@@ -1,3 +1,3 @@
 # marble
 
-high-compression immutable database powered by zstd and fst
+dank-ass transactional pagecache
