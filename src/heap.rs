@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     fs::{File, OpenOptions},
     io::{self, ErrorKind, Read, Write},
     os::unix::fs::FileExt,
@@ -7,8 +7,6 @@ use std::{
 };
 
 use crate::Result;
-
-pub struct Reservation;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
 #[repr(C)]
@@ -29,7 +27,7 @@ impl HeapOffset {
 }
 
 fn slab_for_size(size: usize) -> u8 {
-    size.trailing_zeros().max(12) - 12
+    u8::try_from(size.trailing_zeros().max(12) - 12).unwrap()
 }
 
 fn size_for_slab(index: u8) -> usize {
@@ -64,12 +62,14 @@ impl Heap {
             Err(e) => return Err(e.into()),
         };
 
-        Ok(Heap {
-            slab_00: Slab {
-                file: files.pop().unwrap(),
-                free: Default::default(),
-            },
-        })
+        let slabs_vec: Vec<Slab> = files
+            .into_iter()
+            .map(|file| Slab { file, free: Default::default() })
+            .collect();
+
+        let slabs: [Slab; 32] = slabs_vec.try_into().unwrap();
+
+        Ok(Heap { slabs })
     }
 
     fn open(path: &Path, options: &OpenOptions) -> Result<Vec<File>> {
@@ -86,6 +86,7 @@ impl Heap {
     }
 }
 
+#[derive(Debug)]
 struct Slab {
     free: BTreeSet<u32>,
     file: File,
