@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, io, path::Path};
 
-use crate::{Page, PageId, TxId, WriteBatch};
+use crate::{Page, PageId, Result, TxId, WriteBatch};
 
 #[must_use]
 pub struct Reservation<'a> {
@@ -22,11 +22,11 @@ pub struct Log {
 }
 
 impl Log {
-    pub fn recover<P: AsRef<Path>>(path: P) -> io::Result<Option<Log>> {
-        todo!()
+    pub fn recover(path: &Path) -> impl Iterator<Item = Result<(PageId, Page)>> {
+        vec![].into_iter()
     }
 
-    pub fn create<P: AsRef<Path>>(path: P) -> io::Result<Log> {
+    pub fn create<P: AsRef<Path>>(path: P) -> Result<Log> {
         todo!()
     }
 

@@ -79,16 +79,24 @@ impl PageCache {
         let mut cache = Cache::default();
 
         // open and apply or create log
-        let log: Log = if let Some(log) = Log::recover(&path)? {
-            for (pid, update) in log.iter() {
-                todo!("page in");
-                // page.apply(update);
+        let log_recovery_iterator = Log::recover(path.as_ref());
+        for pid_page_res in log_recovery_iterator {
+            let (pid, page) = pid_page_res?;
+            // page-in
+            let heap_offset = table.offsets.get(&pid.0).unwrap();
+            if !cache.residents.contains(&pid) {
+                let page = heap.read(&heap_offset)?;
+                cache.residents.insert(pid, page);
             }
 
-            todo!()
-        } else {
-            Log::create(&path)?
-        };
+            let mut page = cache.residents.get_mut(&pid).unwrap();
+
+            page.apply(update);
+        }
+
+        for (pid, page) in cache.dirty() {
+            todo!("")
+        }
 
         //
 
