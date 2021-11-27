@@ -1,30 +1,12 @@
 use std::{
     collections::BTreeSet,
     fs::{File, OpenOptions},
-    io::{self, ErrorKind, Read, Write},
+    io,
     os::unix::fs::FileExt,
     path::Path,
 };
 
 use crate::Result;
-
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
-#[repr(C)]
-pub struct HeapOffset {
-    pub index: u32,
-    pub slab: u8,
-    pub generation: u8,
-}
-
-impl HeapOffset {
-    fn from_bytes(bytes: [u8; 8]) -> HeapOffset {
-        todo!()
-    }
-
-    fn to_bytes(self) -> [u8; 8] {
-        todo!()
-    }
-}
 
 fn slab_for_size(size: usize) -> u8 {
     u8::try_from(size.trailing_zeros().max(12) - 12).unwrap()
@@ -64,7 +46,10 @@ impl Heap {
 
         let slabs_vec: Vec<Slab> = files
             .into_iter()
-            .map(|file| Slab { file, free: Default::default() })
+            .map(|file| Slab {
+                file,
+                free: Default::default(),
+            })
             .collect();
 
         let slabs: [Slab; 32] = slabs_vec.try_into().unwrap();

@@ -1,44 +1,43 @@
-use std::{
-    collections::HashMap,
-    fs::File,
-    io::{self, Error, ErrorKind, Read, Write},
-    os::unix::fs::FileExt,
-    path::Path,
-};
+use std::fs::File;
+use std::io;
 
-use bincode::{config::DefaultOptions, Options as _};
+use backtrace::{Backtrace, BacktraceFrame};
 use crc32fast::Hasher;
-use lazy_static::lazy_static;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::de::DeserializeOwned;
 
 const CRC_BYTES: usize = 4;
 
-lazy_static! {
-    static ref BINCODE: DefaultOptions = DefaultOptions::new();
+#[derive(Debug)]
+pub struct Error {
+    thrower: String,
+    io_error: io::Error,
 }
 
-#[derive(Serialize, Deserialize, Default, Debug)]
-struct VersionedUpdate {
-    lsn: Lsn,
-    contents: PageUpdate,
+impl From<io::Error> for Error {
+    fn from(io_error: io::Error) -> Error {
+        let backtrace = Backtrace::new();
+        let backtrace_frames: Vec<BacktraceFrame> = backtrace.into();
+        let frame = backtrace_frames[6].symbols().first().unwrap();
+        let thrower = format!(
+            "{}: {}",
+            frame
+                .filename()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            frame.lineno().unwrap()
+        );
+
+        Error { thrower, io_error }
+    }
 }
 
-#[derive(Serialize, Deserialize, Default, Debug)]
-struct LogSegment {
-    frags: Vec<VersionedUpdate>,
-}
+impl std::ops::Deref for Error {
+    type Target = io::Error;
 
-#[derive(Serialize, Deserialize, Debug)]
-enum PageUpdate {
-    UpdatePage { pid: PageId, add_count: u64 },
-}
-
-impl Default for PageUpdate {
-    fn default() -> PageUpdate {
-        PageUpdate::UpdatePage {
-            pid: PageId(0),
-            add_count: 0,
-        }
+    fn deref(&self) -> &io::Error {
+        &self.io_error
     }
 }
 

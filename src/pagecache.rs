@@ -27,9 +27,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    Error, Heap, HeapOffset, Log, Page, PageId, Result, TxId, WriteBatch,
-};
+use crate::{Error, Heap, HeapOffset, Log, Page, PageId, Result, TxId, WriteBatch};
 
 const CONFLICT_SPACE: usize = 1024;
 
@@ -50,9 +48,27 @@ struct Cache {
 }
 
 /// Stores the on-disk locations for pages.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 struct PageTable {
     offsets: Vec<HeapOffset>,
+}
+
+impl PageTable {
+    fn recover_or_default(path: &Path) -> Result<PageTable> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        match std::fs::read(path.join("pagetable")) {
+            Ok(p) => {
+                let offsets = p
+                    .chunks(8)
+                    .map(|buf| HeapOffset::from_bytes(buf.try_into().unwrap()))
+                    .collect();
+                Ok(PageTable { offsets })
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(PageTable::default()),
+            Err(other) => Err(other.into()),
+        }
+    }
 }
 
 pub struct PageCache {
@@ -80,6 +96,8 @@ impl PageCache {
 
         let mut cache = Cache::default();
 
+        let table = PageTable::recover_or_default(path.as_ref())?;
+
         // open and apply or create log
         let log_recovery_iterator = Log::recover(path.as_ref());
         for pid_page_res in log_recovery_iterator {
@@ -106,7 +124,16 @@ impl PageCache {
 
         //
 
-        todo!()
+        Ok(PageCache {
+            table,
+            cache,
+            heap,
+            log,
+            next_page_id,
+            next_txid,
+            stable_txid,
+            concurrency_control: Default::default(),
+        })
     }
 
     pub fn tx(&mut self) -> Transaction {
@@ -199,24 +226,28 @@ impl<'a> Transaction<'a> {
         if !self.cache.contains_key(&pid) {
             let (read_txid, page_ref) = self.pagecache.page_in(pid)?;
 
-            let cached_page =
-                CachedPage { read_txid, page: Cow::Borrowed(page_ref) };
+            let cached_page = CachedPage {
+                read_txid,
+                page: Cow::Borrowed(page_ref),
+            };
 
             self.cache.insert(pid, cached_page);
         }
 
-        Ok(&mut self.cache.get_mut(&pid).expect("just paged this in...").page)
+        Ok(&mut self
+            .cache
+            .get_mut(&pid)
+            .expect("just paged this in...")
+            .page)
     }
 
     pub fn commit(
         mut self,
-    ) -> Result<std::result::Result<TransactionReceipt<'a>, TransactionConflict>>
-    {
-        let tx_claim =
-            match self.pagecache.concurrency_control.try_stage(&self.cache) {
-                Ok(tx_claim) => tx_claim,
-                Err(conflict) => return Ok(Err(TransactionConflict)),
-            };
+    ) -> Result<std::result::Result<TransactionReceipt<'a>, TransactionConflict>> {
+        let tx_claim = match self.pagecache.concurrency_control.try_stage(&self.cache) {
+            Ok(tx_claim) => tx_claim,
+            Err(conflict) => return Ok(Err(TransactionConflict)),
+        };
 
         let cache = std::mem::take(&mut self.cache);
 
@@ -226,7 +257,10 @@ impl<'a> Transaction<'a> {
             .map(|(pid, page)| (pid, page.page.into_owned()))
             .collect();
 
-        let write_batch = WriteBatch { txid: self.txid, updates };
+        let write_batch = WriteBatch {
+            txid: self.txid,
+            updates,
+        };
 
         self.pagecache.log.push(write_batch, tx_claim);
 
@@ -249,13 +283,15 @@ impl<'a> Transaction<'a> {
 
 #[test]
 fn basic() {
-    let mut pc =
-        PageCache::recover_or_create("test_log").expect("recovery_or_create");
+    let mut pc = PageCache::recover_or_create("test_log").expect("recovery_or_create");
 
     let mut tx = pc.tx();
 
-    let (pid, mut page) =
-        tx.new_page(HeapOffset { slab: 0, index: 0, generation: 1 });
+    let (pid, mut page) = tx.new_page(HeapOffset {
+        slab: 0,
+        index: 0,
+        generation: 1,
+    });
 
     assert_eq!(pid.0, 0);
 
