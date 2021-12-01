@@ -4,18 +4,17 @@ use serde::{Deserialize, Serialize};
 
 mod io;
 mod log;
+mod par;
 
 // mod pagecache;
 // mod heap;
 
-use io::Error;
+use io::{Error, Io, Result};
 use log::Log;
 
 // use heap::{Heap, HeapOffset};
 // use pagecache::Claim;
 // pub use pagecache::PageCache;
-
-type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct TxId(u64);
@@ -23,16 +22,29 @@ pub struct TxId(u64);
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
 pub struct PageId(u64);
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy)]
 #[repr(align(4096))]
-pub struct Page {
-    raw: [u8; 4096],
+pub struct Page {}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PageBatch {
+    pub min_txid: TxId,
+    pub max_txid: TxId,
+    pub updates: HashMap<PageId, Page>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct WriteBatch {
+pub struct DeltaBatch {
     pub txid: TxId,
-    pub updates: HashMap<PageId, HeapOffset>,
+    pub updates: HashMap<PageId, Delta>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Delta {
+    Set,
+    Del,
+    Split,
+    Merge,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]

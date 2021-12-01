@@ -1,14 +1,14 @@
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 
-use crate::{Result, WriteBatch};
+use crate::{DeltaBatch, Result};
 
 /// Log segments are appended to at runtime, and deleted after the PageCache's
 /// `stable_txid` rises above the final txid that is present in a segment.
 pub struct Log {
-    current_segment: LogSegment,
-    uncompacted_segments: Vec<LogSegment>,
-    file: File,
+    current_delta: DeltaSegment,
+    delta_log: File,
+    page_log: File,
 }
 
 impl Log {
@@ -34,7 +34,7 @@ impl Log {
         Ok(())
     }
 
-    pub fn queue_write(&mut self, batch: WriteBatch) {
+    pub fn queue_write(&mut self, batch: DeltaBatch) {
         if let Some(last) = self.current_segment.write_batches.last() {
             assert!(last.txid.0 < batch.txid.0);
         }
@@ -62,6 +62,6 @@ impl Log {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
-pub struct LogSegment {
-    write_batches: Vec<WriteBatch>,
+pub struct DeltaSegment {
+    write_batches: Vec<DeltaBatch>,
 }

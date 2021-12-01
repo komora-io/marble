@@ -29,21 +29,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Heap, HeapOffset, Log, Page, PageId, Result, TxId, WriteBatch};
 
-const CONFLICT_SPACE: usize = 1024;
-
-/// Prospective writes destined for the log
-pub struct AppendReservation;
-
-/// Prospective writes destined for the heap
-pub struct ReplaceReservation;
-
 #[derive(Default, Debug)]
 struct Cache {
-    residents: HashMap<PageId, Page>,
-    dirty_in_progress: (),
-    dirty_flushing: (),
-    read_entrance: (),
-    read_window: (),
+    delta: HashMap<PageId, Page>,
+    double_write: HashMap<PageId, Page>,
+    read_entrance: HashMap<PageId, Page>,
+    read_window: HashMap<PageId, Page>,
     entry_sketch: (),
 }
 
@@ -168,37 +159,6 @@ impl<'a> TransactionReceipt<'a> {
 
 #[derive(Debug, Clone, Copy)]
 pub struct TransactionConflict;
-
-#[derive(Debug)]
-struct ConcurrencyControl {
-    conflict_space: Arc<[AtomicU64; CONFLICT_SPACE]>,
-}
-
-impl Default for ConcurrencyControl {
-    fn default() -> ConcurrencyControl {
-        todo!()
-    }
-}
-
-impl ConcurrencyControl {
-    fn try_stage(
-        &mut self,
-        updates: &HashMap<PageId, CachedPage<'_>>,
-    ) -> std::result::Result<Claim, TransactionConflict> {
-        todo!("perform cc")
-    }
-}
-
-pub struct Claim<'a> {
-    concurrency_control: &'a mut ConcurrencyControl,
-    updates: &'a HashMap<PageId, CachedPage<'a>>,
-}
-
-impl<'a> Drop for Claim<'a> {
-    fn drop(&mut self) {
-        todo!("clear claims now that logging is done")
-    }
-}
 
 struct CachedPage<'a> {
     read_txid: TxId,

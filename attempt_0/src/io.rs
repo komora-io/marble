@@ -5,7 +5,30 @@ use backtrace::{Backtrace, BacktraceFrame};
 use crc32fast::Hasher;
 use serde::de::DeserializeOwned;
 
+use crate::{par::Par, HeapOffset, Page, PageId, TxId, WriteBatch};
+
 const CRC_BYTES: usize = 4;
+
+pub struct DeltaSegment(Vec<WriteBatch>);
+
+pub struct PageSegment(Vec<(PageId, TxId, Page)>);
+
+/// Unified parallel IO abstraction for facilitating fault injection
+/// and allowing the rest of the codebase to be written without thinking
+/// about IO specifics.
+pub trait Io: Send + Sync + Sized {
+    fn open(path: &std::path::Path) -> Par<Result<Self>>;
+    fn recover_delta_log(&self) -> Par<Result<DeltaSegment>>;
+    fn write_delta_log(&self, delta_segment: DeltaSegment) -> Par<Result<TxId>>;
+    fn recover_page_log(&self) -> Par<Result<PageSegment>>;
+    fn write_page_log(&self, page_segment: PageSegment) -> Par<Result<TxId>>;
+    fn read_page(&self, at: HeapOffset) -> Par<Result<Page>>;
+    fn write_page(&self, at: HeapOffset, page: Page) -> Par<Result<Page>>;
+}
+
+struct TestIo {}
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub struct Error {
@@ -41,6 +64,7 @@ impl std::ops::Deref for Error {
     }
 }
 
+/*
 fn read<T: DeserializeOwned>(file: &mut File, at: u64, limit: Option<usize>) -> io::Result<T> {
     let mut buf = vec![];
 
@@ -92,3 +116,4 @@ fn write<T: Serialize>(file: &mut File, at: u64, item: &T) -> io::Result<()> {
     file.write_all_at(&buf, at)?;
     file.sync_all()
 }
+*/
