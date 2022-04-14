@@ -7,3 +7,8 @@ target
 # already existing elements were commented out
 
 #/target
+
+
+# Added by cargo
+
+/target
