@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -14,6 +14,8 @@ use pt_lsm::Lsm;
 // live percentage of a file before it's considered rewritabe
 const HEAP_DIR_SUFFIX: &str = "heap";
 const PT_DIR_SUFFIX: &str = "page_index";
+const LOCK_SUFFIX: &str = "lock";
+const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
 const PT_LSN_KEY: [u8; 8] = u64::MAX.to_le_bytes();
 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
@@ -35,17 +37,18 @@ struct FileAndMetadata {
     generation: u8,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub path: PathBuf,
     pub target_file_size: u64,
     pub file_compaction_percent: u8,
-    /// A partitioning function for pages based on monotonic
-    /// page id, page size, and page rewrite generation.
-    pub shard_function: fn(PageId, usize, u8) -> u8,
+    pub pages_per_shard: Option<u64>,
+    /// A partitioning function for pages based on
+    /// page size, and page rewrite generation.
+    pub partition_function: fn(usize, u8) -> u8,
 }
 
-pub fn default_shard_function(_pid: PageId, _size: usize, _generation: u8) -> u8 {
+pub fn default_partition_function(_size: usize, _generation: u8) -> u8 {
     0
 }
 
@@ -55,8 +58,19 @@ impl Default for Config {
             path: "".into(),
             target_file_size: 1 << 28, // 256mb
             file_compaction_percent: 60,
-            shard_function: default_shard_function,
+            pages_per_shard: None,
+            partition_function: default_partition_function,
         }
+    }
+}
+
+impl Config {
+    fn validate(&self) -> io::Result<()> {
+        todo!()
+    }
+
+    fn open(self) -> io::Result<Marble> {
+        Marble::open_with_config(self)
     }
 }
 
@@ -66,6 +80,7 @@ pub struct Marble {
     files: RwLock<BTreeMap<DiskLocation, FileAndMetadata>>,
     next_file_lsn: u64,
     config: Config,
+    file_lock: File,
 }
 
 impl Marble {
@@ -79,6 +94,12 @@ impl Marble {
     }
 
     pub fn open_with_config(config: Config) -> io::Result<Marble> {
+        use fs2::FileExt;
+
+        let _ = File::create(config.path.join(WARN));
+        let file_lock = File::open(config.path.join(LOCK_SUFFIX))?;
+        file_lock.try_lock_exclusive()?;
+
         let heap_dir = config.path.join(HEAP_DIR_SUFFIX);
 
         // initialize directories if not present
@@ -190,6 +211,7 @@ impl Marble {
             files: RwLock::new(files),
             next_file_lsn,
             config,
+            file_lock,
         })
     }
 
@@ -333,6 +355,7 @@ impl Marble {
         // scan files, filter by fragmentation, group by
         // generation and size class
 
+        let mut defrag_shards:
         let mut files_to_defrag: Vec<&FileAndMetadata> = vec![];
         let mut locations_to_remove = vec![];
         let mut paths_to_remove = vec![];
