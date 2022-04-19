@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
-//use std::os::unix::fs::FileExt;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -194,7 +194,7 @@ impl Marble {
     }
 
     pub fn read(&self, pid: PageId) -> io::Result<Box<[u8]>> {
-        let mut files = self.files.write().unwrap();
+        let files = self.files.read().unwrap();
         let shard = 0; // todo!();
         let size_class = 0; // todo!();
         let generation = 0; // todo!();
@@ -205,17 +205,15 @@ impl Marble {
 
         let lsn = u64::from_be_bytes(lsn_bytes);
         let location = DiskLocation(lsn);
-        let (base_location, file_and_metadata) = files.range_mut(..=location).next_back().unwrap();
+        let (base_location, file_and_metadata) = files.range(..=location).next_back().unwrap();
 
         let file_offset = lsn - base_location.0;
-        let file = &mut file_and_metadata.file;
+        const HEADER_LEN: usize = 20;
+        let page_offset = file_offset + HEADER_LEN as u64;
+        let file = &file_and_metadata.file;
 
-        file.seek(io::SeekFrom::Start(file_offset))?;
-
-        let mut buf = BufReader::new(file);
-
-        let mut header_buf = [0_u8; 20];
-        buf.read_exact(&mut header_buf)?;
+        let mut header_buf = [0_u8; HEADER_LEN];
+        file.read_exact_at(&mut header_buf, file_offset)?;
 
         let crc_expected_buf: [u8; 4] = header_buf[0..4].try_into().unwrap();
         let pid_buf: [u8; 8] = header_buf[4..12].try_into().unwrap();
@@ -234,7 +232,7 @@ impl Marble {
 
         let mut page_buf = vec![0; len].into_boxed_slice();
 
-        buf.read_exact(&mut page_buf)?;
+        file.read_exact_at(&mut page_buf, page_offset)?;
 
         Ok(page_buf)
     }
