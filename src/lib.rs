@@ -19,7 +19,7 @@ const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
 const PT_LSN_KEY: [u8; 8] = u64::MAX.to_be_bytes();
 const PT_LOGICAL_EPOCH_KEY: [u8; 8] = (u64::MAX - 1).to_be_bytes();
 
-#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
 pub struct PageId(u64);
 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
@@ -27,6 +27,7 @@ struct DiskLocation(u64);
 
 const LOCATION_SZ: usize = std::mem::size_of::<DiskLocation>();
 
+#[derive(Debug)]
 struct FileAndMetadata {
     file: File,
     shard: u8,
@@ -240,19 +241,25 @@ impl Marble {
 
     pub fn read(&self, pid: PageId) -> io::Result<Box<[u8]>> {
         let files = self.files.read().unwrap();
-        let shard = 0; // todo!();
-        let size_class = 0; // todo!();
-        let generation = 0; // todo!();
 
         let pt = self.pt.read().unwrap();
+        println!("pt: {:?}", pt[&[0; 8]]);
         let lsn_bytes = *pt.get(&pid.0.to_be_bytes()).unwrap();
         drop(pt);
 
         let lsn = u64::from_be_bytes(lsn_bytes);
         assert_ne!(lsn, 0);
-
         let location = DiskLocation(lsn);
+
+        dbg!(&files);
+
         let (base_location, file_and_metadata) = files.range(..=location).next_back().unwrap();
+
+        dbg!(base_location, file_and_metadata);
+
+        let shard = 0; // todo!();
+        let size_class = 0; // todo!();
+        let generation = 0; // todo!();
 
         let file_offset = lsn - base_location.0;
         const HEADER_LEN: usize = 20;
@@ -284,13 +291,12 @@ impl Marble {
         Ok(page_buf)
     }
 
-    pub fn write_batch(&self, pages: Vec<(PageId, Vec<u8>)>) -> io::Result<()> {
-        let shard = 0; // todo!();
-
+    pub fn write_batch(&self, pages: HashMap<PageId, Vec<u8>>) -> io::Result<()> {
         let mut next_file_lsn = self.next_file_lsn.lock().unwrap();
         let lsn = *next_file_lsn;
         let size_class = 0; // todo!();
         let gen = 0; // todo!();
+        let shard = 0; // todo!();
 
         let mut new_locations: Vec<(PageId, DiskLocation)> = vec![];
         let mut buf = vec![];
@@ -347,7 +353,21 @@ impl Marble {
         let mut new_options = OpenOptions::new();
         new_options.read(true);
 
-        let new_file = new_options.open(new_path)?;
+        let new_file = new_options.open(&new_path)?;
+
+        let fam = FileAndMetadata {
+            file: new_file,
+            capacity,
+            len: capacity.into(),
+            generation: gen,
+            location: DiskLocation(lsn),
+            path: new_path,
+            shard,
+            size_class,
+        };
+
+        self.files.write().unwrap().insert(fam.location, fam);
+
         // TODO add new file to self.files with its metadata
 
         File::open(self.config.path.join(HEAP_DIR_SUFFIX)).and_then(|f| f.sync_all())?;
@@ -454,21 +474,47 @@ fn test_01() {
     fs::remove_dir_all("test_01");
     let mut m = Marble::open("test_01").unwrap();
 
-    for i in 0..10 {
+    for i in 0_u64..10 {
         let start = i * 10;
         let end = (i + 1) * 10;
 
-        let mut batch = vec![];
+        let mut batch = HashMap::new();
         for pid in start..end {
-            batch.push((PageId(pid), pid.to_be_bytes().to_vec()));
+            let value = pid
+                .to_be_bytes()
+                .into_iter()
+                .cycle()
+                .take(pid as usize)
+                .collect();
+            batch.insert(PageId(pid), value);
         }
 
         m.write_batch(batch).unwrap();
     }
 
     for pid in 0..100 {
+        println!("{}", pid);
         let read = m.read(PageId(pid)).unwrap();
-        let expected = pid.to_be_bytes();
+        let expected = pid
+            .to_be_bytes()
+            .into_iter()
+            .cycle()
+            .take(pid as usize)
+            .collect::<Vec<_>>();
+        assert_eq!(&*read, &expected[..]);
+    }
+
+    m.maintenance().unwrap();
+
+    for pid in 0..100 {
+        println!("{}", pid);
+        let read = m.read(PageId(pid)).unwrap();
+        let expected = pid
+            .to_be_bytes()
+            .into_iter()
+            .cycle()
+            .take(pid as usize)
+            .collect::<Vec<_>>();
         assert_eq!(&*read, &expected[..]);
     }
 }
