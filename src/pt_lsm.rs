@@ -47,6 +47,8 @@ use std::sync::{
 
 const SSTABLE_DIR: &str = "sstables";
 const U64_SZ: usize = std::mem::size_of::<u64>();
+const K: usize = 8;
+const V: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -107,7 +109,7 @@ pub struct Stats {
     pub write_amp: f64,
 }
 
-fn hash<const K: usize, const V: usize>(k: &[u8; K], v: &Option<[u8; V]>) -> u32 {
+fn hash(k: &[u8; K], v: &Option<[u8; V]>) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&[v.is_some() as u8]);
     hasher.update(&*k);
@@ -137,7 +139,7 @@ enum WorkerMessage {
     Heartbeat(mpsc::Sender<()>),
 }
 
-struct Worker<const K: usize, const V: usize> {
+struct Worker {
     sstable_directory: BTreeMap<u64, u64>,
     inbox: mpsc::Receiver<WorkerMessage>,
     db_sz: u64,
@@ -146,7 +148,7 @@ struct Worker<const K: usize, const V: usize> {
     stats: Arc<WorkerStats>,
 }
 
-impl<const K: usize, const V: usize> Worker<K, V> {
+impl Worker {
     fn run(mut self) {
         while self.tick() {}
         log::info!("tiny-lsm compaction worker quitting");
@@ -256,7 +258,7 @@ impl<const K: usize, const V: usize> Worker<K, V> {
         let mut read_pairs = 0;
 
         for sstable_id in sstable_ids {
-            for (k, v) in read_sstable::<K, V>(&self.path, *sstable_id)? {
+            for (k, v) in read_sstable(&self.path, *sstable_id)? {
                 map.insert(k, v);
                 read_pairs += 1;
             }
@@ -327,7 +329,7 @@ fn list_sstables(path: &Path, remove_tmp: bool) -> Result<BTreeMap<u64, u64>> {
     Ok(sstable_map)
 }
 
-fn write_sstable<const K: usize, const V: usize>(
+fn write_sstable(
     path: &Path,
     id: u64,
     items: &BTreeMap<[u8; K], Option<[u8; V]>>,
@@ -382,10 +384,7 @@ fn write_sstable<const K: usize, const V: usize>(
     Ok(())
 }
 
-fn read_sstable<const K: usize, const V: usize>(
-    path: &Path,
-    id: u64,
-) -> Result<Vec<([u8; K], Option<[u8; V]>)>> {
+fn read_sstable(path: &Path, id: u64) -> Result<Vec<([u8; K], Option<[u8; V]>)>> {
     let file = fs::OpenOptions::new()
         .read(true)
         .open(path.join(SSTABLE_DIR).join(id_format(id)))?;
@@ -439,7 +438,7 @@ fn read_sstable<const K: usize, const V: usize>(
     Ok(sstable)
 }
 
-pub struct Lsm<const K: usize, const V: usize> {
+pub struct Lsm {
     // `BufWriter` flushes on drop
     memtable: BTreeMap<[u8; K], Option<[u8; V]>>,
     db: BTreeMap<[u8; K], [u8; V]>,
@@ -453,7 +452,7 @@ pub struct Lsm<const K: usize, const V: usize> {
     worker_stats: Arc<WorkerStats>,
 }
 
-impl<const K: usize, const V: usize> Drop for Lsm<K, V> {
+impl Drop for Lsm {
     fn drop(&mut self) {
         let (tx, rx) = mpsc::channel();
 
@@ -466,7 +465,7 @@ impl<const K: usize, const V: usize> Drop for Lsm<K, V> {
     }
 }
 
-impl<const K: usize, const V: usize> std::ops::Deref for Lsm<K, V> {
+impl std::ops::Deref for Lsm {
     type Target = BTreeMap<[u8; K], [u8; V]>;
 
     fn deref(&self) -> &Self::Target {
@@ -474,7 +473,7 @@ impl<const K: usize, const V: usize> std::ops::Deref for Lsm<K, V> {
     }
 }
 
-impl<const K: usize, const V: usize> Lsm<K, V> {
+impl Lsm {
     /// Recover the LSM off disk. Make sure to never
     /// recover a DB using different K, V parameters than
     /// it was created with, or there may be data loss.
@@ -482,7 +481,7 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
     /// This is an O(N) operation and involves reading
     /// all previously written sstables and the log,
     /// to recover all data into an in-memory `BTreeMap`.
-    pub fn recover<P: AsRef<Path>>(p: P) -> Result<Lsm<K, V>> {
+    pub fn recover<P: AsRef<Path>>(p: P) -> Result<Lsm> {
         Lsm::recover_with_config(p, Config::default())
     }
 
@@ -490,7 +489,7 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
     /// around IO and merging. All values in the `Config`
     /// object are safe to change across restarts, unlike
     /// the fixed K and V lengths for data in the database.
-    pub fn recover_with_config<P: AsRef<Path>>(p: P, config: Config) -> Result<Lsm<K, V>> {
+    pub fn recover_with_config<P: AsRef<Path>>(p: P, config: Config) -> Result<Lsm> {
         let path = p.as_ref();
         if !path.exists() {
             fs::create_dir_all(path)?;
@@ -519,7 +518,7 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
 
         let mut db = BTreeMap::new();
         for sstable_id in sstable_directory.keys() {
-            for (k, v) in read_sstable::<K, V>(path, *sstable_id)? {
+            for (k, v) in read_sstable(path, *sstable_id)? {
                 if let Some(v) = v {
                     db.insert(k, v);
                 } else {
@@ -683,7 +682,7 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             written_bytes: 0.into(),
         });
 
-        let worker: Worker<K, V> = Worker {
+        let worker: Worker = Worker {
             path: path.clone().into(),
             sstable_directory,
             inbox: rx,

@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, RwLock,
+    Mutex, RwLock,
 };
 
 mod pt_lsm;
@@ -16,7 +16,8 @@ const HEAP_DIR_SUFFIX: &str = "heap";
 const PT_DIR_SUFFIX: &str = "page_index";
 const LOCK_SUFFIX: &str = "lock";
 const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
-const PT_LSN_KEY: [u8; 8] = u64::MAX.to_le_bytes();
+const PT_LSN_KEY: [u8; 8] = u64::MAX.to_be_bytes();
+const PT_LOGICAL_EPOCH_KEY: [u8; 8] = (u64::MAX - 1).to_be_bytes();
 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 pub struct PageId(u64);
@@ -42,13 +43,12 @@ pub struct Config {
     pub path: PathBuf,
     pub target_file_size: u64,
     pub file_compaction_percent: u8,
-    pub pages_per_shard: Option<u64>,
     /// A partitioning function for pages based on
-    /// page size, and page rewrite generation.
-    pub partition_function: fn(usize, u8) -> u8,
+    /// page ID, page size, and page rewrite generation.
+    pub partition_function: fn(PageId, usize, u8) -> u8,
 }
 
-pub fn default_partition_function(_size: usize, _generation: u8) -> u8 {
+pub fn default_partition_function(_pid: PageId, _size: usize, _generation: u8) -> u8 {
     0
 }
 
@@ -58,7 +58,6 @@ impl Default for Config {
             path: "".into(),
             target_file_size: 1 << 28, // 256mb
             file_compaction_percent: 60,
-            pages_per_shard: None,
             partition_function: default_partition_function,
         }
     }
@@ -66,7 +65,21 @@ impl Default for Config {
 
 impl Config {
     fn validate(&self) -> io::Result<()> {
-        todo!()
+        if self.target_file_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Config's target_file_size must be non-zero",
+            ));
+        }
+
+        if self.file_compaction_percent > 99 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Config's file_compaction_percent must be less than 100",
+            ));
+        }
+
+        Ok(())
     }
 
     fn open(self) -> io::Result<Marble> {
@@ -74,11 +87,15 @@ impl Config {
     }
 }
 
+/// Garbage-collecting object store. A nice solution to back
+/// a pagecache, for people building their own databases.
+///
+/// Serves concurrent reads, but expects a single writer.
 pub struct Marble {
     // maps from PageId to DiskLocation
-    pt: RwLock<Lsm<8, 8>>,
+    pt: RwLock<Lsm>,
     files: RwLock<BTreeMap<DiskLocation, FileAndMetadata>>,
-    next_file_lsn: u64,
+    next_file_lsn: Mutex<u64>,
     config: Config,
     file_lock: File,
 }
@@ -96,21 +113,27 @@ impl Marble {
     pub fn open_with_config(config: Config) -> io::Result<Marble> {
         use fs2::FileExt;
 
-        let _ = File::create(config.path.join(WARN));
-        let file_lock = File::open(config.path.join(LOCK_SUFFIX))?;
-        file_lock.try_lock_exclusive()?;
-
-        let heap_dir = config.path.join(HEAP_DIR_SUFFIX);
+        config.validate()?;
 
         // initialize directories if not present
+        let heap_dir = config.path.join(HEAP_DIR_SUFFIX);
+
         if let Err(e) = fs::read_dir(&heap_dir) {
             if e.kind() == io::ErrorKind::NotFound {
                 let _ = fs::create_dir_all(&heap_dir);
             }
         }
 
+        let _ = File::create(config.path.join(WARN));
+
+        let mut file_lock_opts = OpenOptions::new();
+        file_lock_opts.create(true).read(true).write(true);
+
+        let file_lock = file_lock_opts.open(config.path.join(LOCK_SUFFIX))?;
+        file_lock.try_lock_exclusive()?;
+
         // recover page location index
-        let pt = Lsm::<8, 8>::recover(config.path.join(PT_DIR_SUFFIX))?;
+        let pt = Lsm::recover(config.path.join(PT_DIR_SUFFIX))?;
         let recovered_pt_lsn = if let Some(max) = pt.get(&PT_LSN_KEY) {
             u64::from_le_bytes(*max)
         } else {
@@ -209,7 +232,7 @@ impl Marble {
         Ok(Marble {
             pt: RwLock::new(pt),
             files: RwLock::new(files),
-            next_file_lsn,
+            next_file_lsn: Mutex::new(next_file_lsn),
             config,
             file_lock,
         })
@@ -226,6 +249,8 @@ impl Marble {
         drop(pt);
 
         let lsn = u64::from_be_bytes(lsn_bytes);
+        assert_ne!(lsn, 0);
+
         let location = DiskLocation(lsn);
         let (base_location, file_and_metadata) = files.range(..=location).next_back().unwrap();
 
@@ -261,7 +286,9 @@ impl Marble {
 
     pub fn write_batch(&self, pages: Vec<(PageId, Vec<u8>)>) -> io::Result<()> {
         let shard = 0; // todo!();
-        let lsn = self.next_file_lsn;
+
+        let mut next_file_lsn = self.next_file_lsn.lock().unwrap();
+        let lsn = *next_file_lsn;
         let size_class = 0; // todo!();
         let gen = 0; // todo!();
 
@@ -289,7 +316,8 @@ impl Marble {
             buf.write_all(&raw_page)?;
         }
 
-        self.next_file_lsn += buf.len() as u64 + 1;
+        *next_file_lsn += buf.len() as u64 + 1;
+        drop(next_file_lsn);
 
         let fname = format!(
             "{:02x}-{:016x}-{:01x}-{:01x}-{:016x}",
@@ -355,8 +383,7 @@ impl Marble {
         // scan files, filter by fragmentation, group by
         // generation and size class
 
-        let mut defrag_shards:
-        let mut files_to_defrag: Vec<&FileAndMetadata> = vec![];
+        let mut defrag_shards: HashMap<u8, Vec<PathBuf>> = Default::default();
         let mut locations_to_remove = vec![];
         let mut paths_to_remove = vec![];
 
@@ -370,14 +397,13 @@ impl Marble {
             } else if (len * 100) / cap < u64::from(self.config.file_compaction_percent) {
                 paths_to_remove.push(meta.path.clone());
                 locations_to_remove.push(meta.location);
-                files_to_defrag.push(meta);
             }
         }
 
         let pt = self.pt.read().unwrap();
 
         // rewrite the live pages
-        let page_rewrite_iter = FilteredPageRewriteIter::new(&pt, &files_to_defrag);
+        let page_rewrite_iter = FilteredPageRewriteIter::new(&pt, &paths_to_remove);
 
         let batch = page_rewrite_iter.collect();
 
@@ -405,12 +431,12 @@ impl Marble {
 }
 
 struct FilteredPageRewriteIter<'a> {
-    pt: &'a Lsm<8, 8>,
-    files: Vec<&'a FileAndMetadata>,
+    pt: &'a Lsm,
+    files: Vec<PathBuf>,
 }
 
 impl<'a> FilteredPageRewriteIter<'a> {
-    fn new(pt: &Lsm<8, 8>, files: &Vec<&FileAndMetadata>) -> FilteredPageRewriteIter<'a> {
+    fn new(pt: &Lsm, files: &Vec<PathBuf>) -> FilteredPageRewriteIter<'a> {
         todo!()
     }
 }
