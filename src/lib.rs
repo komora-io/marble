@@ -295,7 +295,7 @@ impl Marble {
         fs::rename(tmp_path, &new_path)?;
 
         let mut new_options = OpenOptions::new();
-        new_options.read(true).write(false).create(false);
+        new_options.read(true);
 
         let new_file = new_options.open(new_path)?;
         // TODO add new file to self.files with its metadata

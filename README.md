@@ -1,3 +1,3 @@
 # marble
 
-dank-ass transactional pagecache
+dank-ass epoch-based garbage-collecting object-store
