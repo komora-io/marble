@@ -36,23 +36,6 @@
 //!
 //! Never change the constant size of keys or values for an existing
 //! database.
-//!
-//! # Examples
-//!
-//! ```
-//! // open up the LSM
-//! let mut lsm = tiny_lsm::Lsm::recover("path/to/base/dir").expect("recover lsm");
-//!
-//! // store some things
-//! let key: [u8; 8] = 8_u64.to_le_bytes();
-//! let value: [u8; 1] = 255_u8.to_le_bytes();
-//! lsm.insert(key, value);
-//!
-//! assert_eq!(lsm.get(&key), Some(&value));
-//!
-//! ```
-#![cfg_attr(test, feature(no_coverage))]
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, prelude::*, BufReader, BufWriter, Result};
@@ -66,10 +49,6 @@ const SSTABLE_DIR: &str = "sstables";
 const U64_SZ: usize = std::mem::size_of::<u64>();
 
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(
-    test,
-    derive(serde::Serialize, serde::Deserialize, fuzzcheck::DefaultMutator)
-)]
 pub struct Config {
     /// If on-disk uncompressed sstable data exceeds in-memory usage
     /// by this proportion, a full-compaction of all sstables will
@@ -168,7 +147,6 @@ struct Worker<const K: usize, const V: usize> {
 }
 
 impl<const K: usize, const V: usize> Worker<K, V> {
-    #[cfg(not(test))]
     fn run(mut self) {
         while self.tick() {}
         log::info!("tiny-lsm compaction worker quitting");
@@ -468,11 +446,6 @@ pub struct Lsm<const K: usize, const V: usize> {
     worker_outbox: mpsc::Sender<WorkerMessage>,
     next_sstable_id: u64,
     dirty_bytes: usize,
-    #[cfg(test)]
-    worker: Worker<K, V>,
-    #[cfg(test)]
-    pub log: tearable::Tearable<fs::File>,
-    #[cfg(not(test))]
     log: BufWriter<fs::File>,
     path: PathBuf,
     config: Config,
@@ -488,9 +461,6 @@ impl<const K: usize, const V: usize> Drop for Lsm<K, V> {
             log::error!("failed to shut down compaction worker on Lsm drop");
             return;
         }
-
-        #[cfg(test)]
-        assert!(!self.worker.tick());
 
         for _ in rx {}
     }
@@ -722,27 +692,15 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             stats: worker_stats.clone(),
         };
 
-        #[cfg(not(test))]
         std::thread::spawn(move || worker.run());
 
         let (hb_tx, hb_rx) = mpsc::channel();
         tx.send(WorkerMessage::Heartbeat(hb_tx)).unwrap();
 
-        #[cfg(test)]
-        let mut worker = worker;
-
-        #[cfg(test)]
-        assert!(worker.tick());
-
         for _ in hb_rx {}
 
         let lsm = Lsm {
-            #[cfg(not(test))]
             log: BufWriter::with_capacity(config.log_bufwriter_size as usize, reader.into_inner()),
-            #[cfg(test)]
-            log: tearable::Tearable::new(reader.into_inner()),
-            #[cfg(test)]
-            worker,
             path: path.into(),
             next_sstable_id: max_sstable_id.unwrap_or(0) + 1,
             dirty_bytes: recovered as usize,
@@ -878,13 +836,6 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
     /// been written, fsynced, and the sstable
     /// directory has been fsyced.
     pub fn flush(&mut self) -> Result<()> {
-        #[cfg(test)]
-        {
-            if self.log.tearing {
-                return Ok(());
-            }
-        }
-
         self.log.flush()?;
         self.log.get_mut().sync_all()?;
 
@@ -911,9 +862,6 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
                 log::logger().flush();
                 panic!("failed to send message to worker: {:?}", e);
             }
-
-            #[cfg(test)]
-            assert!(self.worker.tick());
 
             self.next_sstable_id += 1;
 
@@ -950,9 +898,3 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         Ok(self.stats)
     }
 }
-
-#[cfg(test)]
-mod tearable;
-
-#[cfg(test)]
-mod fuzz;
