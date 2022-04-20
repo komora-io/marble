@@ -177,20 +177,15 @@ impl Marble {
                 continue;
             }
 
-            let shard: u8 = splits[0]
-                .parse()
+            let shard = u8::from_str_radix(&splits[0], 16)
                 .expect("encountered garbage filename in internal directory");
-            let lsn: u64 = splits[1]
-                .parse()
+            let lsn = u64::from_str_radix(&splits[1], 16)
                 .expect("encountered garbage filename in internal directory");
-            let size_class: u8 = splits[2]
-                .parse()
+            let size_class = u8::from_str_radix(&splits[2], 16)
                 .expect("encountered garbage filename in internal directory");
-            let generation: u8 = splits[3]
-                .parse()
+            let generation = u8::from_str_radix(splits[3], 16)
                 .expect("encountered garbage filename in internal directory");
-            let capacity: u64 = splits[4]
-                .parse()
+            let capacity = u64::from_str_radix(&splits[4], 16)
                 .expect("encountered garbage filename in internal directory");
 
             // remove files that are ahead of the recovered page location index
@@ -504,7 +499,10 @@ fn test_01() {
         assert_eq!(&*read, &expected[..]);
     }
 
-    m.maintenance().unwrap();
+    // m.maintenance().unwrap();
+
+    drop(m);
+    m = Marble::open("test_01").unwrap();
 
     for pid in 0..100 {
         println!("{}", pid);
