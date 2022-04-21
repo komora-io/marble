@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -11,13 +11,13 @@ use std::sync::{
 mod pt_lsm;
 use pt_lsm::Lsm;
 
-// live percentage of a file before it's considered rewritabe
 const HEAP_DIR_SUFFIX: &str = "heap";
 const PT_DIR_SUFFIX: &str = "page_index";
 const LOCK_SUFFIX: &str = "lock";
 const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
 const PT_LSN_KEY: [u8; 8] = u64::MAX.to_be_bytes();
 const PT_LOGICAL_EPOCH_KEY: [u8; 8] = (u64::MAX - 1).to_be_bytes();
+const HEADER_LEN: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
 pub struct PageId(u64);
@@ -30,11 +30,11 @@ const LOCATION_SZ: usize = std::mem::size_of::<DiskLocation>();
 #[derive(Debug)]
 struct FileAndMetadata {
     file: File,
-    shard: u8,
     location: DiskLocation,
     path: PathBuf,
     capacity: u64,
     len: AtomicU64,
+    shard: u8,
     size_class: u8,
     generation: u8,
 }
@@ -43,9 +43,15 @@ struct FileAndMetadata {
 pub struct Config {
     pub path: PathBuf,
     pub target_file_size: u64,
+    /// remaining live percentage of a file before it's considered rewritabe
     pub file_compaction_percent: u8,
     /// A partitioning function for pages based on
     /// page ID, page size, and page rewrite generation.
+    /// Causes pages to be written into separate files
+    /// so that garbage collection may be handled at a
+    /// finer granularity. Ideally, you will colocate
+    /// pages that have similar expected lifespans, to
+    /// minimize the costs of copying live data over time.
     pub partition_function: fn(PageId, usize, u8) -> u8,
 }
 
@@ -257,7 +263,6 @@ impl Marble {
         let generation = 0; // todo!();
 
         let file_offset = lsn - base_location.0;
-        const HEADER_LEN: usize = 20;
         let page_offset = file_offset + HEADER_LEN as u64;
         let file = &file_and_metadata.file;
 
@@ -287,11 +292,29 @@ impl Marble {
     }
 
     pub fn write_batch(&self, pages: HashMap<PageId, Vec<u8>>) -> io::Result<()> {
+        let gen = 0;
+        self.write_batch_inner(pages, gen)
+    }
+
+    fn write_batch_inner(&self, pages: HashMap<PageId, Vec<u8>>, gen: u8) -> io::Result<()> {
+        let size_class = 0; // todo
+        let shard = 0; // todo
+
+        /*
+        // TODO
+        // split pages into shards
+        let mut shards: HashMap<u8, HashMap<PageId, Vec<u8>>> = HashMap::new();
+
+        for (pid, data) in pages {
+            let shard_id = (self.config.partition_function)(pid, data.len(), gen);
+
+            let shard = shards.entry(shard_id).or_default();
+            shard.insert(pid, data);
+        }
+        */
+
         let mut next_file_lsn = self.next_file_lsn.lock().unwrap();
         let lsn = *next_file_lsn;
-        let size_class = 0; // todo!();
-        let gen = 0; // todo!();
-        let shard = 0; // todo!();
 
         let mut new_locations: Vec<(PageId, DiskLocation)> = vec![];
         let mut buf = vec![];
@@ -417,10 +440,18 @@ impl Marble {
 
         let pt = self.pt.read().unwrap();
 
-        // rewrite the live pages
-        let page_rewrite_iter = FilteredPageRewriteIter::new(&pt, &paths_to_remove);
+        let mut batch = HashMap::new();
 
-        let batch = page_rewrite_iter.collect();
+        // rewrite the live pages
+        for path in &paths_to_remove {
+            let file = File::open(path)?;
+            let mut bufreader = BufReader::new(file);
+
+            loop {
+                let mut header = [0_u8; HEADER_LEN];
+                bufreader.read_exact(&mut header)?;
+            }
+        }
 
         drop(pt);
         drop(files);
@@ -445,23 +476,11 @@ impl Marble {
     }
 }
 
-struct FilteredPageRewriteIter<'a> {
-    pt: &'a Lsm,
-    files: Vec<PathBuf>,
-}
-
-impl<'a> FilteredPageRewriteIter<'a> {
-    fn new(pt: &Lsm, files: &Vec<PathBuf>) -> FilteredPageRewriteIter<'a> {
-        todo!()
-    }
-}
-
-impl<'a> Iterator for FilteredPageRewriteIter<'a> {
-    type Item = (PageId, Vec<u8>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        todo!()
-    }
+fn filtered_page_rewrite_iter(
+    pt: &Lsm,
+    files: &[PathBuf],
+) -> impl Iterator<Item = (PageId, Vec<u8>)> {
+    vec![].into_iter()
 }
 
 #[test]
@@ -499,7 +518,25 @@ fn test_01() {
         assert_eq!(&*read, &expected[..]);
     }
 
-    // m.maintenance().unwrap();
+    for i in 0_u64..10 {
+        let start = i * 10;
+        let end = (i + 1) * 10;
+
+        let mut batch = HashMap::new();
+        for pid in start..end {
+            let value = pid
+                .to_be_bytes()
+                .into_iter()
+                .cycle()
+                .take(pid as usize)
+                .collect();
+            batch.insert(PageId(pid), value);
+        }
+
+        m.write_batch(batch).unwrap();
+    }
+
+    m.maintenance().unwrap();
 
     drop(m);
     m = Marble::open("test_01").unwrap();
