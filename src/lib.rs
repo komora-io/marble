@@ -232,7 +232,7 @@ impl Marble {
                 shard,
             };
 
-            fams.insert(location, fam);
+            assert!(fams.insert(location, fam).is_none());
         }
 
         let next_file_lsn = max_file_lsn + max_file_size + 1;
@@ -246,6 +246,12 @@ impl Marble {
                 fam.len.fetch_add(1, Ordering::Acquire);
             }
         }
+
+        let (_, lsn_fam) = fams
+            .range(..=DiskLocation(recovered_pt_lsn))
+            .next_back()
+            .unwrap();
+        lsn_fam.len.fetch_add(1, Ordering::Acquire);
 
         Ok(Marble {
             pt: RwLock::new(pt),
@@ -395,7 +401,12 @@ impl Marble {
             size_class,
         };
 
-        self.fams.write().unwrap().insert(fam.location, fam);
+        assert!(self
+            .fams
+            .write()
+            .unwrap()
+            .insert(fam.location, fam)
+            .is_none());
 
         File::open(self.config.path.join(HEAP_DIR_SUFFIX)).and_then(|f| f.sync_all())?;
 
