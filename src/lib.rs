@@ -453,7 +453,6 @@ impl Marble {
         // scan files, filter by fragmentation, group by
         // generation and size class
 
-        let mut defrag_shards: HashMap<u8, Vec<PathBuf>> = Default::default();
         let mut files_to_defrag = vec![];
         let mut paths_to_remove = vec![];
 
@@ -571,13 +570,6 @@ impl Marble {
 
         Ok(())
     }
-}
-
-fn filtered_page_rewrite_iter(
-    pt: &Lsm,
-    fams: &[PathBuf],
-) -> impl Iterator<Item = (PageId, Vec<u8>)> {
-    vec![].into_iter()
 }
 
 #[test]
