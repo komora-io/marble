@@ -1,42 +1,4 @@
-//! `tiny-lsm` is a dead-simple in-memory LSM for managing
-//! fixed-size metadata in more complex systems.
-//!
-//! Uses crc32fast to checksum all key-value pairs in the log and
-//! sstables. Uses zstd to compress all sstables. Performs sstable
-//! compaction in the background.
-//!
-//! Because the data is in-memory, there is no need to put bloom
-//! filters on the sstables, and read operations cannot fail due
-//! to IO issues.
-//!
-//! `Lsm` implements `Deref<Target=BTreeMap<[u8; K], [u8; V]>>`
-//! to immutably access the data directly without any IO or
-//! blocking.
-//!
-//! `Lsm::insert` writes all data into a 32-kb `BufWriter`
-//! in front of a log file, so it will block for very
-//! short periods of time here and there. SST compaction
-//! is handled completely in the background.
-//!
-//! This is a bad choice for large data sets if you
-//! require quick recovery time because it needs to read all of
-//! the sstables and the write ahead log when starting up.
-//!
-//! The benefit to using tiered sstables at all, despite being
-//! in-memory, is that they act as an effective log-deduplication
-//! mechanism, keeping space amplification very low.
-//!
-//! Maximum throughput is not the goal of this project. Low space
-//! amplification and very simple code is the goal, because this
-//! is intended to maintain metadata in more complex systems.
-//!
-//! There is currently no compaction throttling. You can play
-//! with the `Config` options around compaction to change compaction
-//! characteristics.
-//!
-//! Never change the constant size of keys or values for an existing
-//! database.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, prelude::*, BufReader, BufWriter, Result};
 use std::path::{Path, PathBuf};
@@ -45,10 +7,16 @@ use std::sync::{
     mpsc, Arc,
 };
 
+use pagetable::PageTable;
+
 const SSTABLE_DIR: &str = "sstables";
 const U64_SZ: usize = std::mem::size_of::<u64>();
 const K: usize = 8;
 const V: usize = 8;
+
+fn pt_set(pt: &PageTable, k: u64, v: u64) {
+    pt.get(k).store(v, Ordering::Release);
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -109,13 +77,13 @@ pub struct Stats {
     pub write_amp: f64,
 }
 
-fn hash(k: &[u8; K], v: &Option<[u8; V]>) -> u32 {
+fn hash(k: &u64, v: &Option<u64>) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&[v.is_some() as u8]);
-    hasher.update(&*k);
+    hasher.update(&k.to_be_bytes());
 
     if let Some(v) = v {
-        hasher.update(v);
+        hasher.update(&v.to_be_bytes());
     } else {
         hasher.update(&[0; V]);
     }
@@ -253,7 +221,7 @@ impl Worker {
                 .collect::<Vec<_>>()
         );
 
-        let mut map = BTreeMap::new();
+        let mut map = HashMap::new();
 
         let mut read_pairs = 0;
 
@@ -332,7 +300,7 @@ fn list_sstables(path: &Path, remove_tmp: bool) -> Result<BTreeMap<u64, u64>> {
 fn write_sstable(
     path: &Path,
     id: u64,
-    items: &BTreeMap<[u8; K], Option<[u8; V]>>,
+    items: &HashMap<u64, Option<u64>>,
     tmp_mv: bool,
     config: &Config,
 ) -> Result<()> {
@@ -362,10 +330,10 @@ fn write_sstable(
         let crc: u32 = hash(k, v);
         bw.write_all(&crc.to_le_bytes())?;
         bw.write_all(&[v.is_some() as u8])?;
-        bw.write_all(k)?;
+        bw.write_all(&k.to_be_bytes())?;
 
         if let Some(v) = v {
-            bw.write_all(v)?;
+            bw.write_all(&v.to_be_bytes())?;
         } else {
             bw.write_all(&[0; V])?;
         }
@@ -384,7 +352,7 @@ fn write_sstable(
     Ok(())
 }
 
-fn read_sstable(path: &Path, id: u64) -> Result<Vec<([u8; K], Option<[u8; V]>)>> {
+fn read_sstable(path: &Path, id: u64) -> Result<Vec<(u64, Option<u64>)>> {
     let file = fs::OpenOptions::new()
         .read(true)
         .open(path.join(SSTABLE_DIR).join(id_format(id)))?;
@@ -411,9 +379,12 @@ fn read_sstable(path: &Path, id: u64) -> Result<Vec<([u8; K], Option<[u8; V]>)>>
                 break;
             }
         };
-        let k: [u8; K] = buf[5..K + 5].try_into().unwrap();
-        let v: Option<[u8; V]> = if d {
-            Some(buf[K + 5..5 + K + V].try_into().unwrap())
+        let k_buf: [u8; K] = buf[5..K + 5].try_into().unwrap();
+        let k = u64::from_be_bytes(k_buf);
+        let v: Option<u64> = if d {
+            let v_buf = buf[K + 5..5 + K + V].try_into().unwrap();
+            let v = u64::from_be_bytes(v_buf);
+            Some(v)
         } else {
             None
         };
@@ -440,8 +411,8 @@ fn read_sstable(path: &Path, id: u64) -> Result<Vec<([u8; K], Option<[u8; V]>)>>
 
 pub struct Lsm {
     // `BufWriter` flushes on drop
-    memtable: BTreeMap<[u8; K], Option<[u8; V]>>,
-    db: BTreeMap<[u8; K], [u8; V]>,
+    memtable: HashMap<u64, Option<u64>>,
+    db: PageTable,
     worker_outbox: mpsc::Sender<WorkerMessage>,
     next_sstable_id: u64,
     dirty_bytes: usize,
@@ -466,7 +437,7 @@ impl Drop for Lsm {
 }
 
 impl std::ops::Deref for Lsm {
-    type Target = BTreeMap<[u8; K], [u8; V]>;
+    type Target = PageTable;
 
     fn deref(&self) -> &Self::Target {
         &self.db
@@ -516,13 +487,13 @@ impl Lsm {
 
         let sstable_directory = list_sstables(path, true)?;
 
-        let mut db = BTreeMap::new();
+        let mut db = PageTable::default();
         for sstable_id in sstable_directory.keys() {
             for (k, v) in read_sstable(path, *sstable_id)? {
                 if let Some(v) = v {
-                    db.insert(k, v);
+                    pt_set(&db, k, v);
                 } else {
-                    db.remove(&k);
+                    pt_set(&db, k, 0);
                 }
             }
         }
@@ -542,7 +513,7 @@ impl Lsm {
         let header_tuple_sz = header_sz + tuple_sz;
         let mut buf = vec![0; header_tuple_sz];
 
-        let mut memtable = BTreeMap::new();
+        let mut memtable = HashMap::new();
         let mut recovered = 0;
 
         // write_batch is the pending memtable updates, the number
@@ -602,9 +573,12 @@ impl Lsm {
                     break;
                 }
             };
-            let k: [u8; K] = buf[5..5 + K].try_into().unwrap();
-            let v: Option<[u8; V]> = if d {
-                Some(buf[5 + K..5 + K + V].try_into().unwrap())
+            let k_buf: [u8; K] = buf[5..5 + K].try_into().unwrap();
+            let k = u64::from_be_bytes(k_buf);
+            let v: Option<u64> = if d {
+                let v_buf = buf[K + 5..5 + K + V].try_into().unwrap();
+                let v = u64::from_be_bytes(v_buf);
+                Some(v)
             } else {
                 None
             };
@@ -644,9 +618,9 @@ impl Lsm {
                         memtable.insert(k, v);
 
                         if let Some(v) = v {
-                            db.insert(k, v);
+                            pt_set(&db, k, v);
                         } else {
-                            db.remove(&k);
+                            pt_set(&db, k, 0);
                         }
                     }
                     recovered += wb_recovered;
@@ -657,9 +631,9 @@ impl Lsm {
                 memtable.insert(k, v);
 
                 if let Some(v) = v {
-                    db.insert(k, v);
+                    pt_set(&db, k, v);
                 } else {
-                    db.remove(&k);
+                    pt_set(&db, k, 0);
                 }
 
                 recovered += buf.len() as u64;
@@ -667,7 +641,12 @@ impl Lsm {
         }
 
         // need to back up a few bytes to chop off the torn log
-        log::debug!("recovered {} kv pairs", db.len());
+        let max_child_count = db.approximate_max_child_count();
+        log::debug!(
+            "recovered between {} and {} kv pairs",
+            max_child_count - (1 << 16),
+            max_child_count
+        );
         log::debug!("rewinding log down to length {}", recovered);
         let log_file = reader.get_mut();
         log_file.seek(io::SeekFrom::Start(recovered))?;
@@ -686,7 +665,7 @@ impl Lsm {
             path: path.clone().into(),
             sstable_directory,
             inbox: rx,
-            db_sz: db.len() as u64 * (K + V) as u64,
+            db_sz: max_child_count * (K + V) as u64,
             config,
             stats: worker_stats.clone(),
         };
@@ -710,7 +689,7 @@ impl Lsm {
                 on_disk_bytes: 0,
                 read_bytes: 0,
                 written_bytes: 0,
-                resident_bytes: db.len() as u64 * (K + V) as u64,
+                resident_bytes: max_child_count * (K + V) as u64,
                 space_amp: 0.,
                 write_amp: 0.,
             },
@@ -722,46 +701,11 @@ impl Lsm {
         Ok(lsm)
     }
 
-    /// Writes a KV pair into the `Lsm`, returning the
-    /// previous value if it existed. This operation might
-    /// involve blocking for a very brief moment as a 32kb
-    /// `BufWriter` wrapping the log file is flushed.
-    ///
-    /// If you require blocking until all written data is
-    /// durable, use the `Lsm::flush` method below.
-    pub fn insert(&mut self, k: [u8; K], v: [u8; V]) -> Result<Option<[u8; V]>> {
-        assert_ne!([k[0], v[0]], [255, 254]);
-        self.log_mutation(k, Some(v))?;
-
-        if self.dirty_bytes > self.config.max_log_length {
-            self.flush()?;
-        }
-
-        Ok(self.db.insert(k, v))
-    }
-
-    /// Removes a KV pair from the `Lsm`, returning the
-    /// previous value if it existed. This operation might
-    /// involve blocking for a very brief moment as a 32kb
-    /// `BufWriter` wrapping the log file is flushed.
-    ///
-    /// If you require blocking until all written data is
-    /// durable, use the `Lsm::flush` method below.
-    pub fn remove(&mut self, k: &[u8; K]) -> Result<Option<[u8; V]>> {
-        self.log_mutation(*k, None)?;
-
-        if self.dirty_bytes > self.config.max_log_length {
-            self.flush()?;
-        }
-
-        Ok(self.db.remove(k))
-    }
-
     /// Apply a set of updates to the `Lsm` and
     /// log them to disk in a way that will
     /// be recovered only if every update is
     /// present.
-    pub fn write_batch(&mut self, write_batch: &[([u8; K], Option<[u8; V]>)]) -> Result<()> {
+    pub fn write_batch(&mut self, write_batch: &[(u64, Option<u64>)]) -> Result<()> {
         let batch_len: [u8; 8] = (write_batch.len() as u64).to_le_bytes();
         let crc = hash_batch_len(write_batch.len());
 
@@ -779,9 +723,9 @@ impl Lsm {
 
         for (k, v_opt) in write_batch {
             if let Some(v) = v_opt {
-                self.db.insert(*k, *v);
+                pt_set(&self.db, *k, *v);
             } else {
-                self.db.remove(k);
+                pt_set(&self.db, *k, 0);
             }
 
             self.log_mutation(*k, *v_opt)?;
@@ -795,14 +739,14 @@ impl Lsm {
         Ok(())
     }
 
-    fn log_mutation(&mut self, k: [u8; K], v: Option<[u8; V]>) -> Result<()> {
+    fn log_mutation(&mut self, k: u64, v: Option<u64>) -> Result<()> {
         let crc: u32 = hash(&k, &v);
         self.log.write_all(&crc.to_le_bytes())?;
         self.log.write_all(&[v.is_some() as u8])?;
-        self.log.write_all(&k)?;
+        self.log.write_all(&k.to_be_bytes())?;
 
         if let Some(v) = v {
-            self.log.write_all(&v)?;
+            self.log.write_all(&v.to_be_bytes())?;
         } else {
             self.log.write_all(&[0; V])?;
         };
@@ -850,7 +794,7 @@ impl Lsm {
             }
 
             let sst_sz = 8 + (memtable.len() as u64 * (4 + K + V) as u64);
-            let db_sz = self.db.len() as u64 * (K + V) as u64;
+            let db_sz = self.db.approximate_max_child_count() * (K + V) as u64;
 
             if let Err(e) = self.worker_outbox.send(WorkerMessage::NewSST {
                 id: sst_id,
@@ -879,7 +823,7 @@ impl Lsm {
     pub fn stats(&mut self) -> Result<Stats> {
         self.stats.written_bytes += self.worker_stats.written_bytes.swap(0, Ordering::Relaxed);
         self.stats.read_bytes += self.worker_stats.read_bytes.swap(0, Ordering::Relaxed);
-        self.stats.resident_bytes = self.db.len() as u64 * (K + V) as u64;
+        self.stats.resident_bytes = self.db.approximate_max_child_count() * (K + V) as u64;
 
         let mut on_disk_bytes: u64 = std::fs::metadata(self.path.join("log"))?.len();
 

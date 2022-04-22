@@ -15,7 +15,9 @@ const HEAP_DIR_SUFFIX: &str = "heap";
 const PT_DIR_SUFFIX: &str = "page_index";
 const LOCK_SUFFIX: &str = "lock";
 const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
-const PT_LSN_KEY: [u8; 8] = u64::MAX.to_be_bytes();
+// TODO make this 0, shift everything up by 1, so that there's
+// no waste page?
+const PT_LSN_KEY: u64 = u64::MAX;
 const PT_LOGICAL_EPOCH_KEY: [u8; 8] = (u64::MAX - 1).to_be_bytes();
 const HEADER_LEN: usize = 20;
 
@@ -141,11 +143,10 @@ impl Marble {
 
         // recover page location index
         let pt = Lsm::recover(config.path.join(PT_DIR_SUFFIX))?;
-        let recovered_pt_lsn = if let Some(max) = pt.get(&PT_LSN_KEY) {
-            u64::from_le_bytes(*max)
-        } else {
-            0
-        };
+
+        // NB LSN should initially be 1, not 0, because 0 represents
+        // a page being free.
+        let recovered_pt_lsn = pt.get(PT_LSN_KEY).load(Ordering::Acquire).max(1);
 
         // parse file names
         // calculate file tenancy
@@ -244,11 +245,9 @@ impl Marble {
         let files = self.files.read().unwrap();
 
         let pt = self.pt.read().unwrap();
-        println!("pt: {:?}", pt[&[0; 8]]);
-        let lsn_bytes = *pt.get(&pid.0.to_be_bytes()).unwrap();
+        let lsn = pt.get(pid.0).load(Ordering::Acquire);
         drop(pt);
 
-        let lsn = u64::from_be_bytes(lsn_bytes);
         assert_ne!(lsn, 0);
         let location = DiskLocation(lsn);
 
@@ -392,17 +391,17 @@ impl Marble {
 
         // write a batch of updates to the pt
 
-        let write_batch: Vec<([u8; 8], Option<[u8; 8]>)> = new_locations
+        let write_batch: Vec<(u64, Option<u64>)> = new_locations
             .into_iter()
             .map(|(pid, location)| {
-                let key = pid.0.to_be_bytes();
-                let value = Some(location.0.to_be_bytes());
+                let key = pid.0;
+                let value = Some(location.0);
                 (key, value)
             })
             .chain(std::iter::once({
                 // always mark the lsn w/ the pt batch
                 let key = PT_LSN_KEY;
-                let value = Some(lsn.to_le_bytes());
+                let value = Some(lsn);
                 (key, value)
             }))
             .collect();
