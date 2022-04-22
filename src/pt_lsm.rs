@@ -420,7 +420,7 @@ pub struct Lsm {
     path: PathBuf,
     config: Config,
     stats: Stats,
-    worker_stats: Arc<WorkerStats>,
+    _worker_stats: Arc<WorkerStats>,
 }
 
 impl Drop for Lsm {
@@ -445,21 +445,10 @@ impl std::ops::Deref for Lsm {
 }
 
 impl Lsm {
-    /// Recover the LSM off disk. Make sure to never
-    /// recover a DB using different K, V parameters than
-    /// it was created with, or there may be data loss.
-    ///
-    /// This is an O(N) operation and involves reading
-    /// all previously written sstables and the log,
-    /// to recover all data into an in-memory `BTreeMap`.
     pub fn recover<P: AsRef<Path>>(p: P) -> Result<Lsm> {
         Lsm::recover_with_config(p, Config::default())
     }
 
-    /// Recover the LSM, and provide custom options
-    /// around IO and merging. All values in the `Config`
-    /// object are safe to change across restarts, unlike
-    /// the fixed K and V lengths for data in the database.
     pub fn recover_with_config<P: AsRef<Path>>(p: P, config: Config) -> Result<Lsm> {
         let path = p.as_ref();
         if !path.exists() {
@@ -656,7 +645,7 @@ impl Lsm {
 
         let (tx, rx) = mpsc::channel();
 
-        let worker_stats = Arc::new(WorkerStats {
+        let _worker_stats = Arc::new(WorkerStats {
             read_bytes: 0.into(),
             written_bytes: 0.into(),
         });
@@ -667,7 +656,7 @@ impl Lsm {
             inbox: rx,
             db_sz: max_child_count * (K + V) as u64,
             config,
-            stats: worker_stats.clone(),
+            stats: _worker_stats.clone(),
         };
 
         std::thread::spawn(move || worker.run());
@@ -693,7 +682,7 @@ impl Lsm {
                 space_amp: 0.,
                 write_amp: 0.,
             },
-            worker_stats,
+            _worker_stats,
             db,
             memtable,
         };
@@ -821,8 +810,8 @@ impl Lsm {
     }
 
     pub fn stats(&mut self) -> Result<Stats> {
-        self.stats.written_bytes += self.worker_stats.written_bytes.swap(0, Ordering::Relaxed);
-        self.stats.read_bytes += self.worker_stats.read_bytes.swap(0, Ordering::Relaxed);
+        self.stats.written_bytes += self._worker_stats.written_bytes.swap(0, Ordering::Relaxed);
+        self.stats.read_bytes += self._worker_stats.read_bytes.swap(0, Ordering::Relaxed);
         self.stats.resident_bytes = self.db.approximate_max_child_count() * (K + V) as u64;
 
         let mut on_disk_bytes: u64 = std::fs::metadata(self.path.join("log"))?.len();

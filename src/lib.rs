@@ -103,7 +103,7 @@ impl Config {
 pub struct Marble {
     // maps from PageId to DiskLocation
     pt: RwLock<Lsm>,
-    files: RwLock<BTreeMap<DiskLocation, FileAndMetadata>>,
+    fams: RwLock<BTreeMap<DiskLocation, FileAndMetadata>>,
     next_file_lsn: Mutex<u64>,
     config: Config,
     file_lock: File,
@@ -151,7 +151,7 @@ impl Marble {
         // parse file names
         // calculate file tenancy
 
-        let mut files = BTreeMap::new();
+        let mut fams = BTreeMap::new();
         let mut max_file_lsn = 0;
         let mut max_file_size = 0;
 
@@ -216,7 +216,7 @@ impl Marble {
             max_file_size = max_file_size.max(file_size);
             max_file_lsn = max_file_lsn.max(lsn);
 
-            let file_and_metadata = FileAndMetadata {
+            let fam = FileAndMetadata {
                 len: 0.into(),
                 capacity,
                 path: entry.path().into(),
@@ -227,14 +227,14 @@ impl Marble {
                 shard,
             };
 
-            files.insert(location, file_and_metadata);
+            fams.insert(location, fam);
         }
 
         let next_file_lsn = max_file_lsn + max_file_size + 1;
 
         Ok(Marble {
             pt: RwLock::new(pt),
-            files: RwLock::new(files),
+            fams: RwLock::new(fams),
             next_file_lsn: Mutex::new(next_file_lsn),
             config,
             file_lock,
@@ -242,7 +242,7 @@ impl Marble {
     }
 
     pub fn read(&self, pid: PageId) -> io::Result<Box<[u8]>> {
-        let files = self.files.read().unwrap();
+        let fams = self.fams.read().unwrap();
 
         let pt = self.pt.read().unwrap();
         let lsn = pt.get(pid.0).load(Ordering::Acquire);
@@ -251,9 +251,9 @@ impl Marble {
         assert_ne!(lsn, 0);
         let location = DiskLocation(lsn);
 
-        dbg!(&files);
+        dbg!(&fams);
 
-        let (base_location, file_and_metadata) = files.range(..=location).next_back().unwrap();
+        let (base_location, file_and_metadata) = fams.range(..=location).next_back().unwrap();
 
         dbg!(base_location, file_and_metadata);
 
@@ -383,9 +383,7 @@ impl Marble {
             size_class,
         };
 
-        self.files.write().unwrap().insert(fam.location, fam);
-
-        // TODO add new file to self.files with its metadata
+        self.fams.write().unwrap().insert(fam.location, fam);
 
         File::open(self.config.path.join(HEAP_DIR_SUFFIX)).and_then(|f| f.sync_all())?;
 
@@ -424,8 +422,8 @@ impl Marble {
         let mut locations_to_remove = vec![];
         let mut paths_to_remove = vec![];
 
-        let files = self.files.read().unwrap();
-        for (_, meta) in &*files {
+        let fams = self.fams.read().unwrap();
+        for (_, meta) in &*fams {
             let len = meta.len.load(Ordering::Acquire);
             let cap = meta.capacity.max(1);
 
@@ -453,19 +451,19 @@ impl Marble {
         }
 
         drop(pt);
-        drop(files);
+        drop(fams);
 
         self.write_batch(batch)?;
 
-        // get writer file lock and remove the replaced files
+        // get writer file lock and remove the replaced fams
 
-        let mut files = self.files.write().unwrap();
+        let mut fams = self.fams.write().unwrap();
 
         for location in locations_to_remove {
-            files.remove(&location);
+            fams.remove(&location);
         }
 
-        drop(files);
+        drop(fams);
 
         for path in paths_to_remove {
             std::fs::remove_file(path)?;
@@ -477,7 +475,7 @@ impl Marble {
 
 fn filtered_page_rewrite_iter(
     pt: &Lsm,
-    files: &[PathBuf],
+    fams: &[PathBuf],
 ) -> impl Iterator<Item = (PageId, Vec<u8>)> {
     vec![].into_iter()
 }
