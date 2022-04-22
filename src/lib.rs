@@ -45,8 +45,12 @@ struct FileAndMetadata {
 pub struct Config {
     pub path: PathBuf,
     pub target_file_size: u64,
-    /// remaining live percentage of a file before it's considered rewritabe
+    /// Remaining live percentage of a file before
+    /// it's considered rewritabe.
     pub file_compaction_percent: u8,
+    /// The ceiling on the largest allocation this system will ever
+    /// attempt to perform in order to read a page off of disk.
+    pub max_page_size: usize,
     /// A partitioning function for pages based on
     /// page ID, page size, and page rewrite generation.
     /// Causes pages to be written into separate files
@@ -68,6 +72,7 @@ impl Default for Config {
             target_file_size: 1 << 28, // 256mb
             file_compaction_percent: 60,
             partition_function: default_partition_function,
+            max_page_size: 16 * 1024 * 1024 * 1024, // 16gb
         }
     }
 }
@@ -232,6 +237,16 @@ impl Marble {
 
         let next_file_lsn = max_file_lsn + max_file_size + 1;
 
+        // initialize file tenancy from pt
+
+        for pid in 0..pt.approximate_max_child_count() {
+            let location = pt.get(pid).load(Ordering::Acquire);
+            if location != 0 {
+                let (_, fam) = fams.range(..=DiskLocation(location)).next_back().unwrap();
+                fam.len.fetch_add(1, Ordering::Acquire);
+            }
+        }
+
         Ok(Marble {
             pt: RwLock::new(pt),
             fams: RwLock::new(fams),
@@ -251,11 +266,7 @@ impl Marble {
         assert_ne!(lsn, 0);
         let location = DiskLocation(lsn);
 
-        dbg!(&fams);
-
-        let (base_location, file_and_metadata) = fams.range(..=location).next_back().unwrap();
-
-        dbg!(base_location, file_and_metadata);
+        let (base_location, fam) = fams.range(..=location).next_back().unwrap();
 
         let shard = 0; // todo!();
         let size_class = 0; // todo!();
@@ -263,7 +274,7 @@ impl Marble {
 
         let file_offset = lsn - base_location.0;
         let page_offset = file_offset + HEADER_LEN as u64;
-        let file = &file_and_metadata.file;
+        let file = &fam.file;
 
         let mut header_buf = [0_u8; HEADER_LEN];
         file.read_exact_at(&mut header_buf, file_offset)?;
@@ -318,7 +329,8 @@ impl Marble {
         let mut new_locations: Vec<(PageId, DiskLocation)> = vec![];
         let mut buf = vec![];
 
-        let mut capacity = 0;
+        // NB capacity starts with 1 due to the max LSN key that is always included
+        let mut capacity = 1;
         for (pid, raw_page) in pages {
             capacity += 1;
             let address = DiskLocation(lsn + buf.len() as u64);
@@ -405,9 +417,21 @@ impl Marble {
             .collect();
 
         let mut pt = self.pt.write().unwrap();
-        pt.write_batch(&write_batch)?;
+        let replaced_locations = pt.write_batch(&write_batch)?;
         pt.flush()?;
         drop(pt);
+
+        let fams = self.fams.read().unwrap();
+        for old_location in replaced_locations {
+            let (_, fam) = fams
+                .range(..=DiskLocation(old_location))
+                .next_back()
+                .unwrap();
+
+            dbg!(fam.location, fam.len.load(Ordering::Acquire), old_location);
+            let old = fam.len.fetch_sub(1, Ordering::Relaxed);
+            assert_ne!(old, 0);
+        }
 
         Ok(())
     }
@@ -419,7 +443,7 @@ impl Marble {
         // generation and size class
 
         let mut defrag_shards: HashMap<u8, Vec<PathBuf>> = Default::default();
-        let mut locations_to_remove = vec![];
+        let mut files_to_defrag = vec![];
         let mut paths_to_remove = vec![];
 
         let fams = self.fams.read().unwrap();
@@ -427,11 +451,12 @@ impl Marble {
             let len = meta.len.load(Ordering::Acquire);
             let cap = meta.capacity.max(1);
 
+            println!("file {:?} len: {} cap: {}", meta.path, len, cap);
             if len == 0 {
                 paths_to_remove.push(meta.path.clone());
             } else if (len * 100) / cap < u64::from(self.config.file_compaction_percent) {
                 paths_to_remove.push(meta.path.clone());
-                locations_to_remove.push(meta.location);
+                files_to_defrag.push((meta.location.0, meta.path.clone()));
             }
         }
 
@@ -440,13 +465,77 @@ impl Marble {
         let mut batch = HashMap::new();
 
         // rewrite the live pages
-        for path in &paths_to_remove {
+        for (base_lsn, path) in &files_to_defrag {
             let file = File::open(path)?;
             let mut bufreader = BufReader::new(file);
 
+            let mut offset = 0;
+
             loop {
+                let lsn = base_lsn + offset as u64;
                 let mut header = [0_u8; HEADER_LEN];
-                bufreader.read_exact(&mut header)?;
+                let header_res = bufreader.read_exact(&mut header);
+
+                match header_res {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    other => return other,
+                }
+
+                let crc_expected = u32::from_le_bytes(header[0..4].try_into().unwrap());
+                let pid_buf = header[4..12].try_into().unwrap();
+                let pid = u64::from_le_bytes(pid_buf);
+                let len_buf = header[12..20].try_into().unwrap();
+                let len = usize::try_from(u64::from_le_bytes(len_buf)).unwrap();
+
+                if len > self.config.max_page_size {
+                    eprintln!("corrupt page size detected: {} bytes", len);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "corrupt page size",
+                    ));
+                }
+
+                let mut page_buf = Vec::with_capacity(len);
+
+                unsafe {
+                    page_buf.set_len(len);
+                }
+
+                let page_res = bufreader.read_exact(&mut page_buf);
+
+                match page_res {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    other => return other,
+                }
+
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&len_buf);
+                hasher.update(&pid_buf);
+                hasher.update(&page_buf);
+                let crc_actual = hasher.finalize();
+
+                if crc_expected != crc_actual {
+                    eprintln!(
+                        "crc mismatch when reading page at offset {} in file {:?}",
+                        offset, path
+                    );
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "crc mismatch"));
+                }
+
+                let current_location = pt.get(pid).load(Ordering::Acquire);
+
+                if lsn == current_location {
+                    // can attempt to rewrite
+                    println!("recent");
+                    batch.insert(PageId(pid), page_buf);
+                } else {
+                    //
+                    println!("ain't recent");
+                }
+
+                offset += HEADER_LEN + len;
             }
         }
 
@@ -459,8 +548,8 @@ impl Marble {
 
         let mut fams = self.fams.write().unwrap();
 
-        for location in locations_to_remove {
-            fams.remove(&location);
+        for (location, _) in files_to_defrag {
+            fams.remove(&DiskLocation(location));
         }
 
         drop(fams);
@@ -482,9 +571,10 @@ fn filtered_page_rewrite_iter(
 
 #[test]
 fn test_01() {
-    fs::remove_dir_all("test_01");
+    // fs::remove_dir_all("test_01");
     let mut m = Marble::open("test_01").unwrap();
 
+    println!("initial data bulk write");
     for i in 0_u64..10 {
         let start = i * 10;
         let end = (i + 1) * 10;
@@ -503,8 +593,9 @@ fn test_01() {
         m.write_batch(batch).unwrap();
     }
 
+    println!("reading pages");
+
     for pid in 0..100 {
-        println!("{}", pid);
         let read = m.read(PageId(pid)).unwrap();
         let expected = pid
             .to_be_bytes()
@@ -515,6 +606,8 @@ fn test_01() {
         assert_eq!(&*read, &expected[..]);
     }
 
+    println!("second data bulk write");
+
     for i in 0_u64..10 {
         let start = i * 10;
         let end = (i + 1) * 10;
@@ -533,13 +626,16 @@ fn test_01() {
         m.write_batch(batch).unwrap();
     }
 
+    println!("maintenance");
+
     m.maintenance().unwrap();
 
+    println!("restart");
     drop(m);
     m = Marble::open("test_01").unwrap();
 
+    println!("read pages");
     for pid in 0..100 {
-        println!("{}", pid);
         let read = m.read(PageId(pid)).unwrap();
         let expected = pid
             .to_be_bytes()

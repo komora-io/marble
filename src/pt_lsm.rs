@@ -14,8 +14,8 @@ const U64_SZ: usize = std::mem::size_of::<u64>();
 const K: usize = 8;
 const V: usize = 8;
 
-fn pt_set(pt: &PageTable, k: u64, v: u64) {
-    pt.get(k).store(v, Ordering::Release);
+fn pt_set(pt: &PageTable, k: u64, v: u64) -> u64 {
+    pt.get(k).swap(v, Ordering::Release)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -690,11 +690,8 @@ impl Lsm {
         Ok(lsm)
     }
 
-    /// Apply a set of updates to the `Lsm` and
-    /// log them to disk in a way that will
-    /// be recovered only if every update is
-    /// present.
-    pub fn write_batch(&mut self, write_batch: &[(u64, Option<u64>)]) -> Result<()> {
+    /// Returns previous non-zero values for each item in batch
+    pub fn write_batch(&mut self, write_batch: &[(u64, Option<u64>)]) -> Result<Vec<u64>> {
         let batch_len: [u8; 8] = (write_batch.len() as u64).to_le_bytes();
         let crc = hash_batch_len(write_batch.len());
 
@@ -710,11 +707,17 @@ impl Lsm {
         let pad = [0; U64_SZ];
         self.log.write_all(&pad[..pad_sz])?;
 
+        let mut replaced = Vec::with_capacity(write_batch.len());
+
         for (k, v_opt) in write_batch {
-            if let Some(v) = v_opt {
-                pt_set(&self.db, *k, *v);
+            let old = if let Some(v) = v_opt {
+                pt_set(&self.db, *k, *v)
             } else {
-                pt_set(&self.db, *k, 0);
+                pt_set(&self.db, *k, 0)
+            };
+
+            if old != 0 {
+                replaced.push(old);
             }
 
             self.log_mutation(*k, *v_opt)?;
@@ -725,7 +728,7 @@ impl Lsm {
             self.flush()?;
         }
 
-        Ok(())
+        Ok(replaced)
     }
 
     fn log_mutation(&mut self, k: u64, v: Option<u64>) -> Result<()> {
