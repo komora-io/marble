@@ -5,7 +5,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Mutex, RwLock,
+    Arc, Mutex, RwLock,
 };
 
 mod pt_lsm;
@@ -22,7 +22,7 @@ const PT_LOGICAL_EPOCH_KEY: [u8; 8] = (u64::MAX - 1).to_be_bytes();
 const HEADER_LEN: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
-pub struct PageId(u64);
+pub struct PageId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 struct DiskLocation(u64);
@@ -37,7 +37,6 @@ struct FileAndMetadata {
     capacity: u64,
     len: AtomicU64,
     shard: u8,
-    size_class: u8,
     generation: u8,
 }
 
@@ -96,7 +95,7 @@ impl Config {
         Ok(())
     }
 
-    fn open(self) -> io::Result<Marble> {
+    pub fn open(self) -> io::Result<Marble> {
         Marble::open_with_config(self)
     }
 }
@@ -111,7 +110,7 @@ pub struct Marble {
     fams: RwLock<BTreeMap<DiskLocation, FileAndMetadata>>,
     next_file_lsn: Mutex<u64>,
     config: Config,
-    file_lock: File,
+    _file_lock: File,
 }
 
 impl Marble {
@@ -143,8 +142,8 @@ impl Marble {
         let mut file_lock_opts = OpenOptions::new();
         file_lock_opts.create(true).read(true).write(true);
 
-        let file_lock = file_lock_opts.open(config.path.join(LOCK_SUFFIX))?;
-        file_lock.try_lock_exclusive()?;
+        let _file_lock = file_lock_opts.open(config.path.join(LOCK_SUFFIX))?;
+        _file_lock.try_lock_exclusive()?;
 
         // recover page location index
         let pt = Lsm::recover(config.path.join(PT_DIR_SUFFIX))?;
@@ -181,7 +180,7 @@ impl Marble {
             }
 
             let splits: Vec<&str> = name.split("-").collect();
-            if splits.len() != 5 {
+            if splits.len() != 4 {
                 eprintln!(
                     "encountered strange file in internal directory: {:?}",
                     entry.path()
@@ -193,11 +192,9 @@ impl Marble {
                 .expect("encountered garbage filename in internal directory");
             let lsn = u64::from_str_radix(&splits[1], 16)
                 .expect("encountered garbage filename in internal directory");
-            let size_class = u8::from_str_radix(&splits[2], 16)
+            let generation = u8::from_str_radix(splits[2], 16)
                 .expect("encountered garbage filename in internal directory");
-            let generation = u8::from_str_radix(splits[3], 16)
-                .expect("encountered garbage filename in internal directory");
-            let capacity = u64::from_str_radix(&splits[4], 16)
+            let capacity = u64::from_str_radix(&splits[3], 16)
                 .expect("encountered garbage filename in internal directory");
 
             // remove files that are ahead of the recovered page location index
@@ -227,7 +224,6 @@ impl Marble {
                 path: entry.path().into(),
                 file,
                 location,
-                size_class,
                 generation,
                 shard,
             };
@@ -247,22 +243,20 @@ impl Marble {
             }
         }
 
-        let (_, lsn_fam) = fams
-            .range(..=DiskLocation(recovered_pt_lsn))
-            .next_back()
-            .unwrap();
-        lsn_fam.len.fetch_add(1, Ordering::Acquire);
+        if let Some((_, lsn_fam)) = fams.range(..=DiskLocation(recovered_pt_lsn)).next_back() {
+            lsn_fam.len.fetch_add(1, Ordering::Acquire);
+        }
 
         Ok(Marble {
             pt: RwLock::new(pt),
             fams: RwLock::new(fams),
             next_file_lsn: Mutex::new(next_file_lsn),
             config,
-            file_lock,
+            _file_lock,
         })
     }
 
-    pub fn read(&self, pid: PageId) -> io::Result<Box<[u8]>> {
+    pub fn read(&self, pid: PageId) -> io::Result<Arc<[u8]>> {
         let fams = self.fams.read().unwrap();
 
         let pt = self.pt.read().unwrap();
@@ -274,10 +268,6 @@ impl Marble {
 
         let (base_location, fam) = fams.range(..=location).next_back().unwrap();
 
-        let shard = 0; // todo!();
-        let size_class = 0; // todo!();
-        let generation = 0; // todo!();
-
         let file_offset = lsn - base_location.0;
         let page_offset = file_offset + HEADER_LEN as u64;
         let file = &fam.file;
@@ -288,9 +278,8 @@ impl Marble {
         let crc_expected_buf: [u8; 4] = header_buf[0..4].try_into().unwrap();
         let pid_buf: [u8; 8] = header_buf[4..12].try_into().unwrap();
         let len_buf: [u8; 8] = header_buf[12..].try_into().unwrap();
-
         let crc_expected = u32::from_le_bytes(crc_expected_buf);
-        let pid = PageId(u64::from_le_bytes(pid_buf));
+
         let len: usize = if let Ok(len) = u64::from_le_bytes(len_buf).try_into() {
             len
         } else {
@@ -300,25 +289,34 @@ impl Marble {
             ));
         };
 
-        let mut page_buf = vec![0; len].into_boxed_slice();
+        let mut page_buf: Arc<[u8]> = vec![0_u8; len].into();
+        let page_buf_ref = Arc::get_mut(&mut page_buf).unwrap();
 
-        file.read_exact_at(&mut page_buf, page_offset)?;
+        file.read_exact_at(page_buf_ref, page_offset)?;
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&len_buf);
+        hasher.update(&pid_buf);
+        hasher.update(&page_buf);
+        let crc_actual: u32 = hasher.finalize();
+
+        if crc_expected != crc_actual {
+            eprintln!(
+                "crc mismatch when reading page at offset {} in file {:?}",
+                page_offset, fam.path
+            );
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "crc mismatch"));
+        }
 
         Ok(page_buf)
     }
 
     pub fn write_batch(&self, pages: HashMap<PageId, Vec<u8>>) -> io::Result<()> {
         let gen = 0;
-        self.write_batch_inner(pages, gen)
+        self.shard_batch(pages, gen)
     }
 
-    fn write_batch_inner(&self, pages: HashMap<PageId, Vec<u8>>, gen: u8) -> io::Result<()> {
-        let size_class = 0; // todo
-        let shard = 0; // todo
-
-        /*
-        // TODO
-        // split pages into shards
+    fn shard_batch(&self, pages: HashMap<PageId, Vec<u8>>, gen: u8) -> io::Result<()> {
         let mut shards: HashMap<u8, HashMap<PageId, Vec<u8>>> = HashMap::new();
 
         for (pid, data) in pages {
@@ -327,8 +325,20 @@ impl Marble {
             let shard = shards.entry(shard_id).or_default();
             shard.insert(pid, data);
         }
-        */
 
+        for (shard, pages) in shards {
+            self.write_batch_inner(pages, gen, shard)?;
+        }
+
+        Ok(())
+    }
+
+    fn write_batch_inner(
+        &self,
+        pages: HashMap<PageId, Vec<u8>>,
+        gen: u8,
+        shard: u8,
+    ) -> io::Result<()> {
         let mut next_file_lsn = self.next_file_lsn.lock().unwrap();
         let lsn = *next_file_lsn;
 
@@ -360,10 +370,7 @@ impl Marble {
         *next_file_lsn += buf.len() as u64 + 1;
         drop(next_file_lsn);
 
-        let fname = format!(
-            "{:02x}-{:016x}-{:01x}-{:01x}-{:016x}",
-            shard, lsn, size_class, gen, capacity
-        );
+        let fname = format!("{:02x}-{:016x}-{:01x}-{:016x}", shard, lsn, gen, capacity);
 
         let tmp_fname = format!("{}-tmp", fname);
 
@@ -398,7 +405,6 @@ impl Marble {
             location: DiskLocation(lsn),
             path: new_path,
             shard,
-            size_class,
         };
 
         assert!(self
