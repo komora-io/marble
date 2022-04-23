@@ -22,7 +22,7 @@ impl<'a> Arbitrary<'a> for Config {
         Ok(Config(MarbleConfig {
             path,
             target_file_size: u.int_in_range(1..=16384)?,
-            file_compaction_percent: u.int_in_range(0..100)?,
+            file_compaction_percent: u.int_in_range(0..=99)?,
             ..Default::default()
         }))
     }
