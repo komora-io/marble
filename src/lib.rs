@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -10,6 +10,19 @@ use std::sync::{
 
 mod pt_lsm;
 use pt_lsm::Lsm;
+
+// converts io::Error to include the location of error creation
+macro_rules! io_try {
+    ($e:expr) => {
+        match $e {
+            Ok(ok) => ok,
+            Err(e) => return Err(io::Error::new(
+                e.kind(),
+                format!("{} {}", file!(), line!()),
+            )),
+        }
+    }
+}
 
 const HEAP_DIR_SUFFIX: &str = "heap";
 const PT_DIR_SUFFIX: &str = "page_index";
@@ -26,8 +39,6 @@ pub struct PageId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 struct DiskLocation(u64);
-
-const LOCATION_SZ: usize = std::mem::size_of::<DiskLocation>();
 
 #[derive(Debug)]
 struct FileAndMetadata {
@@ -445,7 +456,6 @@ impl Marble {
                 .next_back()
                 .unwrap();
 
-            dbg!(fam.location, fam.len.load(Ordering::Acquire), old_location);
             let old = fam.len.fetch_sub(1, Ordering::Relaxed);
             assert_ne!(old, 0);
         }
@@ -467,11 +477,11 @@ impl Marble {
             let len = meta.len.load(Ordering::Acquire);
             let cap = meta.capacity.max(1);
 
-            println!("file {:?} len: {} cap: {}", meta.path, len, cap);
+            // println!("file {:?} len: {} cap: {}", meta.path, len, cap);
             if len == 0 {
-                paths_to_remove.push(meta.path.clone());
+                paths_to_remove.push((meta.location, meta.path.clone()));
             } else if (len * 100) / cap < u64::from(self.config.file_compaction_percent) {
-                paths_to_remove.push(meta.path.clone());
+                paths_to_remove.push((meta.location, meta.path.clone()));
                 files_to_defrag.push((meta.location.0, meta.path.clone()));
             }
         }
@@ -482,7 +492,7 @@ impl Marble {
 
         // rewrite the live pages
         for (base_lsn, path) in &files_to_defrag {
-            let file = File::open(path)?;
+            let file = io_try!(File::open(path));
             let mut bufreader = BufReader::new(file);
 
             let mut offset = 0;
@@ -544,11 +554,9 @@ impl Marble {
 
                 if lsn == current_location {
                     // can attempt to rewrite
-                    println!("recent");
                     batch.insert(PageId(pid), page_buf);
                 } else {
                     //
-                    println!("ain't recent");
                 }
 
                 offset += HEADER_LEN + len;
@@ -558,20 +566,20 @@ impl Marble {
         drop(pt);
         drop(fams);
 
-        self.write_batch(batch)?;
+        io_try!(self.write_batch(batch));
 
         // get writer file lock and remove the replaced fams
 
         let mut fams = self.fams.write().unwrap();
 
-        for (location, _) in files_to_defrag {
-            fams.remove(&DiskLocation(location));
+        for (location, _) in &paths_to_remove {
+            fams.remove(location);
         }
 
         drop(fams);
 
-        for path in paths_to_remove {
-            std::fs::remove_file(path)?;
+        for (_, path) in paths_to_remove {
+            io_try!(std::fs::remove_file(path));
         }
 
         Ok(())
@@ -583,7 +591,6 @@ fn test_01() {
     // fs::remove_dir_all("test_01");
     let mut m = Marble::open("test_01").unwrap();
 
-    println!("initial data bulk write");
     for i in 0_u64..10 {
         let start = i * 10;
         let end = (i + 1) * 10;
@@ -601,8 +608,6 @@ fn test_01() {
 
         m.write_batch(batch).unwrap();
     }
-
-    println!("reading pages");
 
     for pid in 0..100 {
         let read = m.read(PageId(pid)).unwrap();
@@ -615,8 +620,6 @@ fn test_01() {
         assert_eq!(&*read, &expected[..]);
     }
 
-    println!("second data bulk write");
-
     for i in 0_u64..10 {
         let start = i * 10;
         let end = (i + 1) * 10;
@@ -635,15 +638,11 @@ fn test_01() {
         m.write_batch(batch).unwrap();
     }
 
-    println!("maintenance");
-
     m.maintenance().unwrap();
 
-    println!("restart");
     drop(m);
     m = Marble::open("test_01").unwrap();
 
-    println!("read pages");
     for pid in 0..100 {
         let read = m.read(PageId(pid)).unwrap();
         let expected = pid

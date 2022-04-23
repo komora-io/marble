@@ -476,7 +476,7 @@ impl Lsm {
 
         let sstable_directory = list_sstables(path, true)?;
 
-        let mut db = PageTable::default();
+        let db = PageTable::default();
         for sstable_id in sstable_directory.keys() {
             for (k, v) in read_sstable(path, *sstable_id)? {
                 if let Some(v) = v {
