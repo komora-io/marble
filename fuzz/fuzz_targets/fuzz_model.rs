@@ -18,10 +18,11 @@ impl<'a> Arbitrary<'a> for Config {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let path = std::path::Path::new("fuzz_model_dirs").join(uuid::Uuid::new_v4().to_string()).into();
 
+
         Ok(Config(MarbleConfig {
             path,
-            max_page_size: Arbitrary::arbitrary(u)?,
-            file_compaction_percent: Arbitrary::arbitrary(u)?,
+            target_file_size: u.int_in_range(1..=16384)?,
+            file_compaction_percent: u.int_in_range(0..=100)?,
             ..Default::default()
         }))
     }
