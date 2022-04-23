@@ -1,3 +1,5 @@
+fuzz/artifacts
+fuzz/corpus
 Cargo.lock
 target
 test_*
