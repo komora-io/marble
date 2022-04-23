@@ -1,7 +1,7 @@
 use marble::{PageId, Marble};
 
 fn main() {
-    let marble = Marble::open("bench").unwrap();
+    let marble = Marble::open("bench_data").unwrap();
 
     const MAX: u64 = 100 * 1024 * 1024;
     const KEYSPACE: u64 = 1024 * 1024;

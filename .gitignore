@@ -1,3 +1,6 @@
+bench_data
+perf*
+flamegraph.svg
 fuzz_model_dirs
 fuzz/artifacts
 fuzz/corpus
