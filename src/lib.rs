@@ -587,6 +587,14 @@ impl Marble {
     }
 }
 
+fn _auto_trait_assertions() {
+    use core::panic::{RefUnwindSafe, UnwindSafe};
+
+    fn f<T: Send + Sync + UnwindSafe + RefUnwindSafe>() {}
+
+    f::<Marble>();
+}
+
 #[test]
 fn test_01() {
     // fs::remove_dir_all("test_01");
@@ -655,3 +663,4 @@ fn test_01() {
         assert_eq!(&*read, &expected[..]);
     }
 }
+
