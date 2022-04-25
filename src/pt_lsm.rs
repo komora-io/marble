@@ -4,7 +4,7 @@ use std::io::{self, prelude::*, BufReader, BufWriter, Result};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    mpsc, Arc,
+    Arc,
 };
 
 use pagetable::PageTable;
@@ -16,6 +16,56 @@ const V: usize = 8;
 
 fn pt_set(pt: &PageTable, k: u64, v: u64) -> u64 {
     pt.get(k).swap(v, Ordering::Release)
+}
+
+#[derive(Default)]
+struct Queue<T> {
+    mu: std::sync::Mutex<std::collections::VecDeque<T>>,
+    cv: std::sync::Condvar,
+}
+
+impl<T> Queue<T> {
+    fn recv(&self) -> T {
+        let mut q = self.mu.lock().unwrap();
+
+        while q.is_empty() {
+            q = self.cv.wait(q).unwrap();
+        }
+
+        q.pop_back().unwrap()
+    }
+
+    fn send(&self, item: T) {
+        let mut q = self.mu.lock().unwrap();
+        q.push_front(item);
+        drop(q);
+        self.cv.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct Waiter {
+    done: std::sync::atomic::AtomicBool,
+    mu: std::sync::Mutex<()>,
+    cv: std::sync::Condvar,
+}
+
+impl Waiter {
+    fn wait(self: Arc<Waiter>) {
+        if self.done.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let mut mu = self.mu.lock().unwrap();
+        while !self.done.load(std::sync::atomic::Ordering::Acquire) {
+            mu = self.cv.wait(mu).unwrap();
+        }
+    }
+
+    fn finished(self: Arc<Waiter>) {
+        let _mu = self.mu.lock().unwrap();
+        self.done.store(true, std::sync::atomic::Ordering::Release);
+        self.cv.notify_all();
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -103,13 +153,13 @@ fn hash_batch_len(len: usize) -> u32 {
 
 enum WorkerMessage {
     NewSST { id: u64, sst_sz: u64, db_sz: u64 },
-    Stop(mpsc::Sender<()>),
-    Heartbeat(mpsc::Sender<()>),
+    Stop(Arc<Waiter>),
+    Heartbeat(Arc<Waiter>),
 }
 
 struct Worker {
     sstable_directory: BTreeMap<u64, u64>,
-    inbox: mpsc::Receiver<WorkerMessage>,
+    inbox: Arc<Queue<WorkerMessage>>,
     db_sz: u64,
     path: PathBuf,
     config: Config,
@@ -123,15 +173,9 @@ impl Worker {
     }
 
     fn tick(&mut self) -> bool {
-        match self.inbox.recv() {
-            Ok(message) => {
-                if !self.handle_message(message) {
-                    return false;
-                }
-            }
-            Err(mpsc::RecvError) => {
-                return false;
-            }
+        let message = self.inbox.recv();
+        if !self.handle_message(message) {
+            return false;
         }
 
         // only compact one run at a time before checking
@@ -154,12 +198,12 @@ impl Worker {
                 self.sstable_directory.insert(id, sst_sz);
                 true
             }
-            WorkerMessage::Stop(dropper) => {
-                drop(dropper);
+            WorkerMessage::Stop(waiter) => {
+                waiter.finished();
                 false
             }
-            WorkerMessage::Heartbeat(dropper) => {
-                drop(dropper);
+            WorkerMessage::Heartbeat(waiter) => {
+                waiter.finished();
                 true
             }
         }
@@ -413,7 +457,7 @@ pub struct Lsm {
     // `BufWriter` flushes on drop
     memtable: HashMap<u64, Option<u64>>,
     db: PageTable,
-    worker_outbox: mpsc::Sender<WorkerMessage>,
+    worker_outbox: Arc<Queue<WorkerMessage>>,
     next_sstable_id: u64,
     dirty_bytes: usize,
     log: BufWriter<fs::File>,
@@ -425,14 +469,11 @@ pub struct Lsm {
 
 impl Drop for Lsm {
     fn drop(&mut self) {
-        let (tx, rx) = mpsc::channel();
+        let waiter: Arc<Waiter> = Arc::default();
 
-        if self.worker_outbox.send(WorkerMessage::Stop(tx)).is_err() {
-            log::error!("failed to shut down compaction worker on Lsm drop");
-            return;
-        }
+        self.worker_outbox.send(WorkerMessage::Stop(waiter.clone()));
 
-        for _ in rx {}
+        waiter.wait();
     }
 }
 
@@ -643,7 +684,10 @@ impl Lsm {
         log_file.sync_all()?;
         fs::File::open(path.join(SSTABLE_DIR))?.sync_all()?;
 
-        let (tx, rx) = mpsc::channel();
+        let q = Arc::new(Queue {
+            mu: Default::default(),
+            cv: Default::default(),
+        });
 
         let _worker_stats = Arc::new(WorkerStats {
             read_bytes: 0.into(),
@@ -653,7 +697,7 @@ impl Lsm {
         let worker: Worker = Worker {
             path: path.clone().into(),
             sstable_directory,
-            inbox: rx,
+            inbox: q.clone(),
             db_sz: max_child_count * (K + V) as u64,
             config,
             stats: _worker_stats.clone(),
@@ -661,17 +705,17 @@ impl Lsm {
 
         std::thread::spawn(move || worker.run());
 
-        let (hb_tx, hb_rx) = mpsc::channel();
-        tx.send(WorkerMessage::Heartbeat(hb_tx)).unwrap();
+        let hb_waiter: Arc<Waiter> = Arc::default();
+        q.send(WorkerMessage::Heartbeat(hb_waiter.clone()));
 
-        for _ in hb_rx {}
+        hb_waiter.wait();
 
         let lsm = Lsm {
             log: BufWriter::with_capacity(config.log_bufwriter_size as usize, reader.into_inner()),
             path: path.into(),
             next_sstable_id: max_sstable_id.unwrap_or(0) + 1,
             dirty_bytes: recovered as usize,
-            worker_outbox: tx,
+            worker_outbox: q,
             config,
             stats: Stats {
                 logged_bytes: recovered,
@@ -788,15 +832,11 @@ impl Lsm {
             let sst_sz = 8 + (memtable.len() as u64 * (4 + K + V) as u64);
             let db_sz = self.db.approximate_max_child_count() * (K + V) as u64;
 
-            if let Err(e) = self.worker_outbox.send(WorkerMessage::NewSST {
+            self.worker_outbox.send(WorkerMessage::NewSST {
                 id: sst_id,
                 sst_sz,
                 db_sz,
-            }) {
-                log::error!("failed to send message to worker: {:?}", e);
-                log::logger().flush();
-                panic!("failed to send message to worker: {:?}", e);
-            }
+            });
 
             self.next_sstable_id += 1;
 
