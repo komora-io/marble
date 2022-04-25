@@ -322,6 +322,7 @@ impl Marble {
         Ok(page_buf)
     }
 
+    /// Submit a new batch of pages
     pub fn write_batch(&self, pages: HashMap<PageId, Vec<u8>>) -> io::Result<()> {
         let gen = 0;
         self.shard_batch(pages, gen)
