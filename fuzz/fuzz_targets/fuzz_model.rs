@@ -51,6 +51,7 @@ impl<'a> Arbitrary<'a> for WriteBatch {
 #[derive(Debug, Arbitrary)]
 enum Op {
     WriteBatch(WriteBatch),
+    Gc,
     Restart,
 }
 
@@ -60,19 +61,16 @@ fuzz_target!(|args: (Config, Vec<Op>)| {
     let mut marble = config.0.clone().open().unwrap();
     let mut model = std::collections::BTreeMap::new();
 
-    /*
-    println!();
-    println!("~~~~~~~~~~~~~~~");
-    println!();
-    */
     for op in ops {
-        // println!("op: {:?}", op);
         match op {
             Op::WriteBatch(write_batch) => {
                 for (k, v) in &write_batch.0 {
                     model.insert(*k, v.clone());
                 }
                 marble.write_batch(write_batch.0).unwrap()
+            }
+            Op::Gc => {
+                marble.maintenance().unwrap();
             }
             Op::Restart => {
                 drop(marble);
