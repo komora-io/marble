@@ -4,23 +4,30 @@ use std::io::{self, BufReader, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicBool, Ordering},
     Arc, Mutex, RwLock,
 };
 
 mod pt_lsm;
 use pt_lsm::Lsm;
 
-// converts io::Error to include the location of error creation
+pub static FAULT_INJECT_COUNTER: AtomicU64 = AtomicU64::new(u64::MAX);
 macro_rules! io_try {
-    ($e:expr) => {
+    ($e:expr) => {{
+        if FAULT_INJECT_COUNTER.fetch_sub(1, Ordering::Relaxed) == 1 {
+            return Err(io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected fault",
+            ));
+        }
+        // converts io::Error to include the location of error creation
         match $e {
             Ok(ok) => ok,
             Err(e) => return Err(io::Error::new(
                 e.kind(),
-                format!("{} {}", file!(), line!()),
+                format!("{} {} {}", file!(), line!(), e.to_string()),
             )),
-        }
+        }}
     }
 }
 
@@ -47,6 +54,7 @@ struct FileAndMetadata {
     path: PathBuf,
     capacity: u64,
     len: AtomicU64,
+    defrag_lock: AtomicBool,
     shard: u8,
     generation: u8,
 }
@@ -237,6 +245,7 @@ impl Marble {
                 location,
                 generation,
                 shard,
+                defrag_lock: false.into(),
             };
 
             assert!(fams.insert(location, fam).is_none());
@@ -417,6 +426,7 @@ impl Marble {
             location: DiskLocation(lsn),
             path: new_path,
             shard,
+            defrag_lock: false.into(),
         };
 
         assert!(self
@@ -479,6 +489,10 @@ impl Marble {
             let cap = meta.capacity.max(1);
 
             // println!("file {:?} len: {} cap: {}", meta.path, len, cap);
+            if meta.defrag_lock.swap(true, Ordering::SeqCst) {
+                // only remove and defrag files if we can do so exclusively
+                continue;
+            }
             if len == 0 {
                 paths_to_remove.push((meta.location, meta.path.clone()));
             } else if (len * 100) / cap < u64::from(self.config.file_compaction_percent) {

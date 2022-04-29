@@ -25,7 +25,7 @@ fn run(marble: Arc<Marble>) {
 }
 
 fn main() {
-    const CONCURRENCY: usize = 1;
+    const CONCURRENCY: usize = 16;
 
     let marble = Arc::new(Marble::open("bench_data").unwrap());
 
