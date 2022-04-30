@@ -171,8 +171,8 @@ impl Marble {
         let mut file_lock_opts = OpenOptions::new();
         file_lock_opts.create(true).read(true).write(true);
 
-        let _file_lock = file_lock_opts.open(config.path.join(LOCK_SUFFIX))?;
-        _file_lock.try_lock_exclusive()?;
+        let _file_lock = io_try!(file_lock_opts.open(config.path.join(LOCK_SUFFIX)));
+        io_try!(_file_lock.try_lock_exclusive());
 
         // recover page location index
         let (page_table, metadata_log) = MetadataLog::recover(config.path.join(PT_DIR_SUFFIX))?;
@@ -188,8 +188,8 @@ impl Marble {
         let mut max_file_lsn = 0;
         let mut max_file_size = 0;
 
-        for entry_res in fs::read_dir(heap_dir)? {
-            let entry = entry_res?;
+        for entry_res in io_try!(fs::read_dir(heap_dir)) {
+            let entry = io_try!(entry_res);
             let path = entry.path();
             let name = path
                 .file_name()
@@ -204,7 +204,7 @@ impl Marble {
                     entry.path()
                 );
 
-                fs::remove_file(entry.path())?;
+                io_try!(fs::remove_file(entry.path()));
                 continue;
             }
 
@@ -233,17 +233,17 @@ impl Marble {
                     which is higher than the recovered page table lsn of {}",
                     lsn, recovered_pt_lsn,
                 );
-                fs::remove_file(entry.path())?;
+                io_try!(fs::remove_file(entry.path()));
                 continue;
             }
 
             let mut options = OpenOptions::new();
             options.read(true);
 
-            let file = options.open(entry.path())?;
+            let file = io_try!(options.open(entry.path()));
             let location = DiskLocation(lsn.try_into().unwrap());
 
-            let file_size = entry.metadata()?.len();
+            let file_size = io_try!(entry.metadata()).len();
             max_file_size = max_file_size.max(file_size);
             max_file_lsn = max_file_lsn.max(lsn);
 
@@ -298,7 +298,7 @@ impl Marble {
         let file_offset = lsn - base_location.0.get();
 
         let mut header_buf = [0_u8; HEADER_LEN];
-        fam.file.read_exact_at(&mut header_buf, file_offset)?;
+        io_try!(fam.file.read_exact_at(&mut header_buf, file_offset));
 
         let crc_expected_buf: [u8; 4] = header_buf[0..4].try_into().unwrap();
         let pid_buf: [u8; 8] = header_buf[4..12].try_into().unwrap();
@@ -320,7 +320,7 @@ impl Marble {
         }
 
         let page_offset = file_offset + HEADER_LEN as u64;
-        fam.file.read_exact_at(&mut page_buf, page_offset)?;
+        io_try!(fam.file.read_exact_at(&mut page_buf, page_offset));
 
         drop(fams);
 
@@ -403,10 +403,10 @@ impl Marble {
             hasher.update(&raw_page);
             let crc: u32 = hasher.finalize();
 
-            buf.write_all(&crc.to_le_bytes())?;
-            buf.write_all(&pid_buf)?;
-            buf.write_all(&len_buf)?;
-            buf.write_all(&raw_page)?;
+            io_try!(buf.write_all(&crc.to_le_bytes()));
+            io_try!(buf.write_all(&pid_buf));
+            io_try!(buf.write_all(&len_buf));
+            io_try!(buf.write_all(&raw_page));
         }
 
         let tmp_fname = format!("{}-tmp", TMP_COUNTER.fetch_add(1, Ordering::Relaxed));
@@ -415,16 +415,16 @@ impl Marble {
         let mut file_options = OpenOptions::new();
         file_options.read(true).write(true).create(true);
 
-        let mut file = file_options.open(&tmp_path)?;
+        let mut file = io_try!(file_options.open(&tmp_path));
 
-        file.write_all(&buf)?;
+        io_try!(file.write_all(&buf));
 
         let buf_len = buf.len();
         drop(buf);
 
         // mv and fsync new file and directory
 
-        file.sync_all()?;
+        io_try!(file.sync_all());
 
         let mut next_lsn_and_metadata_log = self.next_file_lsn_and_metadata_log.lock().unwrap();
 
@@ -434,10 +434,10 @@ impl Marble {
         let fname = format!("{:02x}-{:016x}-{:01x}-{:016x}", shard, lsn, gen, capacity);
         let new_path = self.config.path.join(HEAP_DIR_SUFFIX).join(fname);
 
-        fs::rename(tmp_path, &new_path)?;
+        io_try!(fs::rename(tmp_path, &new_path));
 
         // fsync directory to ensure new file is present
-        File::open(self.config.path.join(HEAP_DIR_SUFFIX)).and_then(|f| f.sync_all())?;
+        io_try!(File::open(self.config.path.join(HEAP_DIR_SUFFIX)).and_then(|f| f.sync_all()));
 
         let fam = FileAndMetadata {
             file,
