@@ -28,7 +28,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicBool, Ordering},
     Mutex, RwLock, MutexGuard,
 };
 
@@ -42,6 +42,7 @@ const LOCK_SUFFIX: &str = "lock";
 const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
 const PT_LSN_KEY: u64 = 0;
 const HEADER_LEN: usize = 20;
+const MAX_GENERATION: u8 = 5;
 
 fn pt_set(pt: &PageTable, k: u64, v: u64, _mu: &MutexGuard<'_, (u64, MetadataLog)>) -> u64 {
     // NB the unused mutex must be held for page table updates to serialize updates safely
@@ -61,8 +62,8 @@ struct FileAndMetadata {
     path: PathBuf,
     capacity: u64,
     len: AtomicU64,
-    shard: u8,
     generation: u8,
+    rewrite_claim: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -217,7 +218,7 @@ impl Marble {
                 continue;
             }
 
-            let shard = u8::from_str_radix(&splits[0], 16)
+            let _shard = u8::from_str_radix(&splits[0], 16)
                 .expect("encountered garbage filename in internal directory");
             let lsn = u64::from_str_radix(&splits[1], 16)
                 .expect("encountered garbage filename in internal directory");
@@ -254,7 +255,7 @@ impl Marble {
                 file,
                 location,
                 generation,
-                shard,
+                rewrite_claim: false.into(),
             };
 
             assert!(fams.insert(location, fam).is_none());
@@ -376,7 +377,7 @@ impl Marble {
         // allocates unique temporary file names
         static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-        let mut new_locations: Vec<(PageId, Option<DiskLocation>)> = vec![];
+        let mut new_locations: Vec<(PageId, Option<u64>)> = vec![];
         let mut buf = vec![];
 
         // NB capacity starts with 1 due to the max LSN key that is always included
@@ -392,7 +393,7 @@ impl Marble {
             capacity += 1;
 
             let relative_address = buf.len() as u64;
-            new_locations.push((pid, Some(DiskLocation(relative_address.try_into().unwrap()))));
+            new_locations.push((pid, Some(relative_address)));
 
             let len_buf: [u8; 8] = (raw_page.len() as u64).to_le_bytes();
             let pid_buf: [u8; 8] = pid.0.get().to_le_bytes();
@@ -446,7 +447,7 @@ impl Marble {
             generation: gen,
             location: DiskLocation(lsn.try_into().unwrap()),
             path: new_path,
-            shard,
+            rewrite_claim: false.into(),
         };
 
         assert!(self
@@ -462,7 +463,7 @@ impl Marble {
             .into_iter()
             .map(|(pid, location)| {
                 let key = pid.0.get();
-                let value = location.map(|l| l.0.get());
+                let value = location;
                 (key, value)
             })
             .chain(std::iter::once({
@@ -507,100 +508,111 @@ impl Marble {
     }
 
     pub fn maintenance(&self) -> io::Result<()> {
-        let mut files_to_defrag = vec![];
         let mut paths_to_remove = vec![];
+        let mut files_to_defrag: HashMap<u8, Vec<_>> = Default::default();
 
         let fams = self.fams.read().unwrap();
         for (_, meta) in &*fams {
             let len = meta.len.load(Ordering::Acquire);
             let cap = meta.capacity.max(1);
 
+            if meta.rewrite_claim.swap(true, Ordering::SeqCst) {
+                // try to exclusively claim this file for rewrite to
+                // prevent concurrent attempts at rewriting its contents
+                continue;
+            }
+
             if len == 0 {
                 paths_to_remove.push((meta.location, meta.path.clone()));
             } else if (len * 100) / cap < u64::from(self.config.file_compaction_percent) {
                 paths_to_remove.push((meta.location, meta.path.clone()));
-                files_to_defrag.push((meta.location.0.get(), meta.path.clone()));
+
+                let generation = meta.generation.saturating_add(1).min(MAX_GENERATION);
+
+                let entry = files_to_defrag.entry(generation).or_default();
+                entry.push((meta.location.0.get(), meta.path.clone()));
             }
         }
-
-        let mut batch = HashMap::new();
-
-        // rewrite the live pages
-        for (base_lsn, path) in &files_to_defrag {
-            let file = io_try!(File::open(path));
-            let mut bufreader = BufReader::new(file);
-
-            let mut offset = 0;
-
-            loop {
-                let lsn = base_lsn + offset as u64;
-                let mut header = [0_u8; HEADER_LEN];
-                let header_res = bufreader.read_exact(&mut header);
-
-                match header_res {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                    other => return other,
-                }
-
-                let crc_expected = u32::from_le_bytes(header[0..4].try_into().unwrap());
-                let pid_buf = header[4..12].try_into().unwrap();
-                let pid = u64::from_le_bytes(pid_buf);
-                let len_buf = header[12..20].try_into().unwrap();
-                let len = usize::try_from(u64::from_le_bytes(len_buf)).unwrap();
-
-                if len > self.config.max_page_size {
-                    eprintln!("corrupt page size detected: {} bytes", len);
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "corrupt page size",
-                    ));
-                }
-
-                let mut page_buf = Vec::with_capacity(len);
-
-                unsafe {
-                    page_buf.set_len(len);
-                }
-
-                let page_res = bufreader.read_exact(&mut page_buf);
-
-                match page_res {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                    other => return other,
-                }
-
-                let mut hasher = crc32fast::Hasher::new();
-                hasher.update(&len_buf);
-                hasher.update(&pid_buf);
-                hasher.update(&page_buf);
-                let crc_actual = hasher.finalize();
-
-                if crc_expected != crc_actual {
-                    eprintln!(
-                        "crc mismatch when reading page at offset {} in file {:?}",
-                        offset, path
-                    );
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "crc mismatch"));
-                }
-
-                let current_location = self.page_table.get(pid).load(Ordering::Acquire);
-
-                if lsn == current_location {
-                    // can attempt to rewrite
-                    batch.insert(PageId(pid.try_into().unwrap()), Some(page_buf));
-                } else {
-                    //
-                }
-
-                offset += HEADER_LEN + len;
-            }
-        }
-
         drop(fams);
 
-        io_try!(self.write_batch(batch));
+        // rewrite the live pages
+        for (generation, files) in &files_to_defrag {
+            let mut batch = HashMap::new();
+
+            for (base_lsn, path) in files {
+                let file = io_try!(File::open(path));
+                let mut bufreader = BufReader::new(file);
+
+                let mut offset = 0;
+
+                loop {
+                    let lsn = base_lsn + offset as u64;
+                    let mut header = [0_u8; HEADER_LEN];
+                    let header_res = bufreader.read_exact(&mut header);
+
+                    match header_res {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                        other => return other,
+                    }
+
+                    let crc_expected = u32::from_le_bytes(header[0..4].try_into().unwrap());
+                    let pid_buf = header[4..12].try_into().unwrap();
+                    let pid = u64::from_le_bytes(pid_buf);
+                    let len_buf = header[12..20].try_into().unwrap();
+                    let len = usize::try_from(u64::from_le_bytes(len_buf)).unwrap();
+
+                    if len > self.config.max_page_size {
+                        eprintln!("corrupt page size detected: {} bytes", len);
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "corrupt page size",
+                        ));
+                    }
+
+                    let mut page_buf = Vec::with_capacity(len);
+
+                    unsafe {
+                        page_buf.set_len(len);
+                    }
+
+                    let page_res = bufreader.read_exact(&mut page_buf);
+
+                    match page_res {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                        other => return other,
+                    }
+
+                    let mut hasher = crc32fast::Hasher::new();
+                    hasher.update(&len_buf);
+                    hasher.update(&pid_buf);
+                    hasher.update(&page_buf);
+                    let crc_actual = hasher.finalize();
+
+                    if crc_expected != crc_actual {
+                        eprintln!(
+                            "crc mismatch when reading page at offset {} in file {:?}",
+                            offset, path
+                        );
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "crc mismatch"));
+                    }
+
+                    let current_location = self.page_table.get(pid).load(Ordering::Acquire);
+
+                    if lsn == current_location {
+                        // can attempt to rewrite
+                        batch.insert(PageId(pid.try_into().unwrap()), Some(page_buf));
+                    } else {
+                        // page has been rewritten, this one isn't valid
+                    }
+
+                    offset += HEADER_LEN + len;
+                }
+            }
+
+            io_try!(self.shard_batch(batch, *generation));
+        }
 
         // get writer file lock and remove the replaced fams
 
