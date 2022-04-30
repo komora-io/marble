@@ -290,12 +290,13 @@ impl Worker {
             if table_id == sst_id {
                 continue;
             }
-            fs::remove_file(self.path.join(TABLE_DIR).join(id_format(*table_id)))?;
+            io_try!(fs::remove_file(self.path.join(TABLE_DIR).join(id_format(*table_id))));
             self.table_directory
                 .remove(table_id)
                 .expect("compacted sst not present in table_directory");
         }
-        fs::File::open(self.path.join(TABLE_DIR))?.sync_all()?;
+        let parent = io_try!(fs::File::open(self.path.join(TABLE_DIR)));
+        io_try!(parent.sync_all());
 
         Ok(())
     }
@@ -308,8 +309,8 @@ fn id_format(id: u64) -> String {
 fn list_tables(path: &Path, remove_tmp: bool) -> Result<BTreeMap<u64, u64>> {
     let mut table_map = BTreeMap::new();
 
-    for dir_entry_res in fs::read_dir(path.join(TABLE_DIR))? {
-        let dir_entry = dir_entry_res?;
+    for dir_entry_res in io_try!(fs::read_dir(path.join(TABLE_DIR))) {
+        let dir_entry = io_try!(dir_entry_res);
         let file_name = if let Ok(f) = dir_entry.file_name().into_string() {
             f
         } else {
@@ -317,13 +318,13 @@ fn list_tables(path: &Path, remove_tmp: bool) -> Result<BTreeMap<u64, u64>> {
         };
 
         if let Ok(id) = u64::from_str_radix(&file_name, 16) {
-            let metadata = dir_entry.metadata()?;
+            let metadata = io_try!(dir_entry.metadata());
 
             table_map.insert(id, metadata.len());
         } else {
             if remove_tmp && file_name.ends_with("-tmp") {
                 log::warn!("removing incomplete table rewrite {}", file_name);
-                fs::remove_file(path.join(TABLE_DIR).join(file_name))?;
+                io_try!(fs::remove_file(path.join(TABLE_DIR).join(file_name)));
             }
         }
     }
@@ -345,10 +346,10 @@ fn write_table(
         sst_dir_path.join(id_format(id))
     };
 
-    let file = fs::OpenOptions::new()
+    let file = io_try!(fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .open(&sst_path)?;
+        .open(&sst_path));
 
     let max_zstd_level = zstd::compression_level_range();
     let zstd_level = config
@@ -358,38 +359,39 @@ fn write_table(
     let mut bw =
         BufWriter::new(zstd::Encoder::new(file, zstd_level as _).expect("zstd encoder failure"));
 
-    bw.write_all(&(items.len() as u64).to_le_bytes())?;
+    io_try!(bw.write_all(&(items.len() as u64).to_le_bytes()));
 
     for (k, v) in items {
         let crc: u32 = hash(k, v);
-        bw.write_all(&crc.to_le_bytes())?;
-        bw.write_all(&[v.is_some() as u8])?;
-        bw.write_all(&k.to_be_bytes())?;
+        io_try!(bw.write_all(&crc.to_le_bytes()));
+        io_try!(bw.write_all(&[v.is_some() as u8]));
+        io_try!(bw.write_all(&k.to_be_bytes()));
 
         if let Some(v) = v {
-            bw.write_all(&v.to_be_bytes())?;
+            io_try!(bw.write_all(&v.to_be_bytes()));
         } else {
-            bw.write_all(&[0; V])?;
+            io_try!(bw.write_all(&[0; V]));
         }
     }
 
-    bw.flush()?;
+    io_try!(bw.flush());
 
-    bw.get_mut().get_mut().sync_all()?;
-    fs::File::open(path.join(TABLE_DIR))?.sync_all()?;
+    io_try!(bw.get_mut().get_mut().sync_all());
+    let parent = io_try!(fs::File::open(path.join(TABLE_DIR)));
+    io_try!(parent.sync_all());
 
     if tmp_mv {
         let new_path = sst_dir_path.join(id_format(id));
-        fs::rename(sst_path, new_path)?;
+        io_try!(fs::rename(sst_path, new_path));
     }
 
     Ok(())
 }
 
 fn read_table(path: &Path, id: u64) -> Result<Vec<(u64, Option<u64>)>> {
-    let file = fs::OpenOptions::new()
+    let file = io_try!(fs::OpenOptions::new()
         .read(true)
-        .open(path.join(TABLE_DIR).join(id_format(id)))?;
+        .open(path.join(TABLE_DIR).join(id_format(id))));
 
     let mut reader = zstd::Decoder::new(BufReader::with_capacity(16 * 1024 * 1024, file)).unwrap();
 
@@ -398,7 +400,7 @@ fn read_table(path: &Path, id: u64) -> Result<Vec<(u64, Option<u64>)>> {
 
     let len_buf = &mut [0; 8];
 
-    reader.read_exact(len_buf)?;
+    io_try!(reader.read_exact(len_buf));
 
     let expected_len: u64 = u64::from_le_bytes(*len_buf);
     let mut table = Vec::with_capacity(expected_len as usize);
@@ -474,10 +476,10 @@ impl MetadataLog {
     pub fn recover_with_config<P: AsRef<Path>>(p: P, config: Config) -> Result<(PageTable, MetadataLog)> {
         let path = p.as_ref();
         if !path.exists() {
-            fs::create_dir_all(path)?;
-            fs::create_dir(path.join(TABLE_DIR))?;
-            fs::File::open(path.join(TABLE_DIR))?.sync_all()?;
-            fs::File::open(path)?.sync_all()?;
+            io_try!(fs::create_dir_all(path));
+            io_try!(fs::create_dir(path.join(TABLE_DIR)));
+            io_try!(io_try!(fs::File::open(path.join(TABLE_DIR))).sync_all());
+            io_try!(io_try!(fs::File::open(path)).sync_all());
             let mut parent_opt = path.parent();
 
             // need to recursively fsync parents since
@@ -511,11 +513,11 @@ impl MetadataLog {
 
         let max_table_id = table_directory.keys().next_back().copied();
 
-        let log = fs::OpenOptions::new()
+        let log = io_try!(fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(path.join(LOG_PATH))?;
+            .open(path.join(LOG_PATH)));
 
         let mut reader = BufReader::new(log);
 
@@ -660,10 +662,10 @@ impl MetadataLog {
         );
         log::debug!("rewinding log down to length {}", recovered);
         let log_file = reader.get_mut();
-        log_file.seek(io::SeekFrom::Start(recovered))?;
-        log_file.set_len(recovered)?;
-        log_file.sync_all()?;
-        fs::File::open(path.join(TABLE_DIR))?.sync_all()?;
+        io_try!(log_file.seek(io::SeekFrom::Start(recovered)));
+        io_try!(log_file.set_len(recovered));
+        io_try!(log_file.sync_all());
+        io_try!(io_try!(fs::File::open(path.join(TABLE_DIR))).sync_all());
 
         let q = Arc::new(Queue {
             mu: Default::default(),
@@ -718,9 +720,9 @@ impl MetadataLog {
         let batch_len: [u8; 8] = (write_batch.len() as u64).to_le_bytes();
         let crc = hash_batch_len(write_batch.len());
 
-        self.log.write_all(&crc.to_le_bytes())?;
-        self.log.write_all(&[2_u8])?;
-        self.log.write_all(&batch_len)?;
+        io_try!(self.log.write_all(&crc.to_le_bytes()));
+        io_try!(self.log.write_all(&[2_u8]));
+        io_try!(self.log.write_all(&batch_len));
 
         // the zero pad is necessary because every log
         // entry must have the same length, whether
@@ -728,7 +730,7 @@ impl MetadataLog {
         let tuple_sz = U64_SZ.max(K + V);
         let pad_sz = tuple_sz - U64_SZ;
         let pad = [0; U64_SZ];
-        self.log.write_all(&pad[..pad_sz])?;
+        io_try!(self.log.write_all(&pad[..pad_sz]));
 
         for (k, v_opt) in write_batch {
             self.log_mutation(*k, *v_opt)?;
@@ -744,14 +746,14 @@ impl MetadataLog {
 
     fn log_mutation(&mut self, k: u64, v: Option<u64>) -> Result<()> {
         let crc: u32 = hash(&k, &v);
-        self.log.write_all(&crc.to_le_bytes())?;
-        self.log.write_all(&[v.is_some() as u8])?;
-        self.log.write_all(&k.to_be_bytes())?;
+        io_try!(self.log.write_all(&crc.to_le_bytes()));
+        io_try!(self.log.write_all(&[v.is_some() as u8]));
+        io_try!(self.log.write_all(&k.to_be_bytes()));
 
         if let Some(v) = v {
-            self.log.write_all(&v.to_be_bytes())?;
+            io_try!(self.log.write_all(&v.to_be_bytes()));
         } else {
-            self.log.write_all(&[0; V])?;
+            io_try!(self.log.write_all(&[0; V]));
         };
 
         // the zero pad is necessary because every log
@@ -760,7 +762,7 @@ impl MetadataLog {
         let min_tuple_sz = U64_SZ.max(K + V);
         let pad_sz = min_tuple_sz - (K + V);
         let pad = [0; U64_SZ];
-        self.log.write_all(&pad[..pad_sz])?;
+        io_try!(self.log.write_all(&pad[..pad_sz]));
 
         let logged_bytes = 4 + 1 + min_tuple_sz;
 
@@ -782,8 +784,8 @@ impl MetadataLog {
     /// been written, fsynced, and the table
     /// directory has been fsyced.
     pub fn flush(&mut self) -> Result<()> {
-        self.log.flush()?;
-        self.log.get_mut().sync_all()?;
+        io_try!(self.log.flush());
+        io_try!(self.log.get_mut().sync_all());
 
         if self.dirty_bytes > self.config.max_log_length {
             log::debug!("compacting log to table");
@@ -806,10 +808,11 @@ impl MetadataLog {
             self.next_table_id += 1;
 
             let log_file: &mut fs::File = self.log.get_mut();
-            log_file.seek(io::SeekFrom::Start(0))?;
-            log_file.set_len(0)?;
-            log_file.sync_all()?;
-            fs::File::open(self.path.join(TABLE_DIR))?.sync_all()?;
+            io_try!(log_file.seek(io::SeekFrom::Start(0)));
+            io_try!(log_file.set_len(0));
+            io_try!(log_file.sync_all());
+            let parent = io_try!(fs::File::open(self.path.join(TABLE_DIR)));
+            io_try!(parent.sync_all());
 
             self.dirty_bytes = 0;
         }

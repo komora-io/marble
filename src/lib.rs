@@ -1,25 +1,8 @@
-mod metadata_log;
-
-use std::num::NonZeroU64;
-use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
-use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
-use std::sync::{
-    atomic::{AtomicU64, AtomicBool, Ordering},
-    Arc, Mutex, RwLock,
-};
-
-use pagetable::PageTable;
-
-use metadata_log::MetadataLog;
-
 pub static FAULT_INJECT_COUNTER: AtomicU64 = AtomicU64::new(u64::MAX);
 
 macro_rules! io_try {
     ($e:expr) => {{
-        if FAULT_INJECT_COUNTER.fetch_sub(1, Ordering::Relaxed) == 1 {
+        if crate::FAULT_INJECT_COUNTER.fetch_sub(1, Ordering::Relaxed) == 1 {
             return Err(io::Error::new(
                 std::io::ErrorKind::Other,
                 "injected fault",
@@ -30,11 +13,28 @@ macro_rules! io_try {
             Ok(ok) => ok,
             Err(e) => return Err(io::Error::new(
                 e.kind(),
-                format!("{} {} {}", file!(), line!(), e.to_string()),
+                format!("{}:{} -> {}", file!(), line!(), e.to_string()),
             )),
         }}
     }
 }
+
+mod metadata_log;
+
+use std::num::NonZeroU64;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, Read, Write};
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex, RwLock, MutexGuard,
+};
+
+use pagetable::PageTable;
+
+use metadata_log::MetadataLog;
 
 const HEAP_DIR_SUFFIX: &str = "heap";
 const PT_DIR_SUFFIX: &str = "page_index";
@@ -43,7 +43,8 @@ const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
 const PT_LSN_KEY: u64 = 0;
 const HEADER_LEN: usize = 20;
 
-fn pt_set(pt: &PageTable, k: u64, v: u64) -> u64 {
+fn pt_set(pt: &PageTable, k: u64, v: u64, _mu: &MutexGuard<'_, (u64, MetadataLog)>) -> u64 {
+    // NB the unused mutex must be held for page table updates to serialize updates safely
     pt.get(k).swap(v, Ordering::Release)
 }
 
@@ -474,21 +475,22 @@ impl Marble {
 
         next_lsn_and_metadata_log.1.log_batch(&write_batch)?;
         next_lsn_and_metadata_log.1.flush()?;
-        drop(next_lsn_and_metadata_log);
 
         let mut replaced_locations = vec![];
 
         for (pid, new_location_opt) in write_batch {
             let old = if let Some(new_location) = new_location_opt {
-                pt_set(&self.page_table, pid, new_location)
+                pt_set(&self.page_table, pid, new_location, &next_lsn_and_metadata_log)
             } else {
-                pt_set(&self.page_table, pid, 0)
+                pt_set(&self.page_table, pid, 0, &next_lsn_and_metadata_log)
             };
 
             if old != 0 {
                 replaced_locations.push(old);
             }
         }
+
+        drop(next_lsn_and_metadata_log);
 
         let fams = self.fams.read().unwrap();
         for old_location in replaced_locations {
@@ -513,20 +515,13 @@ impl Marble {
             let len = meta.len.load(Ordering::Acquire);
             let cap = meta.capacity.max(1);
 
-            // println!("file {:?} len: {} cap: {}", meta.path, len, cap);
-            if meta.defrag_lock.swap(true, Ordering::SeqCst) {
-                // only remove and defrag files if we can do so exclusively
-                continue;
-            }
             if len == 0 {
                 paths_to_remove.push((meta.location, meta.path.clone()));
             } else if (len * 100) / cap < u64::from(self.config.file_compaction_percent) {
                 paths_to_remove.push((meta.location, meta.path.clone()));
-                files_to_defrag.push((meta.location.0, meta.path.clone()));
+                files_to_defrag.push((meta.location.0.get(), meta.path.clone()));
             }
         }
-
-        let pt = self.pt.read().unwrap();
 
         let mut batch = HashMap::new();
 
@@ -590,11 +585,11 @@ impl Marble {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "crc mismatch"));
                 }
 
-                let current_location = pt.get(pid).load(Ordering::Acquire);
+                let current_location = self.page_table.get(pid).load(Ordering::Acquire);
 
                 if lsn == current_location {
                     // can attempt to rewrite
-                    batch.insert(PageId(pid), page_buf);
+                    batch.insert(PageId(pid.try_into().unwrap()), Some(page_buf));
                 } else {
                     //
                 }
@@ -603,7 +598,6 @@ impl Marble {
             }
         }
 
-        drop(pt);
         drop(fams);
 
         io_try!(self.write_batch(batch));
