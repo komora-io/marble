@@ -1,3 +1,6 @@
+mod metadata_log;
+
+use std::num::NonZeroU64;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
@@ -8,10 +11,12 @@ use std::sync::{
     Arc, Mutex, RwLock,
 };
 
-mod pt_lsm;
-use pt_lsm::Lsm;
+use pagetable::PageTable;
+
+use metadata_log::MetadataLog;
 
 pub static FAULT_INJECT_COUNTER: AtomicU64 = AtomicU64::new(u64::MAX);
+
 macro_rules! io_try {
     ($e:expr) => {{
         if FAULT_INJECT_COUNTER.fetch_sub(1, Ordering::Relaxed) == 1 {
@@ -35,17 +40,18 @@ const HEAP_DIR_SUFFIX: &str = "heap";
 const PT_DIR_SUFFIX: &str = "page_index";
 const LOCK_SUFFIX: &str = "lock";
 const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
-// TODO make this 0, shift everything up by 1, so that there's
-// no waste page?
-const PT_LSN_KEY: u64 = u64::MAX;
-const PT_LOGICAL_EPOCH_KEY: [u8; 8] = (u64::MAX - 1).to_be_bytes();
+const PT_LSN_KEY: u64 = 0;
 const HEADER_LEN: usize = 20;
 
+fn pt_set(pt: &PageTable, k: u64, v: u64) -> u64 {
+    pt.get(k).swap(v, Ordering::Release)
+}
+
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
-pub struct PageId(pub u64);
+pub struct PageId(pub NonZeroU64);
 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
-struct DiskLocation(u64);
+struct DiskLocation(NonZeroU64);
 
 #[derive(Debug)]
 struct FileAndMetadata {
@@ -54,7 +60,6 @@ struct FileAndMetadata {
     path: PathBuf,
     capacity: u64,
     len: AtomicU64,
-    defrag_lock: AtomicBool,
     shard: u8,
     generation: u8,
 }
@@ -119,15 +124,19 @@ impl Config {
     }
 }
 
+
 /// Garbage-collecting object store. A nice solution to back
 /// a pagecache, for people building their own databases.
 ///
-/// Serves concurrent reads, but expects a single writer.
+/// ROWEX-style concurrency: readers never block on other readers
+/// or writers, but serializes writes to be friendlier for SSD GC.
+/// This means that writes should generally be performed by some
+/// background process whose job it is to clean logs etc...
 pub struct Marble {
     // maps from PageId to DiskLocation
-    pt: RwLock<Lsm>,
+    page_table: PageTable,
+    next_file_lsn_and_metadata_log: Mutex<(u64, MetadataLog)>,
     fams: RwLock<BTreeMap<DiskLocation, FileAndMetadata>>,
-    next_file_lsn: Mutex<u64>,
     config: Config,
     _file_lock: File,
 }
@@ -165,11 +174,11 @@ impl Marble {
         _file_lock.try_lock_exclusive()?;
 
         // recover page location index
-        let pt = Lsm::recover(config.path.join(PT_DIR_SUFFIX))?;
+        let (page_table, metadata_log) = MetadataLog::recover(config.path.join(PT_DIR_SUFFIX))?;
 
         // NB LSN should initially be 1, not 0, because 0 represents
         // a page being free.
-        let recovered_pt_lsn = pt.get(PT_LSN_KEY).load(Ordering::Acquire).max(1);
+        let recovered_pt_lsn = page_table.get(PT_LSN_KEY).load(Ordering::Acquire).max(1);
 
         // parse file names
         // calculate file tenancy
@@ -231,7 +240,7 @@ impl Marble {
             options.read(true);
 
             let file = options.open(entry.path())?;
-            let location = DiskLocation(lsn);
+            let location = DiskLocation(lsn.try_into().unwrap());
 
             let file_size = entry.metadata()?.len();
             max_file_size = max_file_size.max(file_size);
@@ -245,7 +254,6 @@ impl Marble {
                 location,
                 generation,
                 shard,
-                defrag_lock: false.into(),
             };
 
             assert!(fams.insert(location, fam).is_none());
@@ -255,45 +263,41 @@ impl Marble {
 
         // initialize file tenancy from pt
 
-        for pid in 0..pt.approximate_max_child_count() {
-            let location = pt.get(pid).load(Ordering::Acquire);
+        for pid in 0..page_table.approximate_max_child_count() {
+            let location = page_table.get(pid).load(Ordering::Acquire);
             if location != 0 {
-                let (_, fam) = fams.range(..=DiskLocation(location)).next_back().unwrap();
+                let (_, fam) = fams.range(..=DiskLocation(location.try_into().unwrap())).next_back().unwrap();
                 fam.len.fetch_add(1, Ordering::Acquire);
             }
         }
 
-        if let Some((_, lsn_fam)) = fams.range(..=DiskLocation(recovered_pt_lsn)).next_back() {
+        if let Some((_, lsn_fam)) = fams.range(..=DiskLocation(recovered_pt_lsn.try_into().unwrap())).next_back() {
             lsn_fam.len.fetch_add(1, Ordering::Acquire);
         }
 
         Ok(Marble {
-            pt: RwLock::new(pt),
+            page_table,
             fams: RwLock::new(fams),
-            next_file_lsn: Mutex::new(next_file_lsn),
+            next_file_lsn_and_metadata_log: Mutex::new((next_file_lsn, metadata_log)),
             config,
             _file_lock,
         })
     }
 
-    pub fn read(&self, pid: PageId) -> io::Result<Arc<[u8]>> {
+    pub fn read(&self, pid: PageId) -> io::Result<Vec<u8>> {
         let fams = self.fams.read().unwrap();
 
-        let pt = self.pt.read().unwrap();
-        let lsn = pt.get(pid.0).load(Ordering::Acquire);
-        drop(pt);
+        let lsn = self.page_table.get(pid.0.get()).load(Ordering::Acquire);
 
-        assert_ne!(lsn, 0);
-        let location = DiskLocation(lsn);
+        let location = DiskLocation(lsn.try_into().expect("unknown page location"));
 
-        let (base_location, fam) = fams.range(..=location).next_back().unwrap();
+        let (base_location, fam) = fams.range(..=location).next_back()
+            .expect("no possible storage file for page - likely file corruption");
 
-        let file_offset = lsn - base_location.0;
-        let page_offset = file_offset + HEADER_LEN as u64;
-        let file = &fam.file;
+        let file_offset = lsn - base_location.0.get();
 
         let mut header_buf = [0_u8; HEADER_LEN];
-        file.read_exact_at(&mut header_buf, file_offset)?;
+        fam.file.read_exact_at(&mut header_buf, file_offset)?;
 
         let crc_expected_buf: [u8; 4] = header_buf[0..4].try_into().unwrap();
         let pid_buf: [u8; 8] = header_buf[4..12].try_into().unwrap();
@@ -309,10 +313,15 @@ impl Marble {
             ));
         };
 
-        let mut page_buf: Arc<[u8]> = vec![0_u8; len].into();
-        let page_buf_ref = Arc::get_mut(&mut page_buf).unwrap();
+        let mut page_buf = Vec::with_capacity(len);
+        unsafe {
+            page_buf.set_len(len);
+        }
 
-        file.read_exact_at(page_buf_ref, page_offset)?;
+        let page_offset = file_offset + HEADER_LEN as u64;
+        fam.file.read_exact_at(&mut page_buf, page_offset)?;
+
+        drop(fams);
 
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&len_buf);
@@ -323,25 +332,28 @@ impl Marble {
         if crc_expected != crc_actual {
             eprintln!(
                 "crc mismatch when reading page at offset {} in file {:?}",
-                page_offset, fam.path
+                page_offset, file_offset
             );
             return Err(io::Error::new(io::ErrorKind::InvalidData, "crc mismatch"));
         }
 
+        let read_pid = u64::from_le_bytes(pid_buf);
+
+        assert_eq!(pid.0.get(), read_pid);
+
         Ok(page_buf)
     }
 
-    /// Submit a new batch of pages
-    pub fn write_batch(&self, pages: HashMap<PageId, Vec<u8>>) -> io::Result<()> {
+    pub fn write_batch(&self, write_batch: HashMap<PageId, Option<Vec<u8>>>) -> io::Result<()> {
         let gen = 0;
-        self.shard_batch(pages, gen)
+        self.shard_batch(write_batch, gen)
     }
 
-    fn shard_batch(&self, pages: HashMap<PageId, Vec<u8>>, gen: u8) -> io::Result<()> {
-        let mut shards: HashMap<u8, HashMap<PageId, Vec<u8>>> = HashMap::new();
+    fn shard_batch(&self, write_batch: HashMap<PageId, Option<Vec<u8>>>, gen: u8) -> io::Result<()> {
+        let mut shards: HashMap<u8, HashMap<PageId, Option<Vec<u8>>>> = HashMap::new();
 
-        for (pid, data) in pages {
-            let shard_id = (self.config.partition_function)(pid, data.len(), gen);
+        for (pid, data) in write_batch {
+            let shard_id = (self.config.partition_function)(pid, data.as_ref().map(|v| v.len()).unwrap_or(0), gen);
 
             let shard = shards.entry(shard_id).or_default();
             shard.insert(pid, data);
@@ -356,25 +368,33 @@ impl Marble {
 
     fn write_batch_inner(
         &self,
-        pages: HashMap<PageId, Vec<u8>>,
+        pages: HashMap<PageId, Option<Vec<u8>>>,
         gen: u8,
         shard: u8,
     ) -> io::Result<()> {
-        let mut next_file_lsn = self.next_file_lsn.lock().unwrap();
-        let lsn = *next_file_lsn;
+        // allocates unique temporary file names
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-        let mut new_locations: Vec<(PageId, DiskLocation)> = vec![];
+        let mut new_locations: Vec<(PageId, Option<DiskLocation>)> = vec![];
         let mut buf = vec![];
 
         // NB capacity starts with 1 due to the max LSN key that is always included
         let mut capacity = 1;
-        for (pid, raw_page) in pages {
+        for (pid, raw_page_opt) in pages {
+            let raw_page = if let Some(raw_page) = raw_page_opt {
+                raw_page
+            } else {
+                new_locations.push((pid, None));
+                continue
+            };
+
             capacity += 1;
-            let address = DiskLocation(lsn + buf.len() as u64);
-            new_locations.push((pid, address));
+
+            let relative_address = buf.len() as u64;
+            new_locations.push((pid, Some(DiskLocation(relative_address.try_into().unwrap()))));
 
             let len_buf: [u8; 8] = (raw_page.len() as u64).to_le_bytes();
-            let pid_buf: [u8; 8] = pid.0.to_le_bytes();
+            let pid_buf: [u8; 8] = pid.0.get().to_le_bytes();
 
             let mut hasher = crc32fast::Hasher::new();
             hasher.update(&len_buf);
@@ -388,45 +408,44 @@ impl Marble {
             buf.write_all(&raw_page)?;
         }
 
-        *next_file_lsn += buf.len() as u64 + 1;
-        drop(next_file_lsn);
-
-        let fname = format!("{:02x}-{:016x}-{:01x}-{:016x}", shard, lsn, gen, capacity);
-
-        let tmp_fname = format!("{}-tmp", fname);
-
-        let new_path = self.config.path.join(HEAP_DIR_SUFFIX).join(fname);
+        let tmp_fname = format!("{}-tmp", TMP_COUNTER.fetch_add(1, Ordering::Relaxed));
         let tmp_path = self.config.path.join(HEAP_DIR_SUFFIX).join(tmp_fname);
 
-        let mut tmp_options = OpenOptions::new();
-        tmp_options.read(false).write(true).create(true);
+        let mut file_options = OpenOptions::new();
+        file_options.read(true).write(true).create(true);
 
-        let mut tmp_file = tmp_options.open(&tmp_path)?;
+        let mut file = file_options.open(&tmp_path)?;
 
-        tmp_file.write_all(&buf)?;
+        file.write_all(&buf)?;
+
+        let buf_len = buf.len();
         drop(buf);
 
         // mv and fsync new file and directory
 
-        tmp_file.sync_all()?;
-        drop(tmp_file);
+        file.sync_all()?;
+
+        let mut next_lsn_and_metadata_log = self.next_file_lsn_and_metadata_log.lock().unwrap();
+
+        let lsn = next_lsn_and_metadata_log.0;
+        next_lsn_and_metadata_log.0 += buf_len as u64 + 1;
+
+        let fname = format!("{:02x}-{:016x}-{:01x}-{:016x}", shard, lsn, gen, capacity);
+        let new_path = self.config.path.join(HEAP_DIR_SUFFIX).join(fname);
 
         fs::rename(tmp_path, &new_path)?;
 
-        let mut new_options = OpenOptions::new();
-        new_options.read(true);
-
-        let new_file = new_options.open(&new_path)?;
+        // fsync directory to ensure new file is present
+        File::open(self.config.path.join(HEAP_DIR_SUFFIX)).and_then(|f| f.sync_all())?;
 
         let fam = FileAndMetadata {
-            file: new_file,
+            file,
             capacity,
             len: capacity.into(),
             generation: gen,
-            location: DiskLocation(lsn),
+            location: DiskLocation(lsn.try_into().unwrap()),
             path: new_path,
             shard,
-            defrag_lock: false.into(),
         };
 
         assert!(self
@@ -436,15 +455,13 @@ impl Marble {
             .insert(fam.location, fam)
             .is_none());
 
-        File::open(self.config.path.join(HEAP_DIR_SUFFIX)).and_then(|f| f.sync_all())?;
-
-        // write a batch of updates to the pt
+        // write a batch of updates to the page table
 
         let write_batch: Vec<(u64, Option<u64>)> = new_locations
             .into_iter()
             .map(|(pid, location)| {
-                let key = pid.0;
-                let value = Some(location.0);
+                let key = pid.0.get();
+                let value = location.map(|l| l.0.get());
                 (key, value)
             })
             .chain(std::iter::once({
@@ -455,15 +472,28 @@ impl Marble {
             }))
             .collect();
 
-        let mut pt = self.pt.write().unwrap();
-        let replaced_locations = pt.write_batch(&write_batch)?;
-        pt.flush()?;
-        drop(pt);
+        next_lsn_and_metadata_log.1.log_batch(&write_batch)?;
+        next_lsn_and_metadata_log.1.flush()?;
+        drop(next_lsn_and_metadata_log);
+
+        let mut replaced_locations = vec![];
+
+        for (pid, new_location_opt) in write_batch {
+            let old = if let Some(new_location) = new_location_opt {
+                pt_set(&self.page_table, pid, new_location)
+            } else {
+                pt_set(&self.page_table, pid, 0)
+            };
+
+            if old != 0 {
+                replaced_locations.push(old);
+            }
+        }
 
         let fams = self.fams.read().unwrap();
         for old_location in replaced_locations {
             let (_, fam) = fams
-                .range(..=DiskLocation(old_location))
+                .range(..=DiskLocation(old_location.try_into().unwrap()))
                 .next_back()
                 .unwrap();
 
@@ -475,11 +505,6 @@ impl Marble {
     }
 
     pub fn maintenance(&self) -> io::Result<()> {
-        // TODO make this concurrency-friendly, because right now it blocks everything
-
-        // scan files, filter by fragmentation, group by
-        // generation and size class
-
         let mut files_to_defrag = vec![];
         let mut paths_to_remove = vec![];
 

@@ -11,9 +11,9 @@ fn run(marble: Arc<Marble>) {
         let mut batch = std::collections::HashMap::default();
 
         let base = i * BATCH_SZ;
-        for j in 0..BATCH_SZ {
-            let pid = PageId((base + j) % KEYSPACE);
-            batch.insert(pid, vec![0; 1024]);
+        for j in 1..=BATCH_SZ {
+            let pid = PageId(((base + j) % KEYSPACE).try_into().unwrap());
+            batch.insert(pid, Some(vec![0; 1024]));
         }
 
         marble.write_batch(batch).unwrap();

@@ -9,7 +9,8 @@ use std::sync::{
 
 use pagetable::PageTable;
 
-const SSTABLE_DIR: &str = "sstables";
+const LOG_PATH: &str = "metadata_log";
+const TABLE_DIR: &str = "metadata_tables";
 const U64_SZ: usize = std::mem::size_of::<u64>();
 const K: usize = 8;
 const V: usize = 8;
@@ -70,43 +71,35 @@ impl Waiter {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
-    /// If on-disk uncompressed sstable data exceeds in-memory usage
-    /// by this proportion, a full-compaction of all sstables will
-    /// occur. This is only likely to happen in situations where
-    /// multiple versions of most of the database's keys exist
-    /// in multiple sstables, but should never happen for workloads
-    /// where mostly new keys are being written.
-    pub max_space_amp: u8,
     /// When the log file exceeds this size, a new compressed
-    /// and compacted sstable will be flushed to disk and the
+    /// and compacted table will be flushed to disk and the
     /// log file will be truncated.
     pub max_log_length: usize,
     /// When the background compactor thread looks for contiguous
-    /// ranges of sstables to merge, it will require all sstables
-    /// to be at least 1/`merge_ratio` * the size of the first sstable
+    /// ranges of tables to merge, it will require all tables
+    /// to be at least 1/`merge_ratio` * the size of the first table
     /// in the contiguous window under consideration.
     pub merge_ratio: u8,
     /// When the background compactor thread looks for ranges of
-    /// sstables to merge, it will require ranges to be at least
+    /// tables to merge, it will require ranges to be at least
     /// this long.
     pub merge_window: u8,
     /// All inserts go directly to a `BufWriter` wrapping the log
     /// file. This option determines how large that in-memory buffer
     /// is.
     pub log_bufwriter_size: u32,
-    /// The level of compression to use for the sstables with zstd.
-    pub zstd_sstable_compression_level: u8,
+    /// The level of compression to use for the tables with zstd.
+    pub zstd_table_compression_level: u8,
 }
 
 impl Default for Config {
     fn default() -> Config {
         Config {
-            max_space_amp: 2,
             max_log_length: 32 * 1024 * 1024,
             merge_ratio: 3,
-            merge_window: 10,
+            merge_window: 5,
             log_bufwriter_size: 32 * 1024,
-            zstd_sstable_compression_level: 3,
+            zstd_table_compression_level: 3,
         }
     }
 }
@@ -152,15 +145,14 @@ fn hash_batch_len(len: usize) -> u32 {
 }
 
 enum WorkerMessage {
-    NewSST { id: u64, sst_sz: u64, db_sz: u64 },
+    NewT { id: u64, sst_sz: u64 },
     Stop(Arc<Waiter>),
     Heartbeat(Arc<Waiter>),
 }
 
 struct Worker {
-    sstable_directory: BTreeMap<u64, u64>,
+    table_directory: BTreeMap<u64, u64>,
     inbox: Arc<Queue<WorkerMessage>>,
-    db_sz: u64,
     path: PathBuf,
     config: Config,
     stats: Arc<WorkerStats>,
@@ -169,7 +161,7 @@ struct Worker {
 impl Worker {
     fn run(mut self) {
         while self.tick() {}
-        log::info!("tiny-lsm compaction worker quitting");
+        log::info!("tiny-metadata_store compaction worker quitting");
     }
 
     fn tick(&mut self) -> bool {
@@ -180,9 +172,9 @@ impl Worker {
 
         // only compact one run at a time before checking
         // for new messages.
-        if let Err(e) = self.sstable_maintenance() {
+        if let Err(e) = self.table_maintenance() {
             log::error!(
-                "error while compacting sstables \
+                "error while compacting tables \
                 in the background: {:?}",
                 e
             );
@@ -193,9 +185,8 @@ impl Worker {
 
     fn handle_message(&mut self, message: WorkerMessage) -> bool {
         match message {
-            WorkerMessage::NewSST { id, sst_sz, db_sz } => {
-                self.db_sz = db_sz;
-                self.sstable_directory.insert(id, sst_sz);
+            WorkerMessage::NewT { id, sst_sz, } => {
+                self.table_directory.insert(id, sst_sz);
                 true
             }
             WorkerMessage::Stop(waiter) => {
@@ -209,30 +200,29 @@ impl Worker {
         }
     }
 
-    fn sstable_maintenance(&mut self) -> Result<()> {
-        let on_disk_size: u64 = self.sstable_directory.values().sum();
+    fn table_maintenance(&mut self) -> Result<()> {
+        let on_disk_size: u64 = self.table_directory.values().sum();
 
-        log::debug!("disk size: {} mem size: {}", on_disk_size, self.db_sz);
-        if self.sstable_directory.len() > 1
-            && on_disk_size / (self.db_sz + 1) > self.config.max_space_amp as u64
+        log::debug!("disk size: {}", on_disk_size);
+        let max_tables = self.config.merge_ratio as usize * self.config.merge_window as usize;
+        if self.table_directory.len() > max_tables
         {
             log::debug!(
                 "performing full compaction, decompressed on-disk \
                 database size has grown beyond {}x the in-memory size",
-                self.config.max_space_amp
+                max_tables
             );
-            let run_to_compact: Vec<u64> = self.sstable_directory.keys().copied().collect();
+            let run_to_compact: Vec<u64> = self.table_directory.keys().copied().collect();
 
-            self.compact_sstable_run(&run_to_compact)?;
-            return Ok(());
+            return self.compact_table_run(&run_to_compact);
         }
 
-        if self.sstable_directory.len() < self.config.merge_window.max(2) as usize {
+        if self.table_directory.len() < self.config.merge_window.max(2) as usize {
             return Ok(());
         }
 
         for window in self
-            .sstable_directory
+            .table_directory
             .iter()
             .collect::<Vec<_>>()
             .windows(self.config.merge_window.max(2) as usize)
@@ -244,7 +234,7 @@ impl Worker {
             {
                 let run_to_compact: Vec<u64> = window.into_iter().map(|(id, _sum)| **id).collect();
 
-                self.compact_sstable_run(&run_to_compact)?;
+                self.compact_table_run(&run_to_compact)?;
                 return Ok(());
             }
         }
@@ -256,10 +246,10 @@ impl Worker {
     // leaving the system in an unrecoverable state, or without
     // losing data. This function must be nullipotent from the
     // external API surface's perspective.
-    fn compact_sstable_run(&mut self, sstable_ids: &[u64]) -> Result<()> {
+    fn compact_table_run(&mut self, table_ids: &[u64]) -> Result<()> {
         log::debug!(
-            "trying to compact sstable_ids {:?}",
-            sstable_ids
+            "trying to compact table_ids {:?}",
+            table_ids
                 .iter()
                 .map(|id| id_format(*id))
                 .collect::<Vec<_>>()
@@ -269,8 +259,8 @@ impl Worker {
 
         let mut read_pairs = 0;
 
-        for sstable_id in sstable_ids {
-            for (k, v) in read_sstable(&self.path, *sstable_id)? {
+        for table_id in table_ids {
+            for (k, v) in read_table(&self.path, *table_id)? {
                 map.insert(k, v);
                 read_pairs += 1;
             }
@@ -280,32 +270,32 @@ impl Worker {
             .read_bytes
             .fetch_add(read_pairs * (4 + 1 + K + V) as u64, Ordering::Relaxed);
 
-        let sst_id = sstable_ids
+        let sst_id = table_ids
             .iter()
             .max()
-            .expect("compact_sstable_run called with empty set of sst ids");
+            .expect("compact_table_run called with empty set of sst ids");
 
-        write_sstable(&self.path, *sst_id, &map, true, &self.config)?;
+        write_table(&self.path, *sst_id, &map, true, &self.config)?;
 
         self.stats
             .written_bytes
             .fetch_add(map.len() as u64 * (4 + 1 + K + V) as u64, Ordering::Relaxed);
 
         let sst_sz = map.len() as u64 * (4 + K + V) as u64;
-        self.sstable_directory.insert(*sst_id, sst_sz);
+        self.table_directory.insert(*sst_id, sst_sz);
 
-        log::debug!("compacted range into sstable {}", id_format(*sst_id));
+        log::debug!("compacted range into table {}", id_format(*sst_id));
 
-        for sstable_id in sstable_ids {
-            if sstable_id == sst_id {
+        for table_id in table_ids {
+            if table_id == sst_id {
                 continue;
             }
-            fs::remove_file(self.path.join(SSTABLE_DIR).join(id_format(*sstable_id)))?;
-            self.sstable_directory
-                .remove(sstable_id)
-                .expect("compacted sst not present in sstable_directory");
+            fs::remove_file(self.path.join(TABLE_DIR).join(id_format(*table_id)))?;
+            self.table_directory
+                .remove(table_id)
+                .expect("compacted sst not present in table_directory");
         }
-        fs::File::open(self.path.join(SSTABLE_DIR))?.sync_all()?;
+        fs::File::open(self.path.join(TABLE_DIR))?.sync_all()?;
 
         Ok(())
     }
@@ -315,10 +305,10 @@ fn id_format(id: u64) -> String {
     format!("{:016x}", id)
 }
 
-fn list_sstables(path: &Path, remove_tmp: bool) -> Result<BTreeMap<u64, u64>> {
-    let mut sstable_map = BTreeMap::new();
+fn list_tables(path: &Path, remove_tmp: bool) -> Result<BTreeMap<u64, u64>> {
+    let mut table_map = BTreeMap::new();
 
-    for dir_entry_res in fs::read_dir(path.join(SSTABLE_DIR))? {
+    for dir_entry_res in fs::read_dir(path.join(TABLE_DIR))? {
         let dir_entry = dir_entry_res?;
         let file_name = if let Ok(f) = dir_entry.file_name().into_string() {
             f
@@ -329,26 +319,26 @@ fn list_sstables(path: &Path, remove_tmp: bool) -> Result<BTreeMap<u64, u64>> {
         if let Ok(id) = u64::from_str_radix(&file_name, 16) {
             let metadata = dir_entry.metadata()?;
 
-            sstable_map.insert(id, metadata.len());
+            table_map.insert(id, metadata.len());
         } else {
             if remove_tmp && file_name.ends_with("-tmp") {
-                log::warn!("removing incomplete sstable rewrite {}", file_name);
-                fs::remove_file(path.join(SSTABLE_DIR).join(file_name))?;
+                log::warn!("removing incomplete table rewrite {}", file_name);
+                fs::remove_file(path.join(TABLE_DIR).join(file_name))?;
             }
         }
     }
 
-    Ok(sstable_map)
+    Ok(table_map)
 }
 
-fn write_sstable(
+fn write_table(
     path: &Path,
     id: u64,
     items: &HashMap<u64, Option<u64>>,
     tmp_mv: bool,
     config: &Config,
 ) -> Result<()> {
-    let sst_dir_path = path.join(SSTABLE_DIR);
+    let sst_dir_path = path.join(TABLE_DIR);
     let sst_path = if tmp_mv {
         sst_dir_path.join(format!("{:x}-tmp", id))
     } else {
@@ -362,7 +352,7 @@ fn write_sstable(
 
     let max_zstd_level = zstd::compression_level_range();
     let zstd_level = config
-        .zstd_sstable_compression_level
+        .zstd_table_compression_level
         .min(*max_zstd_level.end() as u8);
 
     let mut bw =
@@ -386,7 +376,7 @@ fn write_sstable(
     bw.flush()?;
 
     bw.get_mut().get_mut().sync_all()?;
-    fs::File::open(path.join(SSTABLE_DIR))?.sync_all()?;
+    fs::File::open(path.join(TABLE_DIR))?.sync_all()?;
 
     if tmp_mv {
         let new_path = sst_dir_path.join(id_format(id));
@@ -396,10 +386,10 @@ fn write_sstable(
     Ok(())
 }
 
-fn read_sstable(path: &Path, id: u64) -> Result<Vec<(u64, Option<u64>)>> {
+fn read_table(path: &Path, id: u64) -> Result<Vec<(u64, Option<u64>)>> {
     let file = fs::OpenOptions::new()
         .read(true)
-        .open(path.join(SSTABLE_DIR).join(id_format(id)))?;
+        .open(path.join(TABLE_DIR).join(id_format(id)))?;
 
     let mut reader = zstd::Decoder::new(BufReader::with_capacity(16 * 1024 * 1024, file)).unwrap();
 
@@ -411,7 +401,7 @@ fn read_sstable(path: &Path, id: u64) -> Result<Vec<(u64, Option<u64>)>> {
     reader.read_exact(len_buf)?;
 
     let expected_len: u64 = u64::from_le_bytes(*len_buf);
-    let mut sstable = Vec::with_capacity(expected_len as usize);
+    let mut table = Vec::with_capacity(expected_len as usize);
 
     while let Ok(()) = reader.read_exact(&mut buf) {
         let crc_expected: u32 = u32::from_le_bytes(buf[0..4].try_into().unwrap());
@@ -419,7 +409,7 @@ fn read_sstable(path: &Path, id: u64) -> Result<Vec<(u64, Option<u64>)>> {
             0 => false,
             1 => true,
             _ => {
-                log::warn!("detected torn-write while reading sstable {:016x}", id);
+                log::warn!("detected torn-write while reading table {:016x}", id);
                 break;
             }
         };
@@ -435,30 +425,29 @@ fn read_sstable(path: &Path, id: u64) -> Result<Vec<(u64, Option<u64>)>> {
         let crc_actual: u32 = hash(&k, &v);
 
         if crc_expected != crc_actual {
-            log::warn!("detected torn-write while reading sstable {:016x}", id);
+            log::warn!("detected torn-write while reading table {:016x}", id);
             break;
         }
 
-        sstable.push((k, v));
+        table.push((k, v));
     }
 
-    if sstable.len() as u64 != expected_len {
+    if table.len() as u64 != expected_len {
         log::warn!(
-            "sstable {:016x} tear detected - process probably crashed \
-            before full sstable could be written out",
+            "table {:016x} tear detected - process probably crashed \
+            before full table could be written out",
             id
         );
     }
 
-    Ok(sstable)
+    Ok(table)
 }
 
-pub struct Lsm {
+pub struct MetadataLog {
     // `BufWriter` flushes on drop
     memtable: HashMap<u64, Option<u64>>,
-    db: PageTable,
     worker_outbox: Arc<Queue<WorkerMessage>>,
-    next_sstable_id: u64,
+    next_table_id: u64,
     dirty_bytes: usize,
     log: BufWriter<fs::File>,
     path: PathBuf,
@@ -467,7 +456,7 @@ pub struct Lsm {
     _worker_stats: Arc<WorkerStats>,
 }
 
-impl Drop for Lsm {
+impl Drop for MetadataLog {
     fn drop(&mut self) {
         let waiter: Arc<Waiter> = Arc::default();
 
@@ -477,25 +466,17 @@ impl Drop for Lsm {
     }
 }
 
-impl std::ops::Deref for Lsm {
-    type Target = PageTable;
-
-    fn deref(&self) -> &Self::Target {
-        &self.db
-    }
-}
-
-impl Lsm {
-    pub fn recover<P: AsRef<Path>>(p: P) -> Result<Lsm> {
-        Lsm::recover_with_config(p, Config::default())
+impl MetadataLog {
+    pub fn recover<P: AsRef<Path>>(p: P) -> Result<(PageTable, MetadataLog)> {
+        MetadataLog::recover_with_config(p, Config::default())
     }
 
-    pub fn recover_with_config<P: AsRef<Path>>(p: P, config: Config) -> Result<Lsm> {
+    pub fn recover_with_config<P: AsRef<Path>>(p: P, config: Config) -> Result<(PageTable, MetadataLog)> {
         let path = p.as_ref();
         if !path.exists() {
             fs::create_dir_all(path)?;
-            fs::create_dir(path.join(SSTABLE_DIR))?;
-            fs::File::open(path.join(SSTABLE_DIR))?.sync_all()?;
+            fs::create_dir(path.join(TABLE_DIR))?;
+            fs::File::open(path.join(TABLE_DIR))?.sync_all()?;
             fs::File::open(path)?.sync_all()?;
             let mut parent_opt = path.parent();
 
@@ -515,26 +496,26 @@ impl Lsm {
             }
         }
 
-        let sstable_directory = list_sstables(path, true)?;
+        let table_directory = list_tables(path, true)?;
 
-        let db = PageTable::default();
-        for sstable_id in sstable_directory.keys() {
-            for (k, v) in read_sstable(path, *sstable_id)? {
+        let page_table = PageTable::default();
+        for table_id in table_directory.keys() {
+            for (k, v) in read_table(path, *table_id)? {
                 if let Some(v) = v {
-                    pt_set(&db, k, v);
+                    pt_set(&page_table, k, v);
                 } else {
-                    pt_set(&db, k, 0);
+                    pt_set(&page_table, k, 0);
                 }
             }
         }
 
-        let max_sstable_id = sstable_directory.keys().next_back().copied();
+        let max_table_id = table_directory.keys().next_back().copied();
 
         let log = fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(path.join("log"))?;
+            .open(path.join(LOG_PATH))?;
 
         let mut reader = BufReader::new(log);
 
@@ -648,9 +629,9 @@ impl Lsm {
                         memtable.insert(k, v);
 
                         if let Some(v) = v {
-                            pt_set(&db, k, v);
+                            pt_set(&page_table, k, v);
                         } else {
-                            pt_set(&db, k, 0);
+                            pt_set(&page_table, k, 0);
                         }
                     }
                     recovered += wb_recovered;
@@ -661,9 +642,9 @@ impl Lsm {
                 memtable.insert(k, v);
 
                 if let Some(v) = v {
-                    pt_set(&db, k, v);
+                    pt_set(&page_table, k, v);
                 } else {
-                    pt_set(&db, k, 0);
+                    pt_set(&page_table, k, 0);
                 }
 
                 recovered += buf.len() as u64;
@@ -671,7 +652,7 @@ impl Lsm {
         }
 
         // need to back up a few bytes to chop off the torn log
-        let max_child_count = db.approximate_max_child_count();
+        let max_child_count = page_table.approximate_max_child_count();
         log::debug!(
             "recovered between {} and {} kv pairs",
             max_child_count - (1 << 16),
@@ -682,7 +663,7 @@ impl Lsm {
         log_file.seek(io::SeekFrom::Start(recovered))?;
         log_file.set_len(recovered)?;
         log_file.sync_all()?;
-        fs::File::open(path.join(SSTABLE_DIR))?.sync_all()?;
+        fs::File::open(path.join(TABLE_DIR))?.sync_all()?;
 
         let q = Arc::new(Queue {
             mu: Default::default(),
@@ -696,9 +677,8 @@ impl Lsm {
 
         let worker: Worker = Worker {
             path: path.clone().into(),
-            sstable_directory,
+            table_directory,
             inbox: q.clone(),
-            db_sz: max_child_count * (K + V) as u64,
             config,
             stats: _worker_stats.clone(),
         };
@@ -710,10 +690,10 @@ impl Lsm {
 
         hb_waiter.wait();
 
-        let lsm = Lsm {
+        let metadata_store = MetadataLog {
             log: BufWriter::with_capacity(config.log_bufwriter_size as usize, reader.into_inner()),
             path: path.into(),
-            next_sstable_id: max_sstable_id.unwrap_or(0) + 1,
+            next_table_id: max_table_id.unwrap_or(0) + 1,
             dirty_bytes: recovered as usize,
             worker_outbox: q,
             config,
@@ -727,15 +707,14 @@ impl Lsm {
                 write_amp: 0.,
             },
             _worker_stats,
-            db,
             memtable,
         };
 
-        Ok(lsm)
+        Ok((page_table, metadata_store))
     }
 
     /// Returns previous non-zero values for each item in batch
-    pub fn write_batch(&mut self, write_batch: &[(u64, Option<u64>)]) -> Result<Vec<u64>> {
+    pub fn log_batch(&mut self, write_batch: &[(u64, Option<u64>)]) -> Result<()> {
         let batch_len: [u8; 8] = (write_batch.len() as u64).to_le_bytes();
         let crc = hash_batch_len(write_batch.len());
 
@@ -751,19 +730,7 @@ impl Lsm {
         let pad = [0; U64_SZ];
         self.log.write_all(&pad[..pad_sz])?;
 
-        let mut replaced = Vec::with_capacity(write_batch.len());
-
         for (k, v_opt) in write_batch {
-            let old = if let Some(v) = v_opt {
-                pt_set(&self.db, *k, *v)
-            } else {
-                pt_set(&self.db, *k, 0)
-            };
-
-            if old != 0 {
-                replaced.push(old);
-            }
-
             self.log_mutation(*k, *v_opt)?;
             self.memtable.insert(*k, *v_opt);
         }
@@ -772,7 +739,7 @@ impl Lsm {
             self.flush()?;
         }
 
-        Ok(replaced)
+        Ok(())
     }
 
     fn log_mutation(&mut self, k: u64, v: Option<u64>) -> Result<()> {
@@ -810,66 +777,43 @@ impl Lsm {
     /// written out to disk and fsynced. If
     /// the log file has grown above a certain
     /// threshold, it will be compacted into
-    /// a new sstable and the log file will
-    /// be truncated after the sstable has
-    /// been written, fsynced, and the sstable
+    /// a new table and the log file will
+    /// be truncated after the table has
+    /// been written, fsynced, and the table
     /// directory has been fsyced.
     pub fn flush(&mut self) -> Result<()> {
         self.log.flush()?;
         self.log.get_mut().sync_all()?;
 
         if self.dirty_bytes > self.config.max_log_length {
-            log::debug!("compacting log to sstable");
+            log::debug!("compacting log to table");
             let memtable = std::mem::take(&mut self.memtable);
-            let sst_id = self.next_sstable_id;
-            if let Err(e) = write_sstable(&self.path, sst_id, &memtable, false, &self.config) {
+            let sst_id = self.next_table_id;
+            if let Err(e) = write_table(&self.path, sst_id, &memtable, false, &self.config) {
                 // put memtable back together before returning
                 self.memtable = memtable;
-                log::error!("failed to flush lsm log to sstable: {:?}", e);
+                log::error!("failed to flush metadata_store log to table: {:?}", e);
                 return Err(e.into());
             }
 
             let sst_sz = 8 + (memtable.len() as u64 * (4 + K + V) as u64);
-            let db_sz = self.db.approximate_max_child_count() * (K + V) as u64;
 
-            self.worker_outbox.send(WorkerMessage::NewSST {
+            self.worker_outbox.send(WorkerMessage::NewT {
                 id: sst_id,
                 sst_sz,
-                db_sz,
             });
 
-            self.next_sstable_id += 1;
+            self.next_table_id += 1;
 
             let log_file: &mut fs::File = self.log.get_mut();
             log_file.seek(io::SeekFrom::Start(0))?;
             log_file.set_len(0)?;
             log_file.sync_all()?;
-            fs::File::open(self.path.join(SSTABLE_DIR))?.sync_all()?;
+            fs::File::open(self.path.join(TABLE_DIR))?.sync_all()?;
 
             self.dirty_bytes = 0;
         }
 
         Ok(())
-    }
-
-    pub fn stats(&mut self) -> Result<Stats> {
-        self.stats.written_bytes += self._worker_stats.written_bytes.swap(0, Ordering::Relaxed);
-        self.stats.read_bytes += self._worker_stats.read_bytes.swap(0, Ordering::Relaxed);
-        self.stats.resident_bytes = self.db.approximate_max_child_count() * (K + V) as u64;
-
-        let mut on_disk_bytes: u64 = std::fs::metadata(self.path.join("log"))?.len();
-
-        on_disk_bytes += list_sstables(&self.path, false)?
-            .into_iter()
-            .map(|(_, len)| len)
-            .sum::<u64>();
-
-        self.stats.on_disk_bytes = on_disk_bytes;
-
-        self.stats.write_amp =
-            self.stats.written_bytes as f64 / self.stats.on_disk_bytes.max(1) as f64;
-        self.stats.space_amp =
-            self.stats.on_disk_bytes as f64 / self.stats.resident_bytes.max(1) as f64;
-        Ok(self.stats)
     }
 }
