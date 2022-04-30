@@ -1,5 +1,15 @@
 pub static FAULT_INJECT_COUNTER: AtomicU64 = AtomicU64::new(u64::MAX);
 
+fn rng_sleep() {
+    let rdtsc = unsafe {
+        core::arch::x86_64::_rdtsc() as u16
+    };
+
+    for _ in 0..rdtsc.trailing_zeros() {
+        std::thread::yield_now();
+    }
+}
+
 macro_rules! io_try {
     ($e:expr) => {{
         if crate::FAULT_INJECT_COUNTER.fetch_sub(1, Ordering::Relaxed) == 1 {
@@ -8,6 +18,9 @@ macro_rules! io_try {
                 "injected fault",
             ));
         }
+
+        crate::rng_sleep();
+
         // converts io::Error to include the location of error creation
         match $e {
             Ok(ok) => ok,
@@ -84,6 +97,9 @@ pub struct Config {
     /// pages that have similar expected lifespans, to
     /// minimize the costs of copying live data over time.
     pub partition_function: fn(PageId, usize, u8) -> u8,
+    /// The minimum number of files within a generation to
+    /// collect if below the live compaction percent.
+    pub min_compaction_files: usize
 }
 
 pub fn default_partition_function(_pid: PageId, _size: usize, _generation: u8) -> u8 {
@@ -98,6 +114,7 @@ impl Default for Config {
             file_compaction_percent: 60,
             partition_function: default_partition_function,
             max_page_size: 16 * 1024 * 1024 * 1024, // 16gb
+            min_compaction_files: 2,
         }
     }
 }
@@ -537,6 +554,17 @@ impl Marble {
 
         // rewrite the live pages
         for (generation, files) in &files_to_defrag {
+            if files.len() < self.config.min_compaction_files {
+                // release claims on batch with too few files
+                let fams = self.fams.read().unwrap();
+                for (base_lsn, _) in files {
+                    let dl = DiskLocation((*base_lsn).try_into().unwrap());
+                    assert!(fams[&dl].rewrite_claim.swap(false, Ordering::SeqCst))
+                }
+                // skip rewrite of the files in this generation
+                continue;
+            }
+
             let mut batch = HashMap::new();
 
             for (base_lsn, path) in files {
