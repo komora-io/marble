@@ -493,7 +493,7 @@ impl Marble {
             .chain(std::iter::once({
                 // always mark the lsn w/ the pt batch
                 let key = PT_LSN_KEY;
-                let value = Some(0);
+                let value = Some(lsn);
                 (key, value)
             }))
             .collect();
@@ -718,5 +718,20 @@ fn test_00() {
         assert!(marble.read(pid).unwrap().is_some());
         marble = _restart(marble);
         assert!(marble.read(pid).unwrap().is_some());
+    });
+}
+
+#[test]
+fn test_01() {
+    _with_tmp_instance(|mut marble| {
+        let pid_1 = PageId(1.try_into().unwrap());
+        marble.write_batch([(pid_1, Some(vec![]))].into_iter().collect()).unwrap();
+        let pid_2 = PageId(2.try_into().unwrap());
+        marble.write_batch([(pid_2, Some(vec![]))].into_iter().collect()).unwrap();
+        assert!(marble.read(pid_1).unwrap().is_some());
+        assert!(marble.read(pid_2).unwrap().is_some());
+        marble = _restart(marble);
+        assert!(marble.read(pid_1).unwrap().is_some());
+        assert!(marble.read(pid_2).unwrap().is_some());
     });
 }
