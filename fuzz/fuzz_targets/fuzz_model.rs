@@ -28,7 +28,7 @@ impl<'a> Arbitrary<'a> for Config {
 }
 
 #[derive(Debug)]
-struct WriteBatch(HashMap<PageId, Vec<u8>>);
+struct WriteBatch(HashMap<PageId, Option<Vec<u8>>>);
 
 impl<'a> Arbitrary<'a> for WriteBatch {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
@@ -36,12 +36,17 @@ impl<'a> Arbitrary<'a> for WriteBatch {
 
         let mut batch = HashMap::default();
         for _ in 0..pages {
-            let pid: u8 = Arbitrary::arbitrary(u)?;
+            let pid_u8: u8 = Arbitrary::arbitrary(u)?;
+            let pid = u64::from(pid_u8).max(1);
             let sz: u8 = Arbitrary::arbitrary(u)?;
 
-            let page = vec![0b10101010; sz as usize];
+            let page = if Arbitrary::arbitrary(u)? {
+                Some(vec![0b10101010; sz as usize])
+            } else {
+                None
+            };
 
-            batch.insert(PageId(pid as u64), page);
+            batch.insert(PageId(pid.try_into().unwrap()), page);
         }
 
         Ok(WriteBatch(batch))
@@ -79,7 +84,10 @@ fuzz_target!(|args: (Config, Vec<Op>)| {
         };
 
         for (pid, expected) in &model {
-            assert_eq!(expected, &*marble.read(*pid).unwrap());
+            let expected_ref: Option<&[u8]> = expected.as_deref();
+            let actual: Option<Vec<u8>> = marble.read(*pid).unwrap();
+            let actual_ref: Option<&[u8]> = actual.as_deref();
+            assert_eq!(expected_ref, actual_ref);
         }
     }
 

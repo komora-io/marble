@@ -42,7 +42,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, AtomicBool, Ordering},
-    Mutex, RwLock, MutexGuard,
+    Mutex, RwLock,
 };
 
 use pagetable::PageTable;
@@ -56,11 +56,6 @@ const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
 const PT_LSN_KEY: u64 = 0;
 const HEADER_LEN: usize = 20;
 const MAX_GENERATION: u8 = 5;
-
-fn pt_set(pt: &PageTable, k: u64, v: u64, _mu: &MutexGuard<'_, (u64, MetadataLog)>) -> u64 {
-    // NB the unused mutex must be held for page table updates to serialize updates safely
-    pt.get(k).swap(v, Ordering::Release)
-}
 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
 pub struct PageId(pub NonZeroU64);
@@ -158,6 +153,7 @@ pub struct Marble {
     fams: RwLock<BTreeMap<DiskLocation, FileAndMetadata>>,
     config: Config,
     _file_lock: File,
+    rowex: Mutex<()>,
 }
 
 impl Marble {
@@ -300,13 +296,17 @@ impl Marble {
             next_file_lsn_and_metadata_log: Mutex::new((next_file_lsn, metadata_log)),
             config,
             _file_lock,
+            rowex: Default::default(),
         })
     }
 
-    pub fn read(&self, pid: PageId) -> io::Result<Vec<u8>> {
+    pub fn read(&self, pid: PageId) -> io::Result<Option<Vec<u8>>> {
         let fams = self.fams.read().unwrap();
 
         let lsn = self.page_table.get(pid.0.get()).load(Ordering::Acquire);
+        if lsn == 0 {
+            return Ok(None);
+        }
 
         let location = DiskLocation(lsn.try_into().expect("unknown page location"));
 
@@ -360,10 +360,11 @@ impl Marble {
 
         assert_eq!(pid.0.get(), read_pid);
 
-        Ok(page_buf)
+        Ok(Some(page_buf))
     }
 
     pub fn write_batch(&self, write_batch: HashMap<PageId, Option<Vec<u8>>>) -> io::Result<()> {
+        let _mu = self.rowex.lock().unwrap();
         let gen = 0;
         self.shard_batch(write_batch, gen)
     }
@@ -497,17 +498,18 @@ impl Marble {
         let mut replaced_locations = vec![];
 
         for (pid, new_location_opt) in write_batch {
-            let old = if let Some(new_location) = new_location_opt {
-                pt_set(&self.page_table, pid, new_location, &next_lsn_and_metadata_log)
-            } else {
-                pt_set(&self.page_table, pid, 0, &next_lsn_and_metadata_log)
-            };
+            let old = self.page_table.get(pid).swap(
+                new_location_opt.unwrap_or(0),
+                Ordering::Release,
+            );
 
             if old != 0 {
                 replaced_locations.push(old);
             }
         }
 
+        // NB this mutex should be held for the pagetable location
+        // installation above
         drop(next_lsn_and_metadata_log);
 
         let fams = self.fams.read().unwrap();
@@ -525,6 +527,7 @@ impl Marble {
     }
 
     pub fn maintenance(&self) -> io::Result<()> {
+        let _mu = self.rowex.lock().unwrap();
         let mut paths_to_remove = vec![];
         let mut files_to_defrag: HashMap<u8, Vec<_>> = Default::default();
 
