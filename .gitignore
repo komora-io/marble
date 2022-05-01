@@ -6,4 +6,4 @@ fuzz/artifacts
 fuzz/corpus
 Cargo.lock
 target
-test_*
+testing_data_directories

@@ -213,7 +213,7 @@ impl Marble {
 
             // remove files w/ temp name
             if name.ends_with("tmp") {
-                eprintln!(
+                log::warn!(
                     "removing heap file that was not fully written before the last crash: {:?}",
                     entry.path()
                 );
@@ -224,7 +224,7 @@ impl Marble {
 
             let splits: Vec<&str> = name.split("-").collect();
             if splits.len() != 4 {
-                eprintln!(
+                log::error!(
                     "encountered strange file in internal directory: {:?}",
                     entry.path()
                 );
@@ -242,7 +242,7 @@ impl Marble {
 
             // remove files that are ahead of the recovered page location index
             if lsn > recovered_pt_lsn {
-                eprintln!(
+                log::warn!(
                     "removing heap file that has an lsn of {}, \
                     which is higher than the recovered page table lsn of {}",
                     lsn, recovered_pt_lsn,
@@ -349,7 +349,7 @@ impl Marble {
         let crc_actual: u32 = hasher.finalize();
 
         if crc_expected != crc_actual {
-            eprintln!(
+            log::warn!(
                 "crc mismatch when reading page at offset {} in file {:?}",
                 page_offset, file_offset
             );
@@ -477,17 +477,23 @@ impl Marble {
 
         // write a batch of updates to the page table
 
+        assert_ne!(lsn, 0);
+
         let write_batch: Vec<(u64, Option<u64>)> = new_locations
             .into_iter()
-            .map(|(pid, location)| {
+            .map(|(pid, location_opt)| {
                 let key = pid.0.get();
-                let value = location;
+                let value = if let Some(location) = location_opt {
+                    Some(location + lsn)
+                } else {
+                    None
+                };
                 (key, value)
             })
             .chain(std::iter::once({
                 // always mark the lsn w/ the pt batch
                 let key = PT_LSN_KEY;
-                let value = Some(lsn);
+                let value = Some(0);
                 (key, value)
             }))
             .collect();
@@ -594,7 +600,7 @@ impl Marble {
                     let len = usize::try_from(u64::from_le_bytes(len_buf)).unwrap();
 
                     if len > self.config.max_page_size {
-                        eprintln!("corrupt page size detected: {} bytes", len);
+                        log::warn!("corrupt page size detected: {} bytes", len);
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "corrupt page size",
@@ -622,7 +628,7 @@ impl Marble {
                     let crc_actual = hasher.finalize();
 
                     if crc_expected != crc_actual {
-                        eprintln!(
+                        log::warn!(
                             "crc mismatch when reading page at offset {} in file {:?}",
                             offset, path
                         );
@@ -675,6 +681,9 @@ static _TEST_COUNTER: AtomicU64 = AtomicU64::new(u64::MAX);
 
 fn _with_tmp_instance<F: FnOnce(Marble)>(f: F) {
     let config = test_conf(&format!("test_{}", _TEST_COUNTER.fetch_add(1, Ordering::SeqCst)));
+
+    let _ = std::fs::remove_dir_all(&config.path);
+
     let marble = config.open().unwrap();
 
     f(marble);
@@ -700,7 +709,6 @@ pub fn test_conf(subdir: &str) -> Config {
         ..Default::default()
     }
 }
-
 
 #[test]
 fn test_00() {

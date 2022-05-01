@@ -46,4 +46,6 @@ fn main() {
     for thread in threads {
         thread.join().unwrap();
     }
+
+    dbg!(u64::MAX - marble::FAULT_INJECT_COUNTER.load(std::sync::atomic::Ordering::Acquire));
 }
