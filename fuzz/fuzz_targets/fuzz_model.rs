@@ -34,14 +34,12 @@ struct WriteBatch(HashMap<PageId, Option<Vec<u8>>>);
 
 impl<'a> Arbitrary<'a> for WriteBatch {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let pages_unmin: u8 = Arbitrary::arbitrary(u)?;
-        let pages = pages_unmin.min(1);
+        let pages: usize = u.int_in_range(1..=5)?;
 
         let mut batch = HashMap::default();
         for _ in 0..pages {
-            let pid_u8: u8 = Arbitrary::arbitrary(u)?;
-            let pid = u64::from(pid_u8).max(1);
-            let sz: u8 = Arbitrary::arbitrary(u)?;
+            let pid: u64 = u.int_in_range(1..=8)?;
+            let sz: usize =  u.int_in_range(0..=9)?;
 
             let page = if Arbitrary::arbitrary(u)? {
                 Some(vec![0b10101010; sz as usize])

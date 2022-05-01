@@ -15,7 +15,7 @@ macro_rules! io_try {
         if crate::FAULT_INJECT_COUNTER.fetch_sub(1, Ordering::Relaxed) == 1 {
             return Err(io::Error::new(
                 std::io::ErrorKind::Other,
-                "injected fault",
+                format!("injected fault at {}:{}", file!(), line!()),
             ));
         }
 
@@ -60,7 +60,7 @@ const MAX_GENERATION: u8 = 5;
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
 pub struct PageId(pub NonZeroU64);
 
-#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
 struct DiskLocation(NonZeroU64);
 
 #[derive(Debug)]
@@ -171,6 +171,8 @@ impl Marble {
 
         config.validate()?;
 
+        log::debug!("opening Marble at {:?}", config.path);
+
         // initialize directories if not present
         let heap_dir = config.path.join(HEAP_DIR_SUFFIX);
 
@@ -210,6 +212,8 @@ impl Marble {
                 .expect("file without name encountered in internal directory")
                 .to_str()
                 .expect("non-utf8 file name encountered in internal directory");
+
+            log::trace!("examining filename {} in heap directory", name);
 
             // remove files w/ temp name
             if name.ends_with("tmp") {
@@ -271,6 +275,7 @@ impl Marble {
                 rewrite_claim: false.into(),
             };
 
+            log::debug!("inserting new fam at location {:?}", location);
             assert!(fams.insert(location, fam).is_none());
         }
 
@@ -468,6 +473,8 @@ impl Marble {
             rewrite_claim: false.into(),
         };
 
+        log::debug!("inserting new fam at location {:?}", lsn);
+
         assert!(self
             .fams
             .write()
@@ -509,6 +516,8 @@ impl Marble {
                 Ordering::Release,
             );
 
+            log::trace!("updating metadata for pid {} from {:?} to {:?}", pid, old, new_location_opt);
+
             if old != 0 {
                 replaced_locations.push(old);
             }
@@ -533,8 +542,9 @@ impl Marble {
     }
 
     pub fn maintenance(&self) -> io::Result<()> {
+        log::debug!("performing maintenance");
         let _mu = self.rowex.lock().unwrap();
-        let mut paths_to_remove = vec![];
+        let mut paths_to_remove = HashMap::new();
         let mut files_to_defrag: HashMap<u8, Vec<_>> = Default::default();
 
         let fams = self.fams.read().unwrap();
@@ -549,9 +559,11 @@ impl Marble {
             }
 
             if len == 0 {
-                paths_to_remove.push((meta.location, meta.path.clone()));
+                log::trace!("fam at location {:?} is empty, marking it for removal", meta.location);
+                paths_to_remove.insert(meta.location, meta.path.clone());
             } else if (len * 100) / cap < u64::from(self.config.file_compaction_percent) {
-                paths_to_remove.push((meta.location, meta.path.clone()));
+                log::trace!("fam at location {:?} is ready to be compacted, marking it for removal", meta.location);
+                paths_to_remove.insert(meta.location, meta.path.clone());
 
                 let generation = meta.generation.saturating_add(1).min(MAX_GENERATION);
 
@@ -563,12 +575,15 @@ impl Marble {
 
         // rewrite the live pages
         for (generation, files) in &files_to_defrag {
+            log::trace!("compacting files {:?} with generation {}", files, generation);
             if files.len() < self.config.min_compaction_files {
                 // release claims on batch with too few files
                 let fams = self.fams.read().unwrap();
                 for (base_lsn, _) in files {
+                    paths_to_remove.remove(&dl);
+
                     let dl = DiskLocation((*base_lsn).try_into().unwrap());
-                    assert!(fams[&dl].rewrite_claim.swap(false, Ordering::SeqCst))
+                    assert!(fams[&dl].rewrite_claim.swap(false, Ordering::SeqCst));
                 }
                 // skip rewrite of the files in this generation
                 continue;
@@ -656,6 +671,7 @@ impl Marble {
         let mut fams = self.fams.write().unwrap();
 
         for (location, _) in &paths_to_remove {
+            log::debug!("removing fam at location {:?}", location);
             fams.remove(location);
         }
 
@@ -731,6 +747,23 @@ fn test_01() {
         assert!(marble.read(pid_1).unwrap().is_some());
         assert!(marble.read(pid_2).unwrap().is_some());
         marble = _restart(marble);
+        assert!(marble.read(pid_1).unwrap().is_some());
+        assert!(marble.read(pid_2).unwrap().is_some());
+    });
+}
+
+#[test]
+fn test_02() {
+    let _ = env_logger::try_init();
+
+    _with_tmp_instance(|marble| {
+        let pid_1 = PageId(1.try_into().unwrap());
+        marble.write_batch([(pid_1, Some(vec![]))].into_iter().collect()).unwrap();
+        let pid_2 = PageId(2.try_into().unwrap());
+        marble.write_batch([(pid_2, Some(vec![]))].into_iter().collect()).unwrap();
+        assert!(marble.read(pid_1).unwrap().is_some());
+        assert!(marble.read(pid_2).unwrap().is_some());
+        marble.maintenance().unwrap();
         assert!(marble.read(pid_1).unwrap().is_some());
         assert!(marble.read(pid_2).unwrap().is_some());
     });

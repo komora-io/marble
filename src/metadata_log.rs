@@ -656,8 +656,8 @@ impl MetadataLog {
         // need to back up a few bytes to chop off the torn log
         let max_child_count = page_table.approximate_max_child_count();
         log::debug!(
-            "recovered between {} and {} kv pairs",
-            max_child_count - (1 << 16),
+            "recovered between {} and {} pieces of metadata",
+            max_child_count.saturating_sub(1 << 16),
             max_child_count
         );
         log::debug!("rewinding log down to length {}", recovered);
