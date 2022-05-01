@@ -9,14 +9,16 @@ use std::collections::HashMap;
 
 use arbitrary::Arbitrary;
 
-use marble::{Config as MarbleConfig, PageId};
+use marble::{Config as MarbleConfig, PageId, TEST_DIR};
 
 #[derive(Debug)]
 struct Config(MarbleConfig);
 
 impl<'a> Arbitrary<'a> for Config {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let path = std::path::Path::new("fuzz_model_dirs").join(uuid::Uuid::new_v4().to_string()).into();
+        let path = std::path::Path::new(TEST_DIR)
+            .join("fuzz")
+            .join(uuid::Uuid::new_v4().to_string()).into();
 
         Ok(Config(MarbleConfig {
             path,
@@ -32,7 +34,8 @@ struct WriteBatch(HashMap<PageId, Option<Vec<u8>>>);
 
 impl<'a> Arbitrary<'a> for WriteBatch {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let pages: u8 = Arbitrary::arbitrary(u)?;
+        let pages_unmin: u8 = Arbitrary::arbitrary(u)?;
+        let pages = pages_unmin.min(1);
 
         let mut batch = HashMap::default();
         for _ in 0..pages {

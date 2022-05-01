@@ -133,8 +133,8 @@ impl Config {
         Ok(())
     }
 
-    pub fn open(self) -> io::Result<Marble> {
-        Marble::open_with_config(self)
+    pub fn open(&self) -> io::Result<Marble> {
+        Marble::open_with_config(self.clone())
     }
 }
 
@@ -669,4 +669,46 @@ fn _auto_trait_assertions() {
     fn f<T: Send + Sync + UnwindSafe + RefUnwindSafe>() {}
 
     f::<Marble>();
+}
+
+static _TEST_COUNTER: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn _with_tmp_instance<F: FnOnce(Marble)>(f: F) {
+    let config = test_conf(&format!("test_{}", _TEST_COUNTER.fetch_add(1, Ordering::SeqCst)));
+    let marble = config.open().unwrap();
+
+    f(marble);
+
+    std::fs::remove_dir_all(config.path).unwrap();
+}
+
+fn _restart(marble: Marble) -> Marble {
+    let config = marble.config.clone();
+    drop(marble);
+    config.open().unwrap()
+}
+
+#[doc(hidden)]
+pub const TEST_DIR: &str = "testing_data_directories";
+
+#[doc(hidden)]
+pub fn test_conf(subdir: &str) -> Config {
+    let path = std::path::Path::new(TEST_DIR).join(subdir);
+
+    Config {
+        path,
+        ..Default::default()
+    }
+}
+
+
+#[test]
+fn test_00() {
+    _with_tmp_instance(|mut marble| {
+        let pid = PageId(1.try_into().unwrap());
+        marble.write_batch([(pid, Some(vec![]))].into_iter().collect()).unwrap();
+        assert!(marble.read(pid).unwrap().is_some());
+        marble = _restart(marble);
+        assert!(marble.read(pid).unwrap().is_some());
+    });
 }
