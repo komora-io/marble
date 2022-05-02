@@ -49,7 +49,7 @@ impl<'a> Arbitrary<'a> for WriteBatch {
                 None
             };
 
-            batch.insert(PageId(pid.try_into().unwrap()), page);
+            batch.insert(PageId::new(pid).unwrap(), page);
         }
 
         Ok(WriteBatch(batch))

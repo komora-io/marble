@@ -18,7 +18,7 @@ fn run(marble: Arc<Marble>) {
         let mut batch = std::collections::HashMap::default();
 
         for _ in 1..=BATCH_SZ {
-            let pid = PageId(((rdtsc() * MUL) % KEYSPACE).max(1).try_into().unwrap());
+            let pid = PageId::new(((rdtsc() * MUL) % KEYSPACE).max(1)).unwrap();
             batch.insert(pid, Some(vec![0; 64 * 1024]));
         }
 

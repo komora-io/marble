@@ -58,10 +58,30 @@ const HEADER_LEN: usize = 20;
 const MAX_GENERATION: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[repr(transparent)]
 pub struct PageId(pub NonZeroU64);
 
+impl PageId {
+    pub const fn new(u: u64) -> Option<PageId> {
+        if let Some(n) = NonZeroU64::new(u) {
+            Some(PageId(n))
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 struct DiskLocation(NonZeroU64);
+
+impl DiskLocation{
+    fn new(u: u64) -> Option<DiskLocation> {
+        Some(DiskLocation(NonZeroU64::new(u)?))
+    }
+}
+
 
 #[derive(Debug)]
 struct FileAndMetadata {
@@ -269,7 +289,7 @@ impl Marble {
             options.read(true);
 
             let file = io_try!(options.open(entry.path()));
-            let location = DiskLocation(lsn.try_into().unwrap());
+            let location = DiskLocation::new(lsn).unwrap();
 
             let file_size = io_try!(entry.metadata()).len();
             max_file_size = max_file_size.max(file_size);
@@ -296,12 +316,12 @@ impl Marble {
         for pid in 0..page_table.approximate_max_child_count() {
             let location = page_table.get(pid).load(Ordering::Acquire);
             if location != 0 {
-                let (_, fam) = fams.range(..=DiskLocation(location.try_into().unwrap())).next_back().unwrap();
+                let (_, fam) = fams.range(..=DiskLocation::new(location).unwrap()).next_back().unwrap();
                 fam.len.fetch_add(1, Ordering::Acquire);
             }
         }
 
-        if let Some((_, lsn_fam)) = fams.range(..=DiskLocation(recovered_pt_lsn.try_into().unwrap())).next_back() {
+        if let Some((_, lsn_fam)) = fams.range(..=DiskLocation::new(recovered_pt_lsn).unwrap()).next_back() {
             lsn_fam.len.fetch_add(1, Ordering::Acquire);
         }
 
@@ -322,7 +342,7 @@ impl Marble {
             return Ok(None);
         }
 
-        let location = DiskLocation(lsn.try_into().expect("unknown page location"));
+        let location = DiskLocation::new(lsn).unwrap();
 
         let (base_location, fam) = fams.range(..=location).next_back()
             .expect("no possible storage file for page - likely file corruption");
@@ -506,7 +526,7 @@ impl Marble {
         // fsync directory to ensure new file is present
         io_try!(File::open(self.config.path.join(HEAP_DIR_SUFFIX)).and_then(|f| f.sync_all()));
 
-        let location = DiskLocation(lsn.try_into().unwrap());
+        let location = DiskLocation::new(lsn).unwrap();
 
         let fam = FileAndMetadata {
             file,
@@ -599,7 +619,7 @@ impl Marble {
 
         for old_location in replaced_locations {
             let (_, fam) = fams
-                .range(..=DiskLocation(old_location.try_into().unwrap()))
+                .range(..=DiskLocation::new(old_location).unwrap())
                 .next_back()
                 .unwrap();
 
@@ -748,7 +768,7 @@ impl Marble {
 
                     if lsn == current_location {
                         // can attempt to rewrite
-                        batch.insert(PageId(pid.try_into().unwrap()), Some(page_buf));
+                        batch.insert(PageId::new(pid).unwrap(), Some(page_buf));
                     } else {
                         // page has been rewritten, this one isn't valid
                     }
@@ -824,7 +844,7 @@ mod test {
     #[test]
     fn test_00() {
         with_tmp_instance(|mut marble| {
-            let pid = PageId(1.try_into().unwrap());
+            let pid = PageId::new(1).unwrap();
             marble.write_batch([(pid, Some(vec![]))].into_iter().collect()).unwrap();
             assert!(marble.read(pid).unwrap().is_some());
             marble = restart(marble);
@@ -835,9 +855,9 @@ mod test {
     #[test]
     fn test_01() {
         with_tmp_instance(|mut marble| {
-            let pid_1 = PageId(1.try_into().unwrap());
+            let pid_1 = PageId::new(1).unwrap();
             marble.write_batch([(pid_1, Some(vec![]))].into_iter().collect()).unwrap();
-            let pid_2 = PageId(2.try_into().unwrap());
+            let pid_2 = PageId::new(2).unwrap();
             marble.write_batch([(pid_2, Some(vec![]))].into_iter().collect()).unwrap();
             assert!(marble.read(pid_1).unwrap().is_some());
             assert!(marble.read(pid_2).unwrap().is_some());
@@ -852,9 +872,9 @@ mod test {
         let _ = env_logger::try_init();
 
         with_tmp_instance(|marble| {
-            let pid_1 = PageId(1.try_into().unwrap());
+            let pid_1 = PageId::new(1).unwrap();
             marble.write_batch([(pid_1, Some(vec![]))].into_iter().collect()).unwrap();
-            let pid_2 = PageId(2.try_into().unwrap());
+            let pid_2 = PageId::new(2).unwrap();
             marble.write_batch([(pid_2, Some(vec![]))].into_iter().collect()).unwrap();
             assert!(marble.read(pid_1).unwrap().is_some());
             assert!(marble.read(pid_2).unwrap().is_some());
