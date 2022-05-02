@@ -138,6 +138,11 @@ impl Config {
     }
 }
 
+struct WritePath {
+    next_file_lsn: u64,
+    metadata_log: MetadataLog,
+}
+
 
 /// Garbage-collecting object store. A nice solution to back
 /// a pagecache, for people building their own databases.
@@ -149,7 +154,7 @@ impl Config {
 pub struct Marble {
     // maps from PageId to DiskLocation
     page_table: PageTable,
-    next_file_lsn_and_metadata_log: Mutex<(u64, MetadataLog)>,
+    write_path: Mutex<WritePath>,
     fams: RwLock<BTreeMap<DiskLocation, FileAndMetadata>>,
     config: Config,
     _file_lock: File,
@@ -298,7 +303,7 @@ impl Marble {
         Ok(Marble {
             page_table,
             fams: RwLock::new(fams),
-            next_file_lsn_and_metadata_log: Mutex::new((next_file_lsn, metadata_log)),
+            write_path: Mutex::new(WritePath {next_file_lsn, metadata_log}),
             config,
             _file_lock,
             rowex: Default::default(),
@@ -450,10 +455,10 @@ impl Marble {
 
         io_try!(file.sync_all());
 
-        let mut next_lsn_and_metadata_log = self.next_file_lsn_and_metadata_log.lock().unwrap();
+        let mut write_path = self.write_path.lock().unwrap();
 
-        let lsn = next_lsn_and_metadata_log.0;
-        next_lsn_and_metadata_log.0 += buf_len as u64 + 1;
+        let lsn = write_path.next_file_lsn;
+        write_path.next_file_lsn += buf_len as u64 + 1;
 
         let fname = format!("{:02x}-{:016x}-{:01x}-{:016x}", shard, lsn, gen, capacity);
         let new_path = self.config.path.join(HEAP_DIR_SUFFIX).join(fname);
@@ -475,12 +480,9 @@ impl Marble {
 
         log::debug!("inserting new fam at location {:?}", lsn);
 
-        assert!(self
-            .fams
-            .write()
-            .unwrap()
-            .insert(fam.location, fam)
-            .is_none());
+        let mut fams = self.fams.write().unwrap();
+        assert!(fams.insert(fam.location, fam).is_none());
+        drop(fams);
 
         // write a batch of updates to the page table
 
@@ -505,8 +507,8 @@ impl Marble {
             }))
             .collect();
 
-        next_lsn_and_metadata_log.1.log_batch(&write_batch)?;
-        next_lsn_and_metadata_log.1.flush()?;
+        write_path.metadata_log.log_batch(&write_batch)?;
+        write_path.metadata_log.flush()?;
 
         let mut replaced_locations = vec![];
 
@@ -525,7 +527,7 @@ impl Marble {
 
         // NB this mutex should be held for the pagetable location
         // installation above
-        drop(next_lsn_and_metadata_log);
+        drop(write_path);
 
         let fams = self.fams.read().unwrap();
         for old_location in replaced_locations {
@@ -542,8 +544,8 @@ impl Marble {
     }
 
     pub fn maintenance(&self) -> io::Result<()> {
-        log::debug!("performing maintenance");
         let _mu = self.rowex.lock().unwrap();
+        log::debug!("performing maintenance");
         let mut paths_to_remove = HashMap::new();
         let mut files_to_defrag: HashMap<u8, Vec<_>> = Default::default();
 
@@ -580,9 +582,10 @@ impl Marble {
                 // release claims on batch with too few files
                 let fams = self.fams.read().unwrap();
                 for (base_lsn, _) in files {
+                    let dl = DiskLocation((*base_lsn).try_into().unwrap());
+
                     paths_to_remove.remove(&dl);
 
-                    let dl = DiskLocation((*base_lsn).try_into().unwrap());
                     assert!(fams[&dl].rewrite_claim.swap(false, Ordering::SeqCst));
                 }
                 // skip rewrite of the files in this generation
@@ -671,7 +674,7 @@ impl Marble {
         let mut fams = self.fams.write().unwrap();
 
         for (location, _) in &paths_to_remove {
-            log::debug!("removing fam at location {:?}", location);
+            log::trace!("removing fam at location {:?}", location);
             fams.remove(location);
         }
 
