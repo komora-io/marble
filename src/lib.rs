@@ -76,7 +76,10 @@ struct FileAndMetadata {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Storage files will be kept here.
     pub path: PathBuf,
+    /// Garbage collection will try to keep storage
+    /// files around this size or smaller.
     pub target_file_size: u64,
     /// Remaining live percentage of a file before
     /// it's considered rewritabe.
@@ -85,19 +88,22 @@ pub struct Config {
     /// attempt to perform in order to read a page off of disk.
     pub max_page_size: usize,
     /// A partitioning function for pages based on
-    /// page ID, page size, and page rewrite generation.
-    /// Causes pages to be written into separate files
-    /// so that garbage collection may be handled at a
-    /// finer granularity. Ideally, you will colocate
-    /// pages that have similar expected lifespans, to
-    /// minimize the costs of copying live data over time.
-    pub partition_function: fn(PageId, usize, u8) -> u8,
+    /// page ID and page size. You may override this to
+    /// cause pages to be written into separate files so
+    /// that garbage collection may take advantage of locality
+    /// effects for your workload that are correlated to
+    /// page identifiers or the size of data.
+    ///
+    /// Ideally, you will colocate pages that have similar
+    /// expected lifespans. Doing so minimizes the costs of
+    /// copying live data over time during storage file GC.
+    pub partition_function: fn(PageId, usize) -> u8,
     /// The minimum number of files within a generation to
     /// collect if below the live compaction percent.
-    pub min_compaction_files: usize
+    pub min_compaction_files: usize,
 }
 
-pub fn default_partition_function(_pid: PageId, _size: usize, _generation: u8) -> u8 {
+pub fn default_partition_function(_pid: PageId, _size: usize) -> u8 {
     0
 }
 
@@ -381,7 +387,7 @@ impl Marble {
         let mut shards: HashMap<u8, HashMap<PageId, Option<Vec<u8>>>> = HashMap::new();
 
         for (pid, data) in write_batch {
-            let shard_id = (self.config.partition_function)(pid, data.as_ref().map(|v| v.len()).unwrap_or(0), gen);
+            let shard_id = (self.config.partition_function)(pid, data.as_ref().map(|v| v.len()).unwrap_or(0));
 
             let shard = shards.entry(shard_id).or_default();
             shard.insert(pid, data);
@@ -416,6 +422,22 @@ impl Marble {
                 new_locations.push((*pid, None));
                 continue
             };
+
+            if raw_page.len() > self.config.max_page_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "{:?} in write batch has a size of {}, which is \
+                        larger than the configured `max_page_size` of {}. \
+                        If this is intentional, please increase the configured \
+                        `max_page_size`.",
+                        pid,
+                        raw_page.len(),
+                        self.config.max_page_size,
+                    ),
+                ));
+
+            }
 
             capacity += 1;
 
