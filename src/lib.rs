@@ -55,7 +55,7 @@ const LOCK_SUFFIX: &str = "lock";
 const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
 const PT_LSN_KEY: u64 = 0;
 const HEADER_LEN: usize = 20;
-const MAX_GENERATION: u8 = 5;
+const MAX_GENERATION: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
 pub struct PageId(pub NonZeroU64);
@@ -158,7 +158,6 @@ pub struct Marble {
     fams: RwLock<BTreeMap<DiskLocation, FileAndMetadata>>,
     config: Config,
     _file_lock: File,
-    rowex: Mutex<()>,
 }
 
 impl Marble {
@@ -306,7 +305,6 @@ impl Marble {
             write_path: Mutex::new(WritePath {next_file_lsn, metadata_log}),
             config,
             _file_lock,
-            rowex: Default::default(),
         })
     }
 
@@ -374,12 +372,12 @@ impl Marble {
     }
 
     pub fn write_batch(&self, write_batch: HashMap<PageId, Option<Vec<u8>>>) -> io::Result<()> {
-        let _mu = self.rowex.lock().unwrap();
         let gen = 0;
-        self.shard_batch(write_batch, gen)
+        let lsn_fence_opt = None;
+        self.shard_batch(write_batch, gen, lsn_fence_opt)
     }
 
-    fn shard_batch(&self, write_batch: HashMap<PageId, Option<Vec<u8>>>, gen: u8) -> io::Result<()> {
+    fn shard_batch(&self, write_batch: HashMap<PageId, Option<Vec<u8>>>, gen: u8, lsn_fence_opt: Option<u64>) -> io::Result<()> {
         let mut shards: HashMap<u8, HashMap<PageId, Option<Vec<u8>>>> = HashMap::new();
 
         for (pid, data) in write_batch {
@@ -390,17 +388,18 @@ impl Marble {
         }
 
         for (shard, pages) in shards {
-            self.write_batch_inner(pages, gen, shard)?;
+            self.write_batch_inner(pages, gen, shard, lsn_fence_opt)?;
         }
 
         Ok(())
     }
 
-    fn write_batch_inner(
+    fn write_batch_inner<P: AsRef<[u8]>> (
         &self,
-        pages: HashMap<PageId, Option<Vec<u8>>>,
+        pages: HashMap<PageId, Option<P>>,
         gen: u8,
         shard: u8,
+        lsn_fence_opt: Option<u64>,
     ) -> io::Result<()> {
         // allocates unique temporary file names
         static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -410,18 +409,18 @@ impl Marble {
 
         // NB capacity starts with 1 due to the max LSN key that is always included
         let mut capacity = 1;
-        for (pid, raw_page_opt) in pages {
+        for (pid, raw_page_opt) in &pages {
             let raw_page = if let Some(raw_page) = raw_page_opt {
-                raw_page
+                raw_page.as_ref()
             } else {
-                new_locations.push((pid, None));
+                new_locations.push((*pid, None));
                 continue
             };
 
             capacity += 1;
 
             let relative_address = buf.len() as u64;
-            new_locations.push((pid, Some(relative_address)));
+            new_locations.push((*pid, Some(relative_address)));
 
             let len_buf: [u8; 8] = (raw_page.len() as u64).to_le_bytes();
             let pid_buf: [u8; 8] = pid.0.get().to_le_bytes();
@@ -468,12 +467,14 @@ impl Marble {
         // fsync directory to ensure new file is present
         io_try!(File::open(self.config.path.join(HEAP_DIR_SUFFIX)).and_then(|f| f.sync_all()));
 
+        let location = DiskLocation(lsn.try_into().unwrap());
+
         let fam = FileAndMetadata {
             file,
             capacity,
             len: capacity.into(),
             generation: gen,
-            location: DiskLocation(lsn.try_into().unwrap()),
+            location,
             path: new_path,
             rewrite_claim: false.into(),
         };
@@ -481,13 +482,14 @@ impl Marble {
         log::debug!("inserting new fam at location {:?}", lsn);
 
         let mut fams = self.fams.write().unwrap();
-        assert!(fams.insert(fam.location, fam).is_none());
+        assert!(fams.insert(location, fam).is_none());
         drop(fams);
 
         // write a batch of updates to the page table
 
         assert_ne!(lsn, 0);
 
+        let mut contention_hit = 0;
         let write_batch: Vec<(u64, Option<u64>)> = new_locations
             .into_iter()
             .map(|(pid, location_opt)| {
@@ -498,6 +500,18 @@ impl Marble {
                     None
                 };
                 (key, value)
+            })
+            .filter(|(pid, _location)| {
+                if let Some(lsn_fence) = lsn_fence_opt {
+                    if self.page_table.get(*pid).load(Ordering::Acquire) >= lsn_fence {
+                        // a concurrent batch has replaced this attempted
+                        // page GC rewrite in a later file, invalidating
+                        // the copy.
+                        contention_hit += 1;
+                        return false;
+                    }
+                }
+                true
             })
             .chain(std::iter::once({
                 // always mark the lsn w/ the pt batch
@@ -518,6 +532,17 @@ impl Marble {
                 Ordering::Release,
             );
 
+            if let Some(lsn_fence) = lsn_fence_opt {
+                assert!(
+                    lsn_fence > old || pid == 0,
+                    "lsn_fence of {} should always be higher than \
+                    the replaced lsn of {} for pid {}",
+                    lsn_fence,
+                    old,
+                    pid
+                );
+            }
+
             log::trace!("updating metadata for pid {} from {:?} to {:?}", pid, old, new_location_opt);
 
             if old != 0 {
@@ -530,6 +555,9 @@ impl Marble {
         drop(write_path);
 
         let fams = self.fams.read().unwrap();
+
+        fams[&location].len.fetch_sub(contention_hit, Ordering::Relaxed);
+
         for old_location in replaced_locations {
             let (_, fam) = fams
                 .range(..=DiskLocation(old_location.try_into().unwrap()))
@@ -544,13 +572,38 @@ impl Marble {
     }
 
     pub fn maintenance(&self) -> io::Result<()> {
-        let _mu = self.rowex.lock().unwrap();
         log::debug!("performing maintenance");
+
+        struct DeferUnclaim<'a> {
+            marble: &'a Marble,
+            claims: Vec<DiskLocation>,
+        }
+
+        impl <'a> Drop for DeferUnclaim<'a> {
+            fn drop(&mut self) {
+                let fams = self.marble.fams.read().unwrap();
+                for claim in &self.claims {
+                    if let Some(fam) = fams.get(claim) {
+                        assert!(fam.rewrite_claim.swap(false, Ordering::SeqCst));
+                    }
+                }
+            }
+        }
+
+        let mut defer_unclaim = DeferUnclaim {
+            marble: self,
+            claims: vec![],
+        };
         let mut paths_to_remove = HashMap::new();
         let mut files_to_defrag: HashMap<u8, Vec<_>> = Default::default();
 
+        let write_path = self.write_path.lock().unwrap();
+        let lsn_fence = write_path.next_file_lsn.saturating_sub(1);
+        drop(write_path);
+
         let fams = self.fams.read().unwrap();
-        for (_, meta) in &*fams {
+        for (location, meta) in &*fams {
+            assert_eq!(*location, meta.location);
             let len = meta.len.load(Ordering::Acquire);
             let cap = meta.capacity.max(1);
 
@@ -560,17 +613,19 @@ impl Marble {
                 continue;
             }
 
+            defer_unclaim.claims.push(*location);
+
             if len == 0 {
                 log::trace!("fam at location {:?} is empty, marking it for removal", meta.location);
-                paths_to_remove.insert(meta.location, meta.path.clone());
+                paths_to_remove.insert(*location, meta.path.clone());
             } else if (len * 100) / cap < u64::from(self.config.file_compaction_percent) {
                 log::trace!("fam at location {:?} is ready to be compacted, marking it for removal", meta.location);
-                paths_to_remove.insert(meta.location, meta.path.clone());
+                paths_to_remove.insert(*location, meta.path.clone());
 
                 let generation = meta.generation.saturating_add(1).min(MAX_GENERATION);
 
                 let entry = files_to_defrag.entry(generation).or_default();
-                entry.push((meta.location.0.get(), meta.path.clone()));
+                entry.push((location.0.get(), meta.path.clone()));
             }
         }
         drop(fams);
@@ -579,14 +634,10 @@ impl Marble {
         for (generation, files) in &files_to_defrag {
             log::trace!("compacting files {:?} with generation {}", files, generation);
             if files.len() < self.config.min_compaction_files {
-                // release claims on batch with too few files
-                let fams = self.fams.read().unwrap();
+                // skip batch with too few files (claims auto-released by Drop of DeferUnclaim
                 for (base_lsn, _) in files {
                     let dl = DiskLocation((*base_lsn).try_into().unwrap());
-
-                    paths_to_remove.remove(&dl);
-
-                    assert!(fams[&dl].rewrite_claim.swap(false, Ordering::SeqCst));
+                    paths_to_remove.remove(&dl).unwrap();
                 }
                 // skip rewrite of the files in this generation
                 continue;
@@ -666,7 +717,7 @@ impl Marble {
                 }
             }
 
-            io_try!(self.shard_batch(batch, *generation));
+            io_try!(self.shard_batch(batch, *generation, Some(lsn_fence)));
         }
 
         // get writer file lock and remove the replaced fams
@@ -675,7 +726,8 @@ impl Marble {
 
         for (location, _) in &paths_to_remove {
             log::trace!("removing fam at location {:?}", location);
-            fams.remove(location);
+            let fam = fams.remove(location).unwrap();
+            assert!(fam.rewrite_claim.load(Ordering::Acquire));
         }
 
         drop(fams);

@@ -9,28 +9,28 @@ fn rdtsc () -> u64 {
 }
 
 fn run(marble: Arc<Marble>) {
-    const MAX: u64 = 100 * 1024 * 1024;
-    const KEYSPACE: u64 = 1024;
-    const BATCH_SZ: u64 = 127;
+    const MAX: u64 = 1024 * 1024;
+    const KEYSPACE: u64 = 64 * 1024;
+    const BATCH_SZ: u64 = 1024;
 
     for i in 0..(MAX / BATCH_SZ) {
         let mut batch = std::collections::HashMap::default();
 
         for _ in 1..=BATCH_SZ {
             let pid = PageId((rdtsc() % KEYSPACE).max(1).try_into().unwrap());
-            batch.insert(pid, Some(vec![0; 1024]));
+            batch.insert(pid, Some(vec![0; 64]));
         }
 
         marble.write_batch(batch).unwrap();
 
-        if i % 100 == 0 {
+        if i % 16 == 0 {
             marble.maintenance().unwrap();
         }
     }
 }
 
 fn main() {
-    const CONCURRENCY: usize = 1;
+    const CONCURRENCY: usize = 16;
 
     let marble = Arc::new(Marble::open("bench_data").unwrap());
 
