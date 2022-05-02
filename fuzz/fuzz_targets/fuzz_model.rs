@@ -9,7 +9,9 @@ use std::collections::HashMap;
 
 use arbitrary::Arbitrary;
 
-use marble::{Config as MarbleConfig, PageId, TEST_DIR};
+use marble::{Config as MarbleConfig, PageId};
+
+const TEST_DIR: &str = "testing_data_directories";
 
 #[derive(Debug)]
 struct Config(MarbleConfig);

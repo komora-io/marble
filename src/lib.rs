@@ -639,26 +639,11 @@ impl Marble {
     pub fn maintenance(&self) -> io::Result<()> {
         log::debug!("performing maintenance");
 
-        struct DeferUnclaim<'a> {
-            marble: &'a Marble,
-            claims: Vec<DiskLocation>,
-        }
-
-        impl <'a> Drop for DeferUnclaim<'a> {
-            fn drop(&mut self) {
-                let fams = self.marble.fams.read().unwrap();
-                for claim in &self.claims {
-                    if let Some(fam) = fams.get(claim) {
-                        assert!(fam.rewrite_claim.swap(false, Ordering::SeqCst));
-                    }
-                }
-            }
-        }
-
         let mut defer_unclaim = DeferUnclaim {
             marble: self,
             claims: vec![],
         };
+
         let mut files_to_defrag: HashMap<u8, Vec<_>> = Default::default();
 
         let write_path = self.write_path.lock().unwrap();
@@ -695,10 +680,6 @@ impl Marble {
             log::trace!("compacting files {:?} with generation {}", files, generation);
             if files.len() < self.config.min_compaction_files {
                 // skip batch with too few files (claims auto-released by Drop of DeferUnclaim
-                for (base_lsn, _) in files {
-                    let dl = DiskLocation((*base_lsn).try_into().unwrap());
-                }
-                // skip rewrite of the files in this generation
                 continue;
             }
 
@@ -783,6 +764,25 @@ impl Marble {
     }
 }
 
+// `DeferUnclaim` exists because it was surprisingly leak-prone to try to
+// manage fams that were claimed by a maintenance thread but never
+// used. This ensures fams always get unclaimed after this function returns.
+struct DeferUnclaim<'a> {
+    marble: &'a Marble,
+    claims: Vec<DiskLocation>,
+}
+
+impl <'a> Drop for DeferUnclaim<'a> {
+    fn drop(&mut self) {
+        let fams = self.marble.fams.read().unwrap();
+        for claim in &self.claims {
+            if let Some(fam) = fams.get(claim) {
+                assert!(fam.rewrite_claim.swap(false, Ordering::SeqCst));
+            }
+        }
+    }
+}
+
 fn _auto_trait_assertions() {
     use core::panic::{RefUnwindSafe, UnwindSafe};
 
@@ -791,78 +791,76 @@ fn _auto_trait_assertions() {
     f::<Marble>();
 }
 
-static _TEST_COUNTER: AtomicU64 = AtomicU64::new(u64::MAX);
+#[cfg(test)]
+mod test {
+    const TEST_DIR: &str = "testing_data_directories";
 
-fn _with_tmp_instance<F: FnOnce(Marble)>(f: F) {
-    let config = test_conf(&format!("test_{}", _TEST_COUNTER.fetch_add(1, Ordering::SeqCst)));
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(u64::MAX);
 
-    let _ = std::fs::remove_dir_all(&config.path);
+    fn with_tmp_instance<F: FnOnce(Marble)>(f: F) {
+        let subdir = format!("test_{}", TEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+        let path = std::path::Path::new(TEST_DIR).join(subdir);
 
-    let marble = config.open().unwrap();
+        let config = Config {
+            path,
+            ..Default::default()
+        };
 
-    f(marble);
+        let _ = std::fs::remove_dir_all(&config.path);
 
-    std::fs::remove_dir_all(config.path).unwrap();
-}
+        let marble = config.open().unwrap();
 
-fn _restart(marble: Marble) -> Marble {
-    let config = marble.config.clone();
-    drop(marble);
-    config.open().unwrap()
-}
+        f(marble);
 
-#[doc(hidden)]
-pub const TEST_DIR: &str = "testing_data_directories";
-
-#[doc(hidden)]
-pub fn test_conf(subdir: &str) -> Config {
-    let path = std::path::Path::new(TEST_DIR).join(subdir);
-
-    Config {
-        path,
-        ..Default::default()
+        std::fs::remove_dir_all(config.path).unwrap();
     }
-}
 
-#[test]
-fn test_00() {
-    _with_tmp_instance(|mut marble| {
-        let pid = PageId(1.try_into().unwrap());
-        marble.write_batch([(pid, Some(vec![]))].into_iter().collect()).unwrap();
-        assert!(marble.read(pid).unwrap().is_some());
-        marble = _restart(marble);
-        assert!(marble.read(pid).unwrap().is_some());
-    });
-}
+    fn restart(marble: Marble) -> Marble {
+        let config = marble.config.clone();
+        drop(marble);
+        config.open().unwrap()
+    }
 
-#[test]
-fn test_01() {
-    _with_tmp_instance(|mut marble| {
-        let pid_1 = PageId(1.try_into().unwrap());
-        marble.write_batch([(pid_1, Some(vec![]))].into_iter().collect()).unwrap();
-        let pid_2 = PageId(2.try_into().unwrap());
-        marble.write_batch([(pid_2, Some(vec![]))].into_iter().collect()).unwrap();
-        assert!(marble.read(pid_1).unwrap().is_some());
-        assert!(marble.read(pid_2).unwrap().is_some());
-        marble = _restart(marble);
-        assert!(marble.read(pid_1).unwrap().is_some());
-        assert!(marble.read(pid_2).unwrap().is_some());
-    });
-}
+    #[test]
+    fn test_00() {
+        with_tmp_instance(|mut marble| {
+            let pid = PageId(1.try_into().unwrap());
+            marble.write_batch([(pid, Some(vec![]))].into_iter().collect()).unwrap();
+            assert!(marble.read(pid).unwrap().is_some());
+            marble = restart(marble);
+            assert!(marble.read(pid).unwrap().is_some());
+        });
+    }
 
-#[test]
-fn test_02() {
-    let _ = env_logger::try_init();
+    #[test]
+    fn test_01() {
+        with_tmp_instance(|mut marble| {
+            let pid_1 = PageId(1.try_into().unwrap());
+            marble.write_batch([(pid_1, Some(vec![]))].into_iter().collect()).unwrap();
+            let pid_2 = PageId(2.try_into().unwrap());
+            marble.write_batch([(pid_2, Some(vec![]))].into_iter().collect()).unwrap();
+            assert!(marble.read(pid_1).unwrap().is_some());
+            assert!(marble.read(pid_2).unwrap().is_some());
+            marble = restart(marble);
+            assert!(marble.read(pid_1).unwrap().is_some());
+            assert!(marble.read(pid_2).unwrap().is_some());
+        });
+    }
 
-    _with_tmp_instance(|marble| {
-        let pid_1 = PageId(1.try_into().unwrap());
-        marble.write_batch([(pid_1, Some(vec![]))].into_iter().collect()).unwrap();
-        let pid_2 = PageId(2.try_into().unwrap());
-        marble.write_batch([(pid_2, Some(vec![]))].into_iter().collect()).unwrap();
-        assert!(marble.read(pid_1).unwrap().is_some());
-        assert!(marble.read(pid_2).unwrap().is_some());
-        marble.maintenance().unwrap();
-        assert!(marble.read(pid_1).unwrap().is_some());
-        assert!(marble.read(pid_2).unwrap().is_some());
-    });
+    #[test]
+    fn test_02() {
+        let _ = env_logger::try_init();
+
+        with_tmp_instance(|marble| {
+            let pid_1 = PageId(1.try_into().unwrap());
+            marble.write_batch([(pid_1, Some(vec![]))].into_iter().collect()).unwrap();
+            let pid_2 = PageId(2.try_into().unwrap());
+            marble.write_batch([(pid_2, Some(vec![]))].into_iter().collect()).unwrap();
+            assert!(marble.read(pid_1).unwrap().is_some());
+            assert!(marble.read(pid_2).unwrap().is_some());
+            marble.maintenance().unwrap();
+            assert!(marble.read(pid_1).unwrap().is_some());
+            assert!(marble.read(pid_2).unwrap().is_some());
+        });
+    }
 }
