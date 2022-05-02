@@ -80,7 +80,7 @@ pub struct Config {
     pub path: PathBuf,
     /// Garbage collection will try to keep storage
     /// files around this size or smaller.
-    pub target_file_size: u64,
+    pub target_file_size: usize,
     /// Remaining live percentage of a file before
     /// it's considered rewritabe.
     pub file_compaction_percent: u8,
@@ -112,7 +112,7 @@ impl Default for Config {
         Config {
             path: "".into(),
             target_file_size: 1 << 28, // 256mb
-            file_compaction_percent: 60,
+            file_compaction_percent: 66,
             partition_function: default_partition_function,
             max_page_size: 16 * 1024 * 1024 * 1024, // 16gb
             min_compaction_files: 2,
@@ -384,16 +384,33 @@ impl Marble {
     }
 
     fn shard_batch(&self, write_batch: HashMap<PageId, Option<Vec<u8>>>, gen: u8, lsn_fence_opt: Option<u64>) -> io::Result<()> {
-        let mut shards: HashMap<u8, HashMap<PageId, Option<Vec<u8>>>> = HashMap::new();
+        // maps from shard -> (shard size, map of page id's to page data)
+        let mut shards: HashMap<u8, (usize, HashMap<PageId, Option<Vec<u8>>>)> = HashMap::new();
 
-        for (pid, data) in write_batch {
-            let shard_id = (self.config.partition_function)(pid, data.as_ref().map(|v| v.len()).unwrap_or(0));
+        let mut fragmented_shards = vec![];
+
+        for (pid, data_opt) in write_batch {
+            let (page_size, shard_id) = if let Some(ref data) = data_opt {
+                (data.len() + HEADER_LEN, (self.config.partition_function)(pid, data.len()))
+            } else {
+                (0, 0)
+            };
 
             let shard = shards.entry(shard_id).or_default();
-            shard.insert(pid, data);
+
+            if shard.0 > self.config.target_file_size {
+                fragmented_shards.push((shard_id, std::mem::take(&mut shard.1)));
+                shard.0 = 0;
+            }
+
+            shard.0 += page_size;
+            shard.1.insert(pid, data_opt);
         }
 
-        for (shard, pages) in shards {
+        let iter = shards.into_iter().map(|(shard, (_sz, pages))| (shard, pages))
+            .chain(fragmented_shards.into_iter());
+
+        for (shard, pages) in iter {
             self.write_batch_inner(pages, gen, shard, lsn_fence_opt)?;
         }
 
@@ -593,6 +610,32 @@ impl Marble {
         Ok(())
     }
 
+    fn prune_empty_fams(&self) -> io::Result<()> {
+        // get writer file lock and remove the empty fams
+        let mut paths_to_remove = vec![];
+        let mut fams = self.fams.write().unwrap();
+
+        for (location, fam) in &*fams {
+            if fam.len.load(Ordering::Acquire) == 0 {
+                log::trace!("fam at location {:?} is empty, marking it for removal", location);
+                paths_to_remove.push((*location, fam.path.clone()));
+            }
+        }
+
+        for (location, _) in &paths_to_remove {
+            log::trace!("removing fam at location {:?}", location);
+            fams.remove(location).unwrap();
+        }
+
+        drop(fams);
+
+        for (_, path) in paths_to_remove {
+            io_try!(std::fs::remove_file(path));
+        }
+
+        Ok(())
+    }
+
     pub fn maintenance(&self) -> io::Result<()> {
         log::debug!("performing maintenance");
 
@@ -616,7 +659,6 @@ impl Marble {
             marble: self,
             claims: vec![],
         };
-        let mut paths_to_remove = HashMap::new();
         let mut files_to_defrag: HashMap<u8, Vec<_>> = Default::default();
 
         let write_path = self.write_path.lock().unwrap();
@@ -637,12 +679,8 @@ impl Marble {
 
             defer_unclaim.claims.push(*location);
 
-            if len == 0 {
-                log::trace!("fam at location {:?} is empty, marking it for removal", meta.location);
-                paths_to_remove.insert(*location, meta.path.clone());
-            } else if (len * 100) / cap < u64::from(self.config.file_compaction_percent) {
-                log::trace!("fam at location {:?} is ready to be compacted, marking it for removal", meta.location);
-                paths_to_remove.insert(*location, meta.path.clone());
+            if len != 0 && (len * 100) / cap < u64::from(self.config.file_compaction_percent) {
+                log::trace!("fam at location {:?} is ready to be compacted", meta.location);
 
                 let generation = meta.generation.saturating_add(1).min(MAX_GENERATION);
 
@@ -659,7 +697,6 @@ impl Marble {
                 // skip batch with too few files (claims auto-released by Drop of DeferUnclaim
                 for (base_lsn, _) in files {
                     let dl = DiskLocation((*base_lsn).try_into().unwrap());
-                    paths_to_remove.remove(&dl).unwrap();
                 }
                 // skip rewrite of the files in this generation
                 continue;
@@ -742,23 +779,7 @@ impl Marble {
             io_try!(self.shard_batch(batch, *generation, Some(lsn_fence)));
         }
 
-        // get writer file lock and remove the replaced fams
-
-        let mut fams = self.fams.write().unwrap();
-
-        for (location, _) in &paths_to_remove {
-            log::trace!("removing fam at location {:?}", location);
-            let fam = fams.remove(location).unwrap();
-            assert!(fam.rewrite_claim.load(Ordering::Acquire));
-        }
-
-        drop(fams);
-
-        for (_, path) in paths_to_remove {
-            io_try!(std::fs::remove_file(path));
-        }
-
-        Ok(())
+        self.prune_empty_fams()
     }
 }
 
