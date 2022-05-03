@@ -19,7 +19,7 @@ fn run(marble: Arc<Marble>) {
 
         for _ in 1..=BATCH_SZ {
             let pid = PageId::new(((rdtsc() * MUL) % KEYSPACE).max(1)).unwrap();
-            batch.insert(pid, Some(vec![0; 64 * 1024]));
+            batch.insert(pid, Some(vec![0; 4 * 1024]));
         }
 
         marble.write_batch(batch).unwrap();

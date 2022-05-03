@@ -652,6 +652,8 @@ impl Marble {
         drop(fams);
 
         for (_, path) in paths_to_remove {
+            // If this fails, it causes a file leak, but it
+            // is fixed by simply restarting.
             io_try!(std::fs::remove_file(path));
         }
 
