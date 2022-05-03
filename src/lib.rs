@@ -221,11 +221,11 @@ impl Marble {
         io_try!(_file_lock.try_lock_exclusive());
 
         // recover page location index
-        let (page_table, metadata_log) = MetadataLog::recover(config.path.join(PT_DIR_SUFFIX))?;
+        let (metadata, metadata_log) = MetadataLog::recover(config.path.join(PT_DIR_SUFFIX))?;
 
         // NB LSN should initially be 1, not 0, because 0 represents
         // a page being free.
-        let recovered_pt_lsn = page_table.get(PT_LSN_KEY).load(Ordering::Acquire).max(1);
+        let recovered_pt_lsn = metadata.get(&PT_LSN_KEY).copied().unwrap_or(1);
 
         // parse file names
         // calculate file tenancy
@@ -313,11 +313,13 @@ impl Marble {
 
         // initialize file tenancy from pt
 
-        for pid in 0..page_table.approximate_max_child_count() {
-            let location = page_table.get(pid).load(Ordering::Acquire);
+        let page_table = PageTable::default();
+        for (pid, location) in metadata {
+            assert_ne!(location, 0);
             if location != 0 {
                 let (_, fam) = fams.range(..=DiskLocation::new(location).unwrap()).next_back().unwrap();
                 fam.len.fetch_add(1, Ordering::Acquire);
+                page_table.get(pid).store(location, Ordering::Release);
             }
         }
 
@@ -636,7 +638,7 @@ impl Marble {
         let mut fams = self.fams.write().unwrap();
 
         for (location, fam) in &*fams {
-            if fam.len.load(Ordering::Acquire) == 0 {
+            if fam.len.load(Ordering::Acquire) == 0 && !fam.rewrite_claim.swap(true, Ordering::SeqCst) {
                 log::trace!("fam at location {:?} is empty, marking it for removal", location);
                 paths_to_remove.push((*location, fam.path.clone()));
             }
@@ -676,15 +678,16 @@ impl Marble {
             let len = meta.len.load(Ordering::Acquire);
             let cap = meta.capacity.max(1);
 
-            if meta.rewrite_claim.swap(true, Ordering::SeqCst) {
-                // try to exclusively claim this file for rewrite to
-                // prevent concurrent attempts at rewriting its contents
-                continue;
-            }
-
-            defer_unclaim.claims.push(*location);
 
             if len != 0 && (len * 100) / cap < u64::from(self.config.file_compaction_percent) {
+                if meta.rewrite_claim.swap(true, Ordering::SeqCst) {
+                    // try to exclusively claim this file for rewrite to
+                    // prevent concurrent attempts at rewriting its contents
+                    continue;
+                }
+
+                defer_unclaim.claims.push(*location);
+
                 log::trace!("fam at location {:?} is ready to be compacted", meta.location);
 
                 let generation = meta.generation.saturating_add(1).min(MAX_GENERATION);
@@ -779,6 +782,8 @@ impl Marble {
 
             io_try!(self.shard_batch(batch, *generation, Some(lsn_fence)));
         }
+
+        drop(defer_unclaim);
 
         self.prune_empty_fams()
     }

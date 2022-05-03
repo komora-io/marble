@@ -7,17 +7,11 @@ use std::sync::{
     Arc,
 };
 
-use pagetable::PageTable;
-
 const LOG_PATH: &str = "metadata_log";
 const TABLE_DIR: &str = "metadata_tables";
 const U64_SZ: usize = std::mem::size_of::<u64>();
 const K: usize = 8;
 const V: usize = 8;
-
-fn pt_set(pt: &PageTable, k: u64, v: u64) -> u64 {
-    pt.get(k).swap(v, Ordering::Release)
-}
 
 #[derive(Default)]
 struct Queue<T> {
@@ -469,11 +463,11 @@ impl Drop for MetadataLog {
 }
 
 impl MetadataLog {
-    pub fn recover<P: AsRef<Path>>(p: P) -> Result<(PageTable, MetadataLog)> {
+    pub fn recover<P: AsRef<Path>>(p: P) -> Result<(HashMap<u64, u64>, MetadataLog)> {
         MetadataLog::recover_with_config(p, Config::default())
     }
 
-    pub fn recover_with_config<P: AsRef<Path>>(p: P, config: Config) -> Result<(PageTable, MetadataLog)> {
+    pub fn recover_with_config<P: AsRef<Path>>(p: P, config: Config) -> Result<(HashMap<u64, u64>, MetadataLog)> {
         let path = p.as_ref();
         if !path.exists() {
             io_try!(fs::create_dir_all(path));
@@ -500,13 +494,13 @@ impl MetadataLog {
 
         let table_directory = list_tables(path, true)?;
 
-        let page_table = PageTable::default();
+        let mut table = HashMap::default();
         for table_id in table_directory.keys() {
             for (k, v) in read_table(path, *table_id)? {
                 if let Some(v) = v {
-                    pt_set(&page_table, k, v);
+                    table.insert(k, v);
                 } else {
-                    pt_set(&page_table, k, 0);
+                    table.remove(&k);
                 }
             }
         }
@@ -631,9 +625,9 @@ impl MetadataLog {
                         memtable.insert(k, v);
 
                         if let Some(v) = v {
-                            pt_set(&page_table, k, v);
+                            table.insert(k, v);
                         } else {
-                            pt_set(&page_table, k, 0);
+                            table.remove(&k);
                         }
                     }
                     recovered += wb_recovered;
@@ -644,9 +638,9 @@ impl MetadataLog {
                 memtable.insert(k, v);
 
                 if let Some(v) = v {
-                    pt_set(&page_table, k, v);
+                    table.insert(k, v);
                 } else {
-                    pt_set(&page_table, k, 0);
+                    table.remove(&k);
                 }
 
                 recovered += buf.len() as u64;
@@ -654,11 +648,9 @@ impl MetadataLog {
         }
 
         // need to back up a few bytes to chop off the torn log
-        let max_child_count = page_table.approximate_max_child_count();
         log::debug!(
-            "recovered between {} and {} pieces of metadata",
-            max_child_count.saturating_sub(1 << 16),
-            max_child_count
+            "recovered {} pieces of metadata",
+            table.len(),
         );
         log::debug!("rewinding log down to length {}", recovered);
         let log_file = reader.get_mut();
@@ -704,7 +696,7 @@ impl MetadataLog {
                 on_disk_bytes: 0,
                 read_bytes: 0,
                 written_bytes: 0,
-                resident_bytes: max_child_count * (K + V) as u64,
+                resident_bytes: table.len() as u64 * (K + V) as u64,
                 space_amp: 0.,
                 write_amp: 0.,
             },
@@ -712,7 +704,7 @@ impl MetadataLog {
             memtable,
         };
 
-        Ok((page_table, metadata_store))
+        Ok((table, metadata_store))
     }
 
     /// Returns previous non-zero values for each item in batch
