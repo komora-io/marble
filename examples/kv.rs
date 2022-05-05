@@ -10,10 +10,19 @@ fn index_pid() -> PageId {
     PageId::new(1).unwrap()
 }
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Index {
     pages: BTreeMap<Vec<u8>, PageId>,
     max_pid: u64,
+}
+
+impl Default for Index {
+    fn default() -> Self {
+        Index {
+            pages: Default::default(),
+            max_pid: index_pid().0.get() + 1,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -26,9 +35,10 @@ struct Page {
 // A simple larger-than-memory key-value store.
 // A "real" version would use a log of logical
 // operations that then periodically gets
-// compacted into a Marble write batch.
+// compacted into a Marble write batch, along
+// with an in-memory write cache that accumulates
+// corresponding page mutations.
 struct Kv {
-    write_cache: HashMap<PageId, Page>,
     heap: Marble,
     index: Index,
 }
@@ -44,7 +54,6 @@ impl Kv {
         };
 
         let mut kv = Kv {
-            write_cache: HashMap::new(),
             index,
             heap,
         };
@@ -69,7 +78,7 @@ impl Kv {
         let previous = self.index.pages.insert(leaf.lo.clone(), PageId::new(pid).unwrap());
         assert!(previous.is_none());
 
-        let write_batch = [
+        let write_batch: HashMap<PageId, Option<Vec<u8>>> = [
             (PageId::new(pid).unwrap(), Some(serialize(&leaf).unwrap())),
             (index_pid(), Some(serialize(&self.index).unwrap())),
         ].into_iter().collect();
@@ -77,12 +86,12 @@ impl Kv {
         self.heap.write_batch(write_batch)
     }
 
-    fn pid_for_key(&self, key: &Vec<u8>) -> PageId {
+    fn pid_for_key(&self, key: Vec<u8>) -> PageId {
         *self.index.pages.range(..=key).next_back().unwrap().1
     }
 
     fn get(&mut self, key: &Vec<u8>) -> io::Result<Option<Vec<u8>>> {
-        let pid = self.pid_for_key(key);
+        let pid = self.pid_for_key(key.clone());
         let leaf_data = self.heap.read(pid)?.unwrap();
         let leaf: Page = deserialize(&leaf_data).unwrap();
         Ok(leaf.kvs.get(key).cloned())
@@ -97,7 +106,7 @@ impl Kv {
     }
 
     fn mutate(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) -> io::Result<Option<Vec<u8>>> {
-        let pid = self.pid_for_key(&key);
+        let pid = self.pid_for_key(key.clone());
         let leaf_data = self.heap.read(pid)?.unwrap();
         let mut leaf: Page = deserialize(&leaf_data).unwrap();
         let ret = if let Some(v) = value {
