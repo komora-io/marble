@@ -50,7 +50,7 @@ use pagetable::PageTable;
 use metadata_log::MetadataLog;
 
 const HEAP_DIR_SUFFIX: &str = "heap";
-const PT_DIR_SUFFIX: &str = "page_index";
+const PT_DIR_SUFFIX: &str = "object_index";
 const LOCK_SUFFIX: &str = "lock";
 const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
 const PT_LSN_KEY: u64 = 0;
@@ -60,12 +60,12 @@ const MAX_GENERATION: u8 = 3;
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(transparent)]
-pub struct PageId(pub NonZeroU64);
+pub struct ObjectId(pub NonZeroU64);
 
-impl PageId {
-    pub const fn new(u: u64) -> Option<PageId> {
+impl ObjectId {
+    pub const fn new(u: u64) -> Option<ObjectId> {
         if let Some(n) = NonZeroU64::new(u) {
-            Some(PageId(n))
+            Some(ObjectId(n))
         } else {
             None
         }
@@ -76,12 +76,12 @@ impl PageId {
 /// calls to `maintenance`.
 pub struct FileStats {
     /// The number of live objects stored in the backing storage files.
-    pub live_pages: u64,
+    pub live_objects: u64,
     /// The total number of (potentially duplicated) objects stored in the backing storage files.
-    pub stored_pages: u64,
-    /// The number of dead pages that have been replaced or removed in other storage files,
+    pub stored_objects: u64,
+    /// The number of dead objects that have been replaced or removed in other storage files,
     /// contributing to fragmentation.
-    pub dead_pages: u64,
+    pub dead_objects: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
@@ -117,26 +117,26 @@ pub struct Config {
     /// it's considered rewritabe.
     pub file_compaction_percent: u8,
     /// The ceiling on the largest allocation this system will ever
-    /// attempt to perform in order to read a page off of disk.
-    pub max_page_size: usize,
-    /// A partitioning function for pages based on
-    /// page ID and page size. You may override this to
-    /// cause pages to be written into separate files so
+    /// attempt to perform in order to read a object off of disk.
+    pub max_object_size: usize,
+    /// A partitioning function for objects based on
+    /// object ID and object size. You may override this to
+    /// cause objects to be written into separate files so
     /// that garbage collection may take advantage of locality
     /// effects for your workload that are correlated to
-    /// page identifiers or the size of data.
+    /// object identifiers or the size of data.
     ///
-    /// Ideally, you will colocate pages that have similar
+    /// Ideally, you will colocate objects that have similar
     /// expected lifespans. Doing so minimizes the costs of
     /// copying live data over time during storage file GC.
-    pub partition_function: fn(PageId, usize) -> u8,
+    pub partition_function: fn(ObjectId, usize) -> u8,
     /// The minimum number of files within a generation to
     /// collect if below the live compaction percent.
     pub min_compaction_files: usize,
 }
 
 /// Always returns 0
-pub fn default_partition_function(_pid: PageId, _size: usize) -> u8 {
+pub fn default_partition_function(_pid: ObjectId, _size: usize) -> u8 {
     0
 }
 
@@ -147,7 +147,7 @@ impl Default for Config {
             target_file_size: 1 << 28, // 256mb
             file_compaction_percent: 66,
             partition_function: default_partition_function,
-            max_page_size: 16 * 1024 * 1024 * 1024, // 16gb
+            max_object_size: 16 * 1024 * 1024 * 1024, // 16gb
             min_compaction_files: 2,
         }
     }
@@ -191,7 +191,7 @@ struct WritePath {
 /// This means that writes should generally be performed by some
 /// background process whose job it is to clean logs etc...
 pub struct Marble {
-    // maps from PageId to DiskLocation
+    // maps from ObjectId to DiskLocation
     page_table: PageTable,
     write_path: Mutex<WritePath>,
     fams: RwLock<BTreeMap<DiskLocation, FileAndMetadata>>,
@@ -233,11 +233,11 @@ impl Marble {
         let _file_lock = io_try!(file_lock_opts.open(config.path.join(LOCK_SUFFIX)));
         io_try!(_file_lock.try_lock_exclusive());
 
-        // recover page location index
+        // recover object location index
         let (metadata, metadata_log) = MetadataLog::recover(config.path.join(PT_DIR_SUFFIX))?;
 
         // NB LSN should initially be 1, not 0, because 0 represents
-        // a page being free.
+        // an object being free.
         let recovered_pt_lsn = metadata.get(&PT_LSN_KEY).copied().unwrap_or(1);
 
         // parse file names
@@ -287,11 +287,11 @@ impl Marble {
             let capacity = u64::from_str_radix(&splits[3], 16)
                 .expect("encountered garbage filename in internal directory");
 
-            // remove files that are ahead of the recovered page location index
+            // remove files that are ahead of the recovered object location index
             if lsn > recovered_pt_lsn {
                 log::warn!(
                     "removing heap file that has an lsn of {}, \
-                    which is higher than the recovered page table lsn of {}",
+                    which is higher than the recovered pagetable lsn of {}",
                     lsn, recovered_pt_lsn,
                 );
                 io_try!(fs::remove_file(entry.path()));
@@ -349,10 +349,12 @@ impl Marble {
         })
     }
 
-    /// Read a page out of storage. If this page is unknown, returns
-    /// `Ok(None)`. May be called concurrently with background calls
-    /// to `maintenance` and `write_batch`.
-    pub fn read(&self, pid: PageId) -> io::Result<Option<Vec<u8>>> {
+    /// Read a object out of storage. If this object is unknown or has been
+    /// removed, returns `Ok(None)`.
+    ///
+    /// May be called concurrently with background calls to `maintenance`
+    /// and `write_batch`.
+    pub fn read(&self, pid: ObjectId) -> io::Result<Option<Vec<u8>>> {
         let fams = self.fams.read().unwrap();
 
         let lsn = self.page_table.get(pid.0.get()).load(Ordering::Acquire);
@@ -363,7 +365,7 @@ impl Marble {
         let location = DiskLocation::new(lsn).unwrap();
 
         let (base_location, fam) = fams.range(..=location).next_back()
-            .expect("no possible storage file for page - likely file corruption");
+            .expect("no possible storage file for object - likely file corruption");
 
         let file_offset = lsn - base_location.0.get();
 
@@ -384,26 +386,26 @@ impl Marble {
             ));
         };
 
-        let mut page_buf = Vec::with_capacity(len);
+        let mut object_buf = Vec::with_capacity(len);
         unsafe {
-            page_buf.set_len(len);
+            object_buf.set_len(len);
         }
 
-        let page_offset = file_offset + HEADER_LEN as u64;
-        io_try!(fam.file.read_exact_at(&mut page_buf, page_offset));
+        let object_offset = file_offset + HEADER_LEN as u64;
+        io_try!(fam.file.read_exact_at(&mut object_buf, object_offset));
 
         drop(fams);
 
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&len_buf);
         hasher.update(&pid_buf);
-        hasher.update(&page_buf);
+        hasher.update(&object_buf);
         let crc_actual: u32 = hasher.finalize();
 
         if crc_expected != crc_actual {
             log::warn!(
-                "crc mismatch when reading page at offset {} in file {:?}",
-                page_offset, file_offset
+                "crc mismatch when reading object at offset {} in file {:?}",
+                object_offset, file_offset
             );
             return Err(io::Error::new(io::ErrorKind::InvalidData, "crc mismatch"));
         }
@@ -412,46 +414,46 @@ impl Marble {
 
         assert_eq!(pid.0.get(), read_pid);
 
-        Ok(Some(page_buf))
+        Ok(Some(object_buf))
     }
 
     /// Statistics about current files.
     pub fn file_statistics(&self) -> FileStats {
-        let mut live_pages = 0;
-        let mut stored_pages = 0;
+        let mut live_objects = 0;
+        let mut stored_objects = 0;
 
         for (_, fam) in &*self.fams.read().unwrap() {
-            live_pages += fam.len.load(Ordering::Acquire);
-            stored_pages += fam.capacity;
+            live_objects += fam.len.load(Ordering::Acquire);
+            stored_objects += fam.capacity;
         }
 
         FileStats {
-            live_pages,
-            stored_pages,
-            dead_pages: stored_pages- live_pages,
+            live_objects,
+            stored_objects,
+            dead_objects: stored_objects- live_objects,
         }
     }
 
-    /// Write a batch of pages to disk. This function is crash-atomic but NOT runtime atomic.
+    /// Write a batch of objects to disk. This function is crash-atomic but NOT runtime atomic.
     /// If you are concurrently serving reads, and require atomic batch semantics, you should
     /// serve reads out of an in-memory cache until this function returns. Creates at least one
     /// file per call. Performs several fsync calls per call. Ideally, you will heavily batch
-    /// pages being written using a logger of some sort before calling this function occasionally
+    /// objects being written using a logger of some sort before calling this function occasionally
     /// in the background, then deleting corresponding logs after this function returns.
-    pub fn write_batch(&self, write_batch: HashMap<PageId, Option<Vec<u8>>>) -> io::Result<()> {
+    pub fn write_batch(&self, write_batch: HashMap<ObjectId, Option<Vec<u8>>>) -> io::Result<()> {
         let gen = 0;
         let lsn_fence_opt = None;
         self.shard_batch(write_batch, gen, lsn_fence_opt)
     }
 
-    fn shard_batch(&self, write_batch: HashMap<PageId, Option<Vec<u8>>>, gen: u8, lsn_fence_opt: Option<u64>) -> io::Result<()> {
-        // maps from shard -> (shard size, map of page id's to page data)
-        let mut shards: HashMap<u8, (usize, HashMap<PageId, Option<Vec<u8>>>)> = HashMap::new();
+    fn shard_batch(&self, write_batch: HashMap<ObjectId, Option<Vec<u8>>>, gen: u8, lsn_fence_opt: Option<u64>) -> io::Result<()> {
+        // maps from shard -> (shard size, map of object id's to object data)
+        let mut shards: HashMap<u8, (usize, HashMap<ObjectId, Option<Vec<u8>>>)> = HashMap::new();
 
         let mut fragmented_shards = vec![];
 
         for (pid, data_opt) in write_batch {
-            let (page_size, shard_id) = if let Some(ref data) = data_opt {
+            let (object_size, shard_id) = if let Some(ref data) = data_opt {
                 (data.len() + HEADER_LEN, (self.config.partition_function)(pid, data.len()))
             } else {
                 (0, 0)
@@ -464,15 +466,15 @@ impl Marble {
                 shard.0 = 0;
             }
 
-            shard.0 += page_size;
+            shard.0 += object_size;
             shard.1.insert(pid, data_opt);
         }
 
-        let iter = shards.into_iter().map(|(shard, (_sz, pages))| (shard, pages))
+        let iter = shards.into_iter().map(|(shard, (_sz, objects))| (shard, objects))
             .chain(fragmented_shards.into_iter());
 
-        for (shard, pages) in iter {
-            self.write_batch_inner(pages, gen, shard, lsn_fence_opt)?;
+        for (shard, objects) in iter {
+            self.write_batch_inner(objects, gen, shard, lsn_fence_opt)?;
         }
 
         Ok(())
@@ -480,7 +482,7 @@ impl Marble {
 
     fn write_batch_inner<P: AsRef<[u8]>> (
         &self,
-        pages: HashMap<PageId, Option<P>>,
+        objects: HashMap<ObjectId, Option<P>>,
         gen: u8,
         shard: u8,
         lsn_fence_opt: Option<u64>,
@@ -488,30 +490,30 @@ impl Marble {
         // allocates unique temporary file names
         static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-        let mut new_locations: Vec<(PageId, Option<u64>)> = vec![];
+        let mut new_locations: Vec<(ObjectId, Option<u64>)> = vec![];
         let mut buf = vec![];
 
         // NB capacity starts with 1 due to the max LSN key that is always included
         let mut capacity = 1;
-        for (pid, raw_page_opt) in &pages {
-            let raw_page = if let Some(raw_page) = raw_page_opt {
-                raw_page.as_ref()
+        for (pid, raw_object_opt) in &objects {
+            let raw_object = if let Some(raw_object) = raw_object_opt {
+                raw_object.as_ref()
             } else {
                 new_locations.push((*pid, None));
                 continue
             };
 
-            if raw_page.len() > self.config.max_page_size {
+            if raw_object.len() > self.config.max_object_size {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     format!(
                         "{:?} in write batch has a size of {}, which is \
-                        larger than the configured `max_page_size` of {}. \
+                        larger than the configured `max_object_size` of {}. \
                         If this is intentional, please increase the configured \
-                        `max_page_size`.",
+                        `max_object_size`.",
                         pid,
-                        raw_page.len(),
-                        self.config.max_page_size,
+                        raw_object.len(),
+                        self.config.max_object_size,
                     ),
                 ));
 
@@ -522,19 +524,19 @@ impl Marble {
             let relative_address = buf.len() as u64;
             new_locations.push((*pid, Some(relative_address)));
 
-            let len_buf: [u8; 8] = (raw_page.len() as u64).to_le_bytes();
+            let len_buf: [u8; 8] = (raw_object.len() as u64).to_le_bytes();
             let pid_buf: [u8; 8] = pid.0.get().to_le_bytes();
 
             let mut hasher = crc32fast::Hasher::new();
             hasher.update(&len_buf);
             hasher.update(&pid_buf);
-            hasher.update(&raw_page);
+            hasher.update(&raw_object);
             let crc: u32 = hasher.finalize();
 
             io_try!(buf.write_all(&crc.to_le_bytes()));
             io_try!(buf.write_all(&pid_buf));
             io_try!(buf.write_all(&len_buf));
-            io_try!(buf.write_all(&raw_page));
+            io_try!(buf.write_all(&raw_object));
         }
 
         let tmp_fname = format!("{}-tmp", TMP_COUNTER.fetch_add(1, Ordering::Relaxed));
@@ -605,7 +607,7 @@ impl Marble {
                 if let Some(lsn_fence) = lsn_fence_opt {
                     if self.page_table.get(*pid).load(Ordering::Acquire) >= lsn_fence {
                         // a concurrent batch has replaced this attempted
-                        // page GC rewrite in a later file, invalidating
+                        // object GC rewrite in a later file, invalidating
                         // the copy.
                         contention_hit += 1;
                         return false;
@@ -701,7 +703,7 @@ impl Marble {
 
     /// Defragments backing storage files, blocking concurrent calls to
     /// `write_batch` but not blocking concurrent calls to `read`.
-    /// Returns the number of rewritten pages.
+    /// Returns the number of rewritten objects.
     pub fn maintenance(&self) -> io::Result<usize> {
         log::debug!("performing maintenance");
 
@@ -741,9 +743,9 @@ impl Marble {
         }
         drop(fams);
 
-        let mut rewritten_pages = 0;
+        let mut rewritten_objects = 0;
 
-        // rewrite the live pages
+        // rewrite the live objects
         for (generation, files) in &files_to_defrag {
             log::trace!("compacting files {:?} with generation {}", files, generation);
             if files.len() < self.config.min_compaction_files {
@@ -776,23 +778,23 @@ impl Marble {
                     let len_buf = header[12..20].try_into().unwrap();
                     let len = usize::try_from(u64::from_le_bytes(len_buf)).unwrap();
 
-                    if len > self.config.max_page_size {
-                        log::warn!("corrupt page size detected: {} bytes", len);
+                    if len > self.config.max_object_size {
+                        log::warn!("corrupt object size detected: {} bytes", len);
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "corrupt page size",
+                            "corrupt object size",
                         ));
                     }
 
-                    let mut page_buf = Vec::with_capacity(len);
+                    let mut object_buf = Vec::with_capacity(len);
 
                     unsafe {
-                        page_buf.set_len(len);
+                        object_buf.set_len(len);
                     }
 
-                    let page_res = bufreader.read_exact(&mut page_buf);
+                    let object_res = bufreader.read_exact(&mut object_buf);
 
-                    match page_res {
+                    match object_res {
                         Ok(()) => {}
                         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                         Err(other) => return Err(other),
@@ -801,12 +803,12 @@ impl Marble {
                     let mut hasher = crc32fast::Hasher::new();
                     hasher.update(&len_buf);
                     hasher.update(&pid_buf);
-                    hasher.update(&page_buf);
+                    hasher.update(&object_buf);
                     let crc_actual = hasher.finalize();
 
                     if crc_expected != crc_actual {
                         log::warn!(
-                            "crc mismatch when reading page at offset {} in file {:?}",
+                            "crc mismatch when reading object at offset {} in file {:?}",
                             offset, path
                         );
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "crc mismatch"));
@@ -816,16 +818,16 @@ impl Marble {
 
                     if lsn == current_location {
                         // can attempt to rewrite
-                        batch.insert(PageId::new(pid).unwrap(), Some(page_buf));
+                        batch.insert(ObjectId::new(pid).unwrap(), Some(object_buf));
                     } else {
-                        // page has been rewritten, this one isn't valid
+                        // object has been rewritten, this one isn't valid
                     }
 
                     offset += HEADER_LEN + len;
                 }
             }
 
-            rewritten_pages += batch.len();
+            rewritten_objects += batch.len();
 
             io_try!(self.shard_batch(batch, *generation, Some(lsn_fence)));
         }
@@ -834,7 +836,7 @@ impl Marble {
 
         self.prune_empty_fams()?;
 
-        Ok(rewritten_pages)
+        Ok(rewritten_objects)
     }
 }
 
@@ -900,7 +902,7 @@ mod test {
     #[test]
     fn test_00() {
         with_tmp_instance(|mut marble| {
-            let pid = PageId::new(1).unwrap();
+            let pid = ObjectId::new(1).unwrap();
             marble.write_batch([(pid, Some(vec![]))].into_iter().collect()).unwrap();
             assert!(marble.read(pid).unwrap().is_some());
             marble = restart(marble);
@@ -911,9 +913,9 @@ mod test {
     #[test]
     fn test_01() {
         with_tmp_instance(|mut marble| {
-            let pid_1 = PageId::new(1).unwrap();
+            let pid_1 = ObjectId::new(1).unwrap();
             marble.write_batch([(pid_1, Some(vec![]))].into_iter().collect()).unwrap();
-            let pid_2 = PageId::new(2).unwrap();
+            let pid_2 = ObjectId::new(2).unwrap();
             marble.write_batch([(pid_2, Some(vec![]))].into_iter().collect()).unwrap();
             assert!(marble.read(pid_1).unwrap().is_some());
             assert!(marble.read(pid_2).unwrap().is_some());
@@ -928,9 +930,9 @@ mod test {
         let _ = env_logger::try_init();
 
         with_tmp_instance(|marble| {
-            let pid_1 = PageId::new(1).unwrap();
+            let pid_1 = ObjectId::new(1).unwrap();
             marble.write_batch([(pid_1, Some(vec![]))].into_iter().collect()).unwrap();
-            let pid_2 = PageId::new(2).unwrap();
+            let pid_2 = ObjectId::new(2).unwrap();
             marble.write_batch([(pid_2, Some(vec![]))].into_iter().collect()).unwrap();
             assert!(marble.read(pid_1).unwrap().is_some());
             assert!(marble.read(pid_2).unwrap().is_some());

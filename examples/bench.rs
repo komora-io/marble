@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use marble::{PageId, Marble};
+use marble::{ObjectId, Marble};
 
 fn rdtsc () -> u64 {
     unsafe {
@@ -18,7 +18,7 @@ fn run(marble: Arc<Marble>) {
         let mut batch = std::collections::HashMap::default();
 
         for _ in 1..=BATCH_SZ {
-            let pid = PageId::new(((rdtsc() * MUL) % KEYSPACE).max(1)).unwrap();
+            let pid = ObjectId::new(((rdtsc() * MUL) % KEYSPACE).max(1)).unwrap();
             batch.insert(pid, Some(vec![0; 4 * 1024]));
         }
 

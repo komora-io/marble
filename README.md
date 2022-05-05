@@ -14,9 +14,9 @@ Supports 4 methods:
 * `file_statistics`: returns statistics about live and total objects in the backing storage files.
 
 Defragmentation is always generational, and will group rewritten
-pages together. Written pages can be further sharded based on a
-configured `partition_function` which allows you to shard pages
-by `PageId` and the size of the page raw bytes.
+objects together. Written objects can be further sharded based on a
+configured `partition_function` which allows you to shard objects
+by `ObjectId` and the size of the object raw bytes.
 
 Marble solves a pretty basic problem in database storage: storing
 arbitrary bytes on-disk, getting them back, and defragmenting files.
@@ -26,10 +26,10 @@ are arbitrary blobs of raw bytes.
 
 Writes are meant to be performed in bulk by some background process.
 Each call to `Marble::write_batch` creates at least one new file
-that stores the pages being written. Multiple calls to fsync occur
-for each call to `write_batch`. It is blocking. Page metadata is added
+that stores the objects being written. Multiple calls to fsync occur
+for each call to `write_batch`. It is blocking. Object metadata is added
 to the backing wait-free pagetable incrementally, not atomically,
-so if you rely on batch atomicity, you should serve the batch's pages
+so if you rely on batch atomicity, you should serve the batch's objects
 directly from a cache of your own until `write_batch` returns.
 However, upon crash, batches are recovered atomically.
 
@@ -41,10 +41,10 @@ You are responsible for:
 * choosing appropriate configuration tunables for your desired space
   and write amplification.
 * ensuring the `Config.partition_function` is set to a function that
-  appropriately shards your pages based on their `PageId` and/or size.
-  Ideally, pages that have expected death times will be colocated in
-  a shard so that work spent copying live pages is minimized.
-* allocating and managing free `PageId`'s.
+  appropriately shards your objects based on their `ObjectId` and/or size.
+  Ideally, objects that have expected death times will be colocated in
+  a shard so that work spent copying live objects is minimized.
+* allocating and managing free `ObjectId`'s.
 
 If you want to create an industrial database on top of Marble, you will
 probably also want to add:
@@ -53,8 +53,8 @@ probably also want to add:
   `write_batch` creates at least one new file and fsyncs multiple times,
   so you should batch calls appropriately. Once the log or write cache has
   reached an appropriate size, you can have a background thread write a
-  corresponding batch of pages to its storage, and once write_batch returns, the
-  corresponding log segments and write cache can be deleted, as the pages
+  corresponding batch of objects to its storage, and once write_batch returns, the
+  corresponding log segments and write cache can be deleted, as the objects
   will be available via `Marble::read`.
 * an appropriate read cache. `Marble::read` always reads directly from disk.
 * for maximum SSD friendliness, your own log should be configurable to be

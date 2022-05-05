@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use arbitrary::Arbitrary;
 
-use marble::{Config as MarbleConfig, PageId};
+use marble::{Config as MarbleConfig, ObjectId};
 
 const TEST_DIR: &str = "testing_data_directories";
 
@@ -32,7 +32,7 @@ impl<'a> Arbitrary<'a> for Config {
 }
 
 #[derive(Debug)]
-struct WriteBatch(HashMap<PageId, Option<Vec<u8>>>);
+struct WriteBatch(HashMap<ObjectId, Option<Vec<u8>>>);
 
 impl<'a> Arbitrary<'a> for WriteBatch {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
@@ -49,7 +49,7 @@ impl<'a> Arbitrary<'a> for WriteBatch {
                 None
             };
 
-            batch.insert(PageId::new(pid).unwrap(), page);
+            batch.insert(ObjectId::new(pid).unwrap(), page);
         }
 
         Ok(WriteBatch(batch))

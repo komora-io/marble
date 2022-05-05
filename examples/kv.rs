@@ -4,15 +4,15 @@ use std::io;
 
 use bincode::{deserialize, serialize};
 use serde::{Serialize, Deserialize};
-use marble::{PageId, Marble};
+use marble::{ObjectId, Marble};
 
-fn index_pid() -> PageId {
-    PageId::new(1).unwrap()
+fn index_pid() -> ObjectId {
+    ObjectId::new(1).unwrap()
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Index {
-    pages: BTreeMap<Vec<u8>, PageId>,
+    pages: BTreeMap<Vec<u8>, ObjectId>,
     max_pid: u64,
 }
 
@@ -76,18 +76,18 @@ impl Kv {
         self.index.max_pid += 1;
         let pid = self.index.max_pid;
 
-        let previous = self.index.pages.insert(leaf.lo.clone(), PageId::new(pid).unwrap());
+        let previous = self.index.pages.insert(leaf.lo.clone(), ObjectId::new(pid).unwrap());
         assert!(previous.is_none());
 
-        let write_batch: HashMap<PageId, Option<Vec<u8>>> = [
-            (PageId::new(pid).unwrap(), Some(serialize(&leaf).unwrap())),
+        let write_batch: HashMap<ObjectId, Option<Vec<u8>>> = [
+            (ObjectId::new(pid).unwrap(), Some(serialize(&leaf).unwrap())),
             (index_pid(), Some(serialize(&self.index).unwrap())),
         ].into_iter().collect();
 
         self.heap.write_batch(write_batch)
     }
 
-    fn pid_for_key(&self, key: Vec<u8>) -> PageId {
+    fn pid_for_key(&self, key: Vec<u8>) -> ObjectId {
         *self.index.pages.range(..=key).next_back().unwrap().1
     }
 
