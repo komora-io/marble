@@ -173,7 +173,7 @@ struct WritePath {
 /// Garbage-collecting object store. A nice solution to back
 /// a pagecache, for people building their own databases.
 ///
-/// ROWEX-style concurrency: readers never block on other readers
+/// ROWEX-style concurrency: readers rarely block on other readers
 /// or writers, but serializes writes to be friendlier for SSD GC.
 /// This means that writes should generally be performed by some
 /// background process whose job it is to clean logs etc...

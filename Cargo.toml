@@ -1,7 +1,12 @@
 [package]
 name = "marble"
+authors = ["Tyler Neely <t@jujit.su>"]
 version = "0.1.0"
 edition = "2021"
+description = "garbage-collecting on-disk object store"
+license = "GPL-3.0"
+repository = "https://github.com/komora-io/marble"
+documentation = "https://docs.rs/marble/"
 
 [profile.release]
 debug = true
