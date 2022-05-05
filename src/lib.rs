@@ -820,6 +820,8 @@ fn _auto_trait_assertions() {
 
 #[cfg(test)]
 mod test {
+    use super::*;
+
     const TEST_DIR: &str = "testing_data_directories";
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(u64::MAX);

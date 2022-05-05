@@ -613,37 +613,27 @@ impl MetadataLog {
                 break;
             }
 
-            if let Some((mut wb, mut wb_remaining, mut wb_recovered)) = write_batch.take() {
-                wb.push((k, v));
-                wb_remaining = wb_remaining.checked_sub(1).unwrap();
-                wb_recovered = wb_recovered.checked_add(buf.len() as u64).unwrap();
+            let (mut wb, mut wb_remaining, mut wb_recovered) = write_batch.take().unwrap();
 
-                // apply the write batch all at once
-                // or never at all
-                if wb_remaining == 0 {
-                    for (k, v) in wb {
-                        memtable.insert(k, v);
+            wb.push((k, v));
+            wb_remaining = wb_remaining.checked_sub(1).unwrap();
+            wb_recovered = wb_recovered.checked_add(buf.len() as u64).unwrap();
 
-                        if let Some(v) = v {
-                            table.insert(k, v);
-                        } else {
-                            table.remove(&k);
-                        }
+            // apply the write batch all at once
+            // or never at all
+            if wb_remaining == 0 {
+                for (k, v) in wb {
+                    memtable.insert(k, v);
+
+                    if let Some(v) = v {
+                        table.insert(k, v);
+                    } else {
+                        table.remove(&k);
                     }
-                    recovered += wb_recovered;
-                } else {
-                    write_batch = Some((wb, wb_remaining, wb_recovered));
                 }
+                recovered += wb_recovered;
             } else {
-                memtable.insert(k, v);
-
-                if let Some(v) = v {
-                    table.insert(k, v);
-                } else {
-                    table.remove(&k);
-                }
-
-                recovered += buf.len() as u64;
+                write_batch = Some((wb, wb_remaining, wb_recovered));
             }
         }
 
