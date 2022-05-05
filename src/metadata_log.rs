@@ -1,3 +1,5 @@
+// A stripped-down tiny-lsm. Could be made much simpler, but
+// this works.
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, prelude::*, BufReader, BufWriter, Result};
@@ -92,7 +94,7 @@ impl Default for Config {
             max_log_length: 32 * 1024 * 1024,
             merge_ratio: 3,
             merge_window: 5,
-            log_bufwriter_size: 32 * 1024,
+            log_bufwriter_size: 1024 * 1024,
             zstd_table_compression_level: 3,
         }
     }

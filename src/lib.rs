@@ -72,6 +72,18 @@ impl PageId {
     }
 }
 
+/// Statistics for file contents, to base decisions around
+/// calls to `maintenance`.
+pub struct FileStats {
+    /// The number of live objects stored in the backing storage files.
+    pub live_pages: u64,
+    /// The total number of (potentially duplicated) objects stored in the backing storage files.
+    pub stored_pages: u64,
+    /// The number of dead pages that have been replaced or removed in other storage files,
+    /// contributing to fragmentation.
+    pub dead_pages: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 struct DiskLocation(NonZeroU64);
@@ -123,6 +135,7 @@ pub struct Config {
     pub min_compaction_files: usize,
 }
 
+/// Always returns 0
 pub fn default_partition_function(_pid: PageId, _size: usize) -> u8 {
     0
 }
@@ -336,6 +349,9 @@ impl Marble {
         })
     }
 
+    /// Read a page out of storage. If this page is unknown, returns
+    /// `Ok(None)`. May be called concurrently with background calls
+    /// to `maintenance` and `write_batch`.
     pub fn read(&self, pid: PageId) -> io::Result<Option<Vec<u8>>> {
         let fams = self.fams.read().unwrap();
 
@@ -399,6 +415,29 @@ impl Marble {
         Ok(Some(page_buf))
     }
 
+    /// Statistics about current files.
+    pub fn file_statistics(&self) -> FileStats {
+        let mut live_pages = 0;
+        let mut stored_pages = 0;
+
+        for (_, fam) in &*self.fams.read().unwrap() {
+            live_pages += fam.len.load(Ordering::Acquire);
+            stored_pages += fam.capacity;
+        }
+
+        FileStats {
+            live_pages,
+            stored_pages,
+            dead_pages: stored_pages- live_pages,
+        }
+    }
+
+    /// Write a batch of pages to disk. This function is crash-atomic but NOT runtime atomic.
+    /// If you are concurrently serving reads, and require atomic batch semantics, you should
+    /// serve reads out of an in-memory cache until this function returns. Creates at least one
+    /// file per call. Performs several fsync calls per call. Ideally, you will heavily batch
+    /// pages being written using a logger of some sort before calling this function occasionally
+    /// in the background, then deleting corresponding logs after this function returns.
     pub fn write_batch(&self, write_batch: HashMap<PageId, Option<Vec<u8>>>) -> io::Result<()> {
         let gen = 0;
         let lsn_fence_opt = None;
@@ -660,7 +699,10 @@ impl Marble {
         Ok(())
     }
 
-    pub fn maintenance(&self) -> io::Result<()> {
+    /// Defragments backing storage files, blocking concurrent calls to
+    /// `write_batch` but not blocking concurrent calls to `read`.
+    /// Returns the number of rewritten pages.
+    pub fn maintenance(&self) -> io::Result<usize> {
         log::debug!("performing maintenance");
 
         let mut defer_unclaim = DeferUnclaim {
@@ -680,7 +722,6 @@ impl Marble {
             let len = meta.len.load(Ordering::Acquire);
             let cap = meta.capacity.max(1);
 
-
             if len != 0 && (len * 100) / cap < u64::from(self.config.file_compaction_percent) {
                 if meta.rewrite_claim.swap(true, Ordering::SeqCst) {
                     // try to exclusively claim this file for rewrite to
@@ -699,6 +740,8 @@ impl Marble {
             }
         }
         drop(fams);
+
+        let mut rewritten_pages = 0;
 
         // rewrite the live pages
         for (generation, files) in &files_to_defrag {
@@ -724,7 +767,7 @@ impl Marble {
                     match header_res {
                         Ok(()) => {}
                         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                        other => return other,
+                        Err(other) => return Err(other),
                     }
 
                     let crc_expected = u32::from_le_bytes(header[0..4].try_into().unwrap());
@@ -752,7 +795,7 @@ impl Marble {
                     match page_res {
                         Ok(()) => {}
                         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                        other => return other,
+                        Err(other) => return Err(other),
                     }
 
                     let mut hasher = crc32fast::Hasher::new();
@@ -782,12 +825,16 @@ impl Marble {
                 }
             }
 
+            rewritten_pages += batch.len();
+
             io_try!(self.shard_batch(batch, *generation, Some(lsn_fence)));
         }
 
         drop(defer_unclaim);
 
-        self.prune_empty_fams()
+        self.prune_empty_fams()?;
+
+        Ok(rewritten_pages)
     }
 }
 
