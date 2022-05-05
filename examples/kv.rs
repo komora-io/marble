@@ -37,7 +37,8 @@ struct Page {
 // operations that then periodically gets
 // compacted into a Marble write batch, along
 // with an in-memory write cache that accumulates
-// corresponding page mutations.
+// corresponding page mutations, and an in-memory
+// read cache.
 struct Kv {
     heap: Marble,
     index: Index,
