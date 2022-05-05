@@ -60,6 +60,8 @@ probably also want to add:
 * for maximum SSD friendliness, your own log should be configurable to be
   written to a separate storage device, to avoid comingling writes that
   have vastly different expected death times.
+* dictionary-based compression for efficiently compressing objects that may
+  be smaller than 64k.
 
 In short, you get to focus on a bunch of the fun parts of building your own
 database, without so much effort spent on boring file garbage collection.

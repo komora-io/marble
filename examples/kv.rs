@@ -122,6 +122,12 @@ impl Kv {
 
         self.heap.write_batch(write_batch)?;
 
+        let stats = self.heap.file_statistics();
+
+        if stats.dead_objects > stats.live_objects {
+            self.heap.maintenance()?;
+        }
+
         Ok(ret)
     }
 }
