@@ -63,5 +63,18 @@ probably also want to add:
 * dictionary-based compression for efficiently compressing objects that may
   be smaller than 64k.
 
+Ideas for getting great garbage collection performance:
+* give certain kinds of objects a certain ObjectId range. for example,
+  tree index nodes can be above 1<<63, and tree leaf nodes can be below
+  that point. The `Config.partition_function` can return the shard 0 for
+  leaf nodes, and 1 for index nodes, and they will always be written to
+  separate files.
+* WiscKey-style sharding of large items from other items, based on the
+  size of the object. Assign a shard ID based on which power of 2 the
+  object size is.
+* Basically any sharding strategy that tends to group items together that
+  exhibit some amount of locality in terms of expected mutations or
+  overall lifespan.
+
 In short, you get to focus on a bunch of the fun parts of building your own
 database, without so much effort spent on boring file garbage collection.
