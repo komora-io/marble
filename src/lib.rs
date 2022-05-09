@@ -37,7 +37,7 @@ mod metadata_log;
 use std::num::NonZeroU64;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufWriter, BufReader, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -490,11 +490,19 @@ impl Marble {
         // allocates unique temporary file names
         static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-        let mut new_locations: Vec<(ObjectId, Option<u64>)> = vec![];
-        let mut buf = vec![];
+        let tmp_fname = format!("{}-tmp", TMP_COUNTER.fetch_add(1, Ordering::Relaxed));
+        let tmp_path = self.config.path.join(HEAP_DIR_SUFFIX).join(tmp_fname);
 
-        // NB capacity starts with 1 due to the max LSN key that is always included
-        let mut capacity = 1;
+        let mut file_options = OpenOptions::new();
+        file_options.read(true).write(true).create(true);
+
+        let file = io_try!(file_options.open(&tmp_path));
+        let mut buf_writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
+
+        let mut new_locations: Vec<(ObjectId, Option<u64>)> = vec![];
+
+        let mut written_bytes = 0;
+        let mut capacity = 0;
         for (pid, raw_object_opt) in &objects {
             let raw_object = if let Some(raw_object) = raw_object_opt {
                 raw_object.as_ref()
@@ -521,7 +529,7 @@ impl Marble {
 
             capacity += 1;
 
-            let relative_address = buf.len() as u64;
+            let relative_address = written_bytes as u64;
             new_locations.push((*pid, Some(relative_address)));
 
             let len_buf: [u8; 8] = (raw_object.len() as u64).to_le_bytes();
@@ -533,24 +541,21 @@ impl Marble {
             hasher.update(&raw_object);
             let crc: u32 = hasher.finalize();
 
-            io_try!(buf.write_all(&crc.to_le_bytes()));
-            io_try!(buf.write_all(&pid_buf));
-            io_try!(buf.write_all(&len_buf));
-            io_try!(buf.write_all(&raw_object));
+            io_try!(buf_writer.write_all(&crc.to_le_bytes()));
+            io_try!(buf_writer.write_all(&pid_buf));
+            io_try!(buf_writer.write_all(&len_buf));
+            io_try!(buf_writer.write_all(&raw_object));
+
+            written_bytes += HEADER_LEN + raw_object.len();
         }
 
-        let tmp_fname = format!("{}-tmp", TMP_COUNTER.fetch_add(1, Ordering::Relaxed));
-        let tmp_path = self.config.path.join(HEAP_DIR_SUFFIX).join(tmp_fname);
+        io_try!(buf_writer.flush());
 
-        let mut file_options = OpenOptions::new();
-        file_options.read(true).write(true).create(true);
-
-        let mut file = io_try!(file_options.open(&tmp_path));
-
-        io_try!(file.write_all(&buf));
-
-        let buf_len = buf.len();
-        drop(buf);
+        let file: File = buf_writer.into_inner()
+            .expect(
+                "BufWriter::into_inner should not fail \
+                after calling flush directly before"
+            );
 
         // mv and fsync new file and directory
 
@@ -559,7 +564,7 @@ impl Marble {
         let mut write_path = self.write_path.lock().unwrap();
 
         let lsn = write_path.next_file_lsn;
-        write_path.next_file_lsn += buf_len as u64 + 1;
+        write_path.next_file_lsn += written_bytes as u64 + 1;
 
         let fname = format!("{:02x}-{:016x}-{:01x}-{:016x}", shard, lsn, gen, capacity);
         let new_path = self.config.path.join(HEAP_DIR_SUFFIX).join(fname);
@@ -592,43 +597,43 @@ impl Marble {
         assert_ne!(lsn, 0);
 
         let mut contention_hit = 0;
-        let write_batch: Vec<(u64, Option<u64>)> = new_locations
-            .into_iter()
-            .map(|(pid, location_opt)| {
-                let key = pid.0.get();
-                let value = if let Some(location) = location_opt {
-                    Some(location + lsn)
-                } else {
-                    None
-                };
-                (key, value)
-            })
-            .filter(|(pid, _location)| {
-                if let Some(lsn_fence) = lsn_fence_opt {
-                    if self.page_table.get(*pid).load(Ordering::Acquire) >= lsn_fence {
-                        // a concurrent batch has replaced this attempted
-                        // object GC rewrite in a later file, invalidating
-                        // the copy.
-                        contention_hit += 1;
-                        return false;
-                    }
+        let mut write_batch: Vec<(u64, Option<u64>)> = Vec::with_capacity(new_locations.len() + 1);
+
+        for (pid, location_opt) in new_locations {
+            let key = pid.0.get();
+            let value = if let Some(location) = location_opt {
+                Some(location + lsn)
+            } else {
+                None
+            };
+
+            if let Some(lsn_fence) = lsn_fence_opt {
+                if self.page_table.get(key).load(Ordering::Acquire) >= lsn_fence {
+                    // a concurrent batch has replaced this attempted
+                    // object GC rewrite in a later file, invalidating
+                    // the copy.
+                    contention_hit += 1;
+                    continue;
                 }
-                true
-            })
-            .chain(std::iter::once({
-                // always mark the lsn w/ the pt batch
-                let key = PT_LSN_KEY;
-                let value = Some(lsn);
-                (key, value)
-            }))
-            .collect();
+            }
+
+            write_batch.push((key, value));
+        }
+
+        // always mark the lsn w/ the pt batch
+        let key = PT_LSN_KEY;
+        let value = Some(lsn);
+        write_batch.push((key, value));
 
         write_path.metadata_log.log_batch(&write_batch)?;
         write_path.metadata_log.flush()?;
 
-        let mut replaced_locations = vec![];
+        let mut replaced_locations = Vec::with_capacity(write_batch.len());
 
         for (pid, new_location_opt) in write_batch {
+            if pid == PT_LSN_KEY {
+                continue;
+            }
             let old = self.page_table.get(pid).swap(
                 new_location_opt.unwrap_or(0),
                 Ordering::Release,
@@ -658,7 +663,9 @@ impl Marble {
 
         let fams = self.fams.read().unwrap();
 
-        fams[&location].len.fetch_sub(contention_hit, Ordering::Relaxed);
+        let old_len = fams[&location].len.fetch_sub(contention_hit, Ordering::Relaxed);
+
+        assert_ne!(old_len, 0, "unexpected file metadata length wrap to u64::MAX");
 
         for old_location in replaced_locations {
             let (_, fam) = fams
@@ -722,7 +729,9 @@ impl Marble {
         for (location, meta) in &*fams {
             assert_eq!(*location, meta.location);
             let len = meta.len.load(Ordering::Acquire);
-            let cap = meta.capacity.max(1);
+            let cap = meta.capacity;
+
+            assert_ne!(cap, 0);
 
             if len != 0 && (len * 100) / cap < u64::from(self.config.file_compaction_percent) {
                 if meta.rewrite_claim.swap(true, Ordering::SeqCst) {
@@ -829,7 +838,7 @@ impl Marble {
 
             rewritten_objects += batch.len();
 
-            io_try!(self.shard_batch(batch, *generation, Some(lsn_fence)));
+            self.shard_batch(batch, *generation, Some(lsn_fence))?;
         }
 
         drop(defer_unclaim);
