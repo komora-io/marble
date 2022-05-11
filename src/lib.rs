@@ -157,7 +157,7 @@ pub struct Config {
     /// it's considered rewritabe.
     pub file_compaction_percent: u8,
     /// The ceiling on the largest allocation this system
-    /// will ever attempt to perform in order to read a
+    /// will ever attempt to perform in order to read an
     /// object off of disk.
     pub max_object_size: usize,
     /// A partitioning function for objects based on
@@ -548,7 +548,10 @@ impl Marble {
         Ok(Some(object_buf))
     }
 
-    /// Statistics about current files.
+    /// Statistics about current files, intended to inform
+    /// decisions about when to call `maintenance` based on
+    /// desired write and space amplification
+    /// characteristics.
     pub fn file_statistics(&self) -> FileStats {
         let mut live_objects = 0;
         let mut stored_objects = 0;
@@ -563,6 +566,21 @@ impl Marble {
             stored_objects,
             dead_objects: stored_objects - live_objects,
         }
+    }
+
+    /// A monotonic measure of logical progress that this
+    /// system has made. You can refer to this in logs and
+    /// other stores that feed into `marble`, so that after
+    /// recovering `marble`, you can avoid double-recovering
+    /// any mutations that were already persisted here. Note
+    /// that if you are concurrently calling `write_batch`
+    /// or `maintenance`, the stable logical sequence number
+    /// will increase, so you should only use this to fence
+    /// idempotent operations if used in a concurrent
+    /// setting.
+    pub fn stable_logical_sequence_number(&self) -> u64 {
+        let write_path = self.write_path.lock().unwrap();
+        write_path.next_file_lsn.saturating_sub(1)
     }
 
     /// Write a batch of objects to disk. This function is
