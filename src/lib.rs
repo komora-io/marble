@@ -90,6 +90,14 @@ const MAX_GENERATION: u8 = 3;
 #[repr(transparent)]
 pub struct ObjectId(pub NonZeroU64);
 
+impl std::ops::Deref for ObjectId {
+    type Target = NonZeroU64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl ObjectId {
     pub const fn new(u: u64) -> Option<ObjectId> {
         if let Some(n) = NonZeroU64::new(u) {
@@ -411,7 +419,7 @@ impl Marble {
         let page_table = PageTable::default();
         for (pid, location) in metadata {
             assert_ne!(location, 0);
-            if location != 0 {
+            if location != 0 && pid != PT_LSN_KEY {
                 let (_, fam) = fams
                     .range(
                         ..=DiskLocation::new(location)
@@ -760,7 +768,11 @@ impl Marble {
             .join(HEAP_DIR_SUFFIX)
             .join(fname);
 
-        io_try!(fs::rename(tmp_path, &new_path));
+        if capacity > 0 {
+            io_try!(fs::rename(tmp_path, &new_path));
+        } else {
+            io_try!(fs::remove_file(tmp_path));
+        }
 
         // fsync directory to ensure new file is present
         io_try!(File::open(
@@ -769,25 +781,26 @@ impl Marble {
         .and_then(|f| f.sync_all()));
 
         let location = DiskLocation::new(lsn).unwrap();
+        if capacity > 0 {
+            let fam = FileAndMetadata {
+                file,
+                capacity,
+                len: capacity.into(),
+                generation: gen,
+                location,
+                path: new_path,
+                rewrite_claim: false.into(),
+            };
 
-        let fam = FileAndMetadata {
-            file,
-            capacity,
-            len: capacity.into(),
-            generation: gen,
-            location,
-            path: new_path,
-            rewrite_claim: false.into(),
-        };
+            log::debug!(
+                "inserting new fam at location {:?}",
+                lsn
+            );
 
-        log::debug!(
-            "inserting new fam at location {:?}",
-            lsn
-        );
-
-        let mut fams = self.fams.write().unwrap();
-        assert!(fams.insert(location, fam).is_none());
-        drop(fams);
+            let mut fams = self.fams.write().unwrap();
+            assert!(fams.insert(location, fam).is_none());
+            drop(fams);
+        }
 
         // write a batch of updates to the page table
 
@@ -814,10 +827,8 @@ impl Marble {
                     >= lsn_fence
                 {
                     // a concurrent batch has replaced this
-                    // attempted
-                    // object GC rewrite in a later file,
-                    // invalidating
-                    // the copy.
+                    // attempted object GC rewrite in a
+                    // later file, invalidating the copy.
                     contention_hit += 1;
                     continue;
                 }
@@ -877,15 +888,18 @@ impl Marble {
 
         let fams = self.fams.read().unwrap();
 
-        let old_len = fams[&location]
-            .len
-            .fetch_sub(contention_hit, Ordering::Relaxed);
+        if capacity > 0 {
+            let old_len = fams[&location].len.fetch_sub(
+                contention_hit,
+                Ordering::Relaxed,
+            );
 
-        assert_ne!(
-            old_len, 0,
-            "unexpected file metadata length wrap to \
-             u64::MAX"
-        );
+            assert!(
+                old_len != 0 || contention_hit == 0,
+                "unexpected file metadata length wrap to \
+                 u64::MAX"
+            );
+        }
 
         for old_location in replaced_locations {
             let (_, fam) = fams
@@ -1276,6 +1290,51 @@ mod test {
             marble.maintenance().unwrap();
             assert!(marble.read(pid_1).unwrap().is_some());
             assert!(marble.read(pid_2).unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn test_03() {
+        let _ = env_logger::try_init();
+
+        with_tmp_instance(|marble| {
+            let pid_1 = ObjectId::new(1).unwrap();
+            marble
+                .write_batch([(pid_1, None)].into_iter())
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn test_04() {
+        let _ = env_logger::try_init();
+
+        with_tmp_instance(|marble| {
+            let pid_1 = ObjectId::new(1).unwrap();
+            marble
+                .write_batch([(pid_1, None)].into_iter())
+                .unwrap();
+
+            marble.maintenance().unwrap();
+
+            let pid_1 = ObjectId::new(1).unwrap();
+            marble
+                .write_batch([(pid_1, None)].into_iter())
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn test_05() {
+        let _ = env_logger::try_init();
+
+        with_tmp_instance(|marble| {
+            let pid_1 = ObjectId::new(1).unwrap();
+            marble
+                .write_batch([(pid_1, None)].into_iter())
+                .unwrap();
+
+            restart(marble);
         });
     }
 }
