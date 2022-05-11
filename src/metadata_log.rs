@@ -2,7 +2,9 @@
 // this works.
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::{self, prelude::*, BufReader, BufWriter, Result};
+use std::io::{
+    self, prelude::*, BufReader, BufWriter, Result,
+};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -49,43 +51,51 @@ struct Waiter {
 
 impl Waiter {
     fn wait(self: Arc<Waiter>) {
-        if self.done.load(std::sync::atomic::Ordering::Acquire) {
+        if self
+            .done
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return;
         }
         let mut mu = self.mu.lock().unwrap();
-        while !self.done.load(std::sync::atomic::Ordering::Acquire) {
+        while !self
+            .done
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             mu = self.cv.wait(mu).unwrap();
         }
     }
 
     fn finished(self: Arc<Waiter>) {
         let _mu = self.mu.lock().unwrap();
-        self.done.store(true, std::sync::atomic::Ordering::Release);
+        self.done.store(
+            true,
+            std::sync::atomic::Ordering::Release,
+        );
         self.cv.notify_all();
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
-    /// When the log file exceeds this size, a new compressed
-    /// and compacted table will be flushed to disk and the
-    /// log file will be truncated.
+    /// When the log file exceeds this size, a new
+    /// compressed and compacted table will be flushed
+    /// to disk and the log file will be truncated.
     pub max_log_length: usize,
-    /// When the background compactor thread looks for contiguous
-    /// ranges of tables to merge, it will require all tables
-    /// to be at least 1/`merge_ratio` * the size of the first table
+    /// When the background compactor thread looks for
+    /// contiguous ranges of tables to merge, it will
+    /// require all tables to be at least
+    /// 1/`merge_ratio` * the size of the first table
     /// in the contiguous window under consideration.
     pub merge_ratio: u8,
-    /// When the background compactor thread looks for ranges of
-    /// tables to merge, it will require ranges to be at least
-    /// this long.
+    /// When the background compactor thread looks for
+    /// ranges of tables to merge, it will require
+    /// ranges to be at least this long.
     pub merge_window: u8,
-    /// All inserts go directly to a `BufWriter` wrapping the log
-    /// file. This option determines how large that in-memory buffer
-    /// is.
+    /// All inserts go directly to a `BufWriter` wrapping
+    /// the log file. This option determines how large
+    /// that in-memory buffer is.
     pub log_bufwriter_size: u32,
-    /// The level of compression to use for the tables with zstd.
-    pub zstd_table_compression_level: u8,
 }
 
 impl Default for Config {
@@ -95,7 +105,6 @@ impl Default for Config {
             merge_ratio: 3,
             merge_window: 5,
             log_bufwriter_size: 1024 * 1024,
-            zstd_table_compression_level: 3,
         }
     }
 }
@@ -127,8 +136,9 @@ fn hash(k: &u64, v: &Option<u64>) -> u32 {
         hasher.update(&[0; V]);
     }
 
-    // we XOR the hash to make sure it's something other than 0 when empty,
-    // because 0 is an easy value to create accidentally or via corruption.
+    // we XOR the hash to make sure it's something other
+    // than 0 when empty, because 0 is an easy value to
+    // create accidentally or via corruption.
     hasher.finalize() ^ 0xFF
 }
 
@@ -157,7 +167,10 @@ struct Worker {
 impl Worker {
     fn run(mut self) {
         while self.tick() {}
-        log::info!("tiny-metadata_store compaction worker quitting");
+        log::info!(
+            "tiny-metadata_store compaction worker \
+             quitting"
+        );
     }
 
     fn tick(&mut self) -> bool {
@@ -170,8 +183,8 @@ impl Worker {
         // for new messages.
         if let Err(e) = self.table_maintenance() {
             log::error!(
-                "error while compacting tables \
-                in the background: {:?}",
+                "error while compacting tables in the \
+                 background: {:?}",
                 e
             );
         }
@@ -179,9 +192,12 @@ impl Worker {
         true
     }
 
-    fn handle_message(&mut self, message: WorkerMessage) -> bool {
+    fn handle_message(
+        &mut self,
+        message: WorkerMessage,
+    ) -> bool {
         match message {
-            WorkerMessage::NewT { id, sst_sz, } => {
+            WorkerMessage::NewT { id, sst_sz } => {
                 self.table_directory.insert(id, sst_sz);
                 true
             }
@@ -197,38 +213,49 @@ impl Worker {
     }
 
     fn table_maintenance(&mut self) -> Result<()> {
-        let on_disk_size: u64 = self.table_directory.values().sum();
+        let on_disk_size: u64 =
+            self.table_directory.values().sum();
 
         log::debug!("disk size: {}", on_disk_size);
-        let max_tables = self.config.merge_ratio as usize * self.config.merge_window as usize;
-        if self.table_directory.len() > max_tables
-        {
+        let max_tables = self.config.merge_ratio as usize
+            * self.config.merge_window as usize;
+        if self.table_directory.len() > max_tables {
             log::debug!(
-                "performing full compaction, decompressed on-disk \
-                database size has grown beyond {}x the in-memory size",
+                "performing full compaction, decompressed \
+                 on-disk database size has grown beyond \
+                 {}x the in-memory size",
                 max_tables
             );
-            let run_to_compact: Vec<u64> = self.table_directory.keys().copied().collect();
+            let run_to_compact: Vec<u64> = self
+                .table_directory
+                .keys()
+                .copied()
+                .collect();
 
             return self.compact_table_run(&run_to_compact);
         }
 
-        if self.table_directory.len() < self.config.merge_window.max(2) as usize {
+        if self.table_directory.len()
+            < self.config.merge_window.max(2) as usize
+        {
             return Ok(());
         }
 
-        for window in self
-            .table_directory
-            .iter()
-            .collect::<Vec<_>>()
-            .windows(self.config.merge_window.max(2) as usize)
-        {
-            if window
+        for window in
+            self.table_directory
                 .iter()
-                .skip(1)
-                .all(|w| *w.1 * self.config.merge_ratio as u64 > *window[0].1)
-            {
-                let run_to_compact: Vec<u64> = window.into_iter().map(|(id, _sum)| **id).collect();
+                .collect::<Vec<_>>()
+                .windows(self.config.merge_window.max(2)
+                    as usize)
+        {
+            if window.iter().skip(1).all(|w| {
+                *w.1 * self.config.merge_ratio as u64
+                    > *window[0].1
+            }) {
+                let run_to_compact: Vec<u64> = window
+                    .into_iter()
+                    .map(|(id, _sum)| **id)
+                    .collect();
 
                 self.compact_table_run(&run_to_compact)?;
                 return Ok(());
@@ -238,11 +265,15 @@ impl Worker {
         Ok(())
     }
 
-    // This function must be able to crash at any point without
-    // leaving the system in an unrecoverable state, or without
-    // losing data. This function must be nullipotent from the
-    // external API surface's perspective.
-    fn compact_table_run(&mut self, table_ids: &[u64]) -> Result<()> {
+    // This function must be able to crash at any point
+    // without leaving the system in an unrecoverable
+    // state, or without losing data. This function must
+    // be nullipotent from the external API surface's
+    // perspective.
+    fn compact_table_run(
+        &mut self,
+        table_ids: &[u64],
+    ) -> Result<()> {
         log::debug!(
             "trying to compact table_ids {:?}",
             table_ids
@@ -256,42 +287,55 @@ impl Worker {
         let mut read_pairs = 0;
 
         for table_id in table_ids {
-            for (k, v) in read_table(&self.path, *table_id)? {
+            for (k, v) in read_table(&self.path, *table_id)?
+            {
                 map.insert(k, v);
                 read_pairs += 1;
             }
         }
 
-        self.stats
-            .read_bytes
-            .fetch_add(read_pairs * (4 + 1 + K + V) as u64, Ordering::Relaxed);
+        self.stats.read_bytes.fetch_add(
+            read_pairs * (4 + 1 + K + V) as u64,
+            Ordering::Relaxed,
+        );
 
-        let sst_id = table_ids
-            .iter()
-            .max()
-            .expect("compact_table_run called with empty set of sst ids");
+        let sst_id = table_ids.iter().max().expect(
+            "compact_table_run called with empty set of \
+             sst ids",
+        );
 
-        write_table(&self.path, *sst_id, &map, true, &self.config)?;
+        write_table(&self.path, *sst_id, &map, true)?;
 
-        self.stats
-            .written_bytes
-            .fetch_add(map.len() as u64 * (4 + 1 + K + V) as u64, Ordering::Relaxed);
+        self.stats.written_bytes.fetch_add(
+            map.len() as u64 * (4 + 1 + K + V) as u64,
+            Ordering::Relaxed,
+        );
 
         let sst_sz = map.len() as u64 * (4 + K + V) as u64;
         self.table_directory.insert(*sst_id, sst_sz);
 
-        log::debug!("compacted range into table {}", id_format(*sst_id));
+        log::debug!(
+            "compacted range into table {}",
+            id_format(*sst_id)
+        );
 
         for table_id in table_ids {
             if table_id == sst_id {
                 continue;
             }
-            io_try!(fs::remove_file(self.path.join(TABLE_DIR).join(id_format(*table_id))));
-            self.table_directory
-                .remove(table_id)
-                .expect("compacted sst not present in table_directory");
+            io_try!(fs::remove_file(
+                self.path
+                    .join(TABLE_DIR)
+                    .join(id_format(*table_id))
+            ));
+            self.table_directory.remove(table_id).expect(
+                "compacted sst not present in \
+                 table_directory",
+            );
         }
-        let parent = io_try!(fs::File::open(self.path.join(TABLE_DIR)));
+        let parent = io_try!(fs::File::open(
+            self.path.join(TABLE_DIR)
+        ));
         io_try!(parent.sync_all());
 
         Ok(())
@@ -302,25 +346,38 @@ fn id_format(id: u64) -> String {
     format!("{:016x}", id)
 }
 
-fn list_tables(path: &Path, remove_tmp: bool) -> Result<BTreeMap<u64, u64>> {
+fn list_tables(
+    path: &Path,
+    remove_tmp: bool,
+) -> Result<BTreeMap<u64, u64>> {
     let mut table_map = BTreeMap::new();
 
-    for dir_entry_res in io_try!(fs::read_dir(path.join(TABLE_DIR))) {
+    for dir_entry_res in
+        io_try!(fs::read_dir(path.join(TABLE_DIR)))
+    {
         let dir_entry = io_try!(dir_entry_res);
-        let file_name = if let Ok(f) = dir_entry.file_name().into_string() {
+        let file_name = if let Ok(f) =
+            dir_entry.file_name().into_string()
+        {
             f
         } else {
             continue;
         };
 
-        if let Ok(id) = u64::from_str_radix(&file_name, 16) {
+        if let Ok(id) = u64::from_str_radix(&file_name, 16)
+        {
             let metadata = io_try!(dir_entry.metadata());
 
             table_map.insert(id, metadata.len());
         } else {
             if remove_tmp && file_name.ends_with("-tmp") {
-                log::warn!("removing incomplete table rewrite {}", file_name);
-                io_try!(fs::remove_file(path.join(TABLE_DIR).join(file_name)));
+                log::warn!(
+                    "removing incomplete table rewrite {}",
+                    file_name
+                );
+                io_try!(fs::remove_file(
+                    path.join(TABLE_DIR).join(file_name)
+                ));
             }
         }
     }
@@ -333,7 +390,6 @@ fn write_table(
     id: u64,
     items: &HashMap<u64, Option<u64>>,
     tmp_mv: bool,
-    config: &Config,
 ) -> Result<()> {
     let sst_dir_path = path.join(TABLE_DIR);
     let sst_path = if tmp_mv {
@@ -347,15 +403,11 @@ fn write_table(
         .write(true)
         .open(&sst_path));
 
-    let max_zstd_level = zstd::compression_level_range();
-    let zstd_level = config
-        .zstd_table_compression_level
-        .min(*max_zstd_level.end() as u8);
+    let mut bw = BufWriter::new(file);
 
-    let mut bw =
-        BufWriter::new(zstd::Encoder::new(file, zstd_level as _).expect("zstd encoder failure"));
-
-    io_try!(bw.write_all(&(items.len() as u64).to_le_bytes()));
+    io_try!(
+        bw.write_all(&(items.len() as u64).to_le_bytes())
+    );
 
     for (k, v) in items {
         let crc: u32 = hash(k, v);
@@ -372,8 +424,9 @@ fn write_table(
 
     io_try!(bw.flush());
 
-    io_try!(bw.get_mut().get_mut().sync_all());
-    let parent = io_try!(fs::File::open(path.join(TABLE_DIR)));
+    io_try!(bw.get_mut().sync_all());
+    let parent =
+        io_try!(fs::File::open(path.join(TABLE_DIR)));
     io_try!(parent.sync_all());
 
     if tmp_mv {
@@ -384,12 +437,16 @@ fn write_table(
     Ok(())
 }
 
-fn read_table(path: &Path, id: u64) -> Result<Vec<(u64, Option<u64>)>> {
+fn read_table(
+    path: &Path,
+    id: u64,
+) -> Result<Vec<(u64, Option<u64>)>> {
     let file = io_try!(fs::OpenOptions::new()
         .read(true)
         .open(path.join(TABLE_DIR).join(id_format(id))));
 
-    let mut reader = zstd::Decoder::new(BufReader::with_capacity(16 * 1024 * 1024, file)).unwrap();
+    let mut reader =
+        BufReader::with_capacity(16 * 1024 * 1024, file);
 
     // crc + tombstone discriminant + key + value
     let mut buf = vec![0; 4 + 1 + K + V];
@@ -399,22 +456,31 @@ fn read_table(path: &Path, id: u64) -> Result<Vec<(u64, Option<u64>)>> {
     io_try!(reader.read_exact(len_buf));
 
     let expected_len: u64 = u64::from_le_bytes(*len_buf);
-    let mut table = Vec::with_capacity(expected_len as usize);
+    let mut table =
+        Vec::with_capacity(expected_len as usize);
 
     while let Ok(()) = reader.read_exact(&mut buf) {
-        let crc_expected: u32 = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let crc_expected: u32 = u32::from_le_bytes(
+            buf[0..4].try_into().unwrap(),
+        );
         let d: bool = match buf[4] {
             0 => false,
             1 => true,
             _ => {
-                log::warn!("detected torn-write while reading table {:016x}", id);
+                log::warn!(
+                    "detected torn-write while reading \
+                     table {:016x}",
+                    id
+                );
                 break;
             }
         };
-        let k_buf: [u8; K] = buf[5..K + 5].try_into().unwrap();
+        let k_buf: [u8; K] =
+            buf[5..K + 5].try_into().unwrap();
         let k = u64::from_be_bytes(k_buf);
         let v: Option<u64> = if d {
-            let v_buf = buf[K + 5..5 + K + V].try_into().unwrap();
+            let v_buf =
+                buf[K + 5..5 + K + V].try_into().unwrap();
             let v = u64::from_be_bytes(v_buf);
             Some(v)
         } else {
@@ -423,7 +489,11 @@ fn read_table(path: &Path, id: u64) -> Result<Vec<(u64, Option<u64>)>> {
         let crc_actual: u32 = hash(&k, &v);
 
         if crc_expected != crc_actual {
-            log::warn!("detected torn-write while reading table {:016x}", id);
+            log::warn!(
+                "detected torn-write while reading table \
+                 {:016x}",
+                id
+            );
             break;
         }
 
@@ -432,8 +502,9 @@ fn read_table(path: &Path, id: u64) -> Result<Vec<(u64, Option<u64>)>> {
 
     if table.len() as u64 != expected_len {
         log::warn!(
-            "table {:016x} tear detected - process probably crashed \
-            before full table could be written out",
+            "table {:016x} tear detected - process \
+             probably crashed before full table could be \
+             written out",
             id
         );
     }
@@ -458,24 +529,38 @@ impl Drop for MetadataLog {
     fn drop(&mut self) {
         let waiter: Arc<Waiter> = Arc::default();
 
-        self.worker_outbox.send(WorkerMessage::Stop(waiter.clone()));
+        self.worker_outbox
+            .send(WorkerMessage::Stop(waiter.clone()));
 
         waiter.wait();
     }
 }
 
 impl MetadataLog {
-    pub fn recover<P: AsRef<Path>>(p: P) -> Result<(HashMap<u64, u64>, MetadataLog)> {
-        MetadataLog::recover_with_config(p, Config::default())
+    pub fn recover<P: AsRef<Path>>(
+        p: P,
+    ) -> Result<(HashMap<u64, u64>, MetadataLog)> {
+        MetadataLog::recover_with_config(
+            p,
+            Config::default(),
+        )
     }
 
-    pub fn recover_with_config<P: AsRef<Path>>(p: P, config: Config) -> Result<(HashMap<u64, u64>, MetadataLog)> {
+    pub fn recover_with_config<P: AsRef<Path>>(
+        p: P,
+        config: Config,
+    ) -> Result<(HashMap<u64, u64>, MetadataLog)> {
         let path = p.as_ref();
         if !path.exists() {
             io_try!(fs::create_dir_all(path));
             io_try!(fs::create_dir(path.join(TABLE_DIR)));
-            io_try!(io_try!(fs::File::open(path.join(TABLE_DIR))).sync_all());
-            io_try!(io_try!(fs::File::open(path)).sync_all());
+            io_try!(io_try!(fs::File::open(
+                path.join(TABLE_DIR)
+            ))
+            .sync_all());
+            io_try!(
+                io_try!(fs::File::open(path)).sync_all()
+            );
             let mut parent_opt = path.parent();
 
             // need to recursively fsync parents since
@@ -484,9 +569,14 @@ impl MetadataLog {
                 if parent.file_name().is_none() {
                     break;
                 }
-                if fs::File::open(parent).and_then(|f| f.sync_all()).is_err() {
-                    // we made a reasonable attempt, but permissions
-                    // can sometimes get in the way, and at this point it's
+                if fs::File::open(parent)
+                    .and_then(|f| f.sync_all())
+                    .is_err()
+                {
+                    // we made a reasonable attempt, but
+                    // permissions
+                    // can sometimes get in the way, and at
+                    // this point it's
                     // becoming pedantic.
                     break;
                 }
@@ -507,7 +597,8 @@ impl MetadataLog {
             }
         }
 
-        let max_table_id = table_directory.keys().next_back().copied();
+        let max_table_id =
+            table_directory.keys().next_back().copied();
 
         let log = io_try!(fs::OpenOptions::new()
             .create(true)
@@ -525,32 +616,49 @@ impl MetadataLog {
         let mut memtable = HashMap::new();
         let mut recovered = 0;
 
-        // write_batch is the pending memtable updates, the number
-        // of remaining items in the write batch, and the number of
-        // bytes that have been recovered in the write batch.
+        // write_batch is the pending memtable updates, the
+        // number of remaining items in the write
+        // batch, and the number of bytes that have
+        // been recovered in the write batch.
         let mut write_batch: Option<(_, usize, u64)> = None;
         while let Ok(()) = reader.read_exact(&mut buf) {
-            let crc_expected: u32 = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+            let crc_expected: u32 = u32::from_le_bytes(
+                buf[0..4].try_into().unwrap(),
+            );
             let d: bool = match buf[4] {
                 0 => false,
                 1 => true,
                 2 if write_batch.is_none() => {
                     // begin batch
-                    let batch_sz_buf: [u8; 8] = buf[5..5 + 8].try_into().unwrap();
-                    let batch_sz: u64 = u64::from_le_bytes(batch_sz_buf);
-                    log::debug!("processing batch of len {}", batch_sz);
+                    let batch_sz_buf: [u8; 8] =
+                        buf[5..5 + 8].try_into().unwrap();
+                    let batch_sz: u64 =
+                        u64::from_le_bytes(batch_sz_buf);
+                    log::debug!(
+                        "processing batch of len {}",
+                        batch_sz
+                    );
 
-                    let crc_actual = hash_batch_len(usize::try_from(batch_sz).unwrap());
+                    let crc_actual = hash_batch_len(
+                        usize::try_from(batch_sz).unwrap(),
+                    );
                     if crc_expected != crc_actual {
-                        log::warn!("crc mismatch for batch size marker");
+                        log::warn!(
+                            "crc mismatch for batch size \
+                             marker"
+                        );
                         break;
                     }
 
-                    if !buf[5 + U64_SZ..].iter().all(|e| *e == 0) {
+                    if !buf[5 + U64_SZ..]
+                        .iter()
+                        .all(|e| *e == 0)
+                    {
                         log::warn!(
-                            "expected all pad bytes after logged \
-                            batch manifests to be zero, but some \
-                            corruption was detected"
+                            "expected all pad bytes after \
+                             logged batch manifests to be \
+                             zero, but some corruption \
+                             was detected"
                         );
                         break;
                     }
@@ -558,7 +666,8 @@ impl MetadataLog {
                     if batch_sz > usize::MAX as u64 {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
-                            "recovering a batch size over usize::MAX is not supported",
+                            "recovering a batch size over \
+                             usize::MAX is not supported",
                         ));
                     }
 
@@ -567,7 +676,9 @@ impl MetadataLog {
 
                     if wb_remaining > 0 {
                         write_batch = Some((
-                            Vec::with_capacity(batch_sz as usize),
+                            Vec::with_capacity(
+                                batch_sz as usize,
+                            ),
                             wb_remaining,
                             wb_recovered,
                         ));
@@ -578,14 +689,21 @@ impl MetadataLog {
                     continue;
                 }
                 _ => {
-                    log::warn!("invalid log message discriminant detected: {}", buf[4]);
+                    log::warn!(
+                        "invalid log message discriminant \
+                         detected: {}",
+                        buf[4]
+                    );
                     break;
                 }
             };
-            let k_buf: [u8; K] = buf[5..5 + K].try_into().unwrap();
+            let k_buf: [u8; K] =
+                buf[5..5 + K].try_into().unwrap();
             let k = u64::from_be_bytes(k_buf);
             let v: Option<u64> = if d {
-                let v_buf = buf[K + 5..5 + K + V].try_into().unwrap();
+                let v_buf = buf[K + 5..5 + K + V]
+                    .try_into()
+                    .unwrap();
                 let v = u64::from_be_bytes(v_buf);
                 Some(v)
             } else {
@@ -596,7 +714,9 @@ impl MetadataLog {
 
             if crc_expected != crc_actual {
                 log::warn!(
-                    "crc mismatch for kv pair {:?}-{:?}: expected {} actual {}, torn log detected",
+                    "crc mismatch for kv pair {:?}-{:?}: \
+                     expected {} actual {}, torn log \
+                     detected",
                     k,
                     v,
                     crc_expected,
@@ -605,21 +725,30 @@ impl MetadataLog {
                 break;
             }
 
-            let pad_start = if v.is_some() { 5 + K + V } else { 5 + K };
+            let pad_start =
+                if v.is_some() { 5 + K + V } else { 5 + K };
 
             if !buf[pad_start..].iter().all(|e| *e == 0) {
                 log::warn!(
-                    "expected all pad bytes for logged kv entries \
-                    to be zero, but some corruption was detected"
+                    "expected all pad bytes for logged kv \
+                     entries to be zero, but some \
+                     corruption was detected"
                 );
                 break;
             }
 
-            let (mut wb, mut wb_remaining, mut wb_recovered) = write_batch.take().unwrap();
+            let (
+                mut wb,
+                mut wb_remaining,
+                mut wb_recovered,
+            ) = write_batch.take().unwrap();
 
             wb.push((k, v));
-            wb_remaining = wb_remaining.checked_sub(1).unwrap();
-            wb_recovered = wb_recovered.checked_add(buf.len() as u64).unwrap();
+            wb_remaining =
+                wb_remaining.checked_sub(1).unwrap();
+            wb_recovered = wb_recovered
+                .checked_add(buf.len() as u64)
+                .unwrap();
 
             // apply the write batch all at once
             // or never at all
@@ -635,21 +764,31 @@ impl MetadataLog {
                 }
                 recovered += wb_recovered;
             } else {
-                write_batch = Some((wb, wb_remaining, wb_recovered));
+                write_batch =
+                    Some((wb, wb_remaining, wb_recovered));
             }
         }
 
-        // need to back up a few bytes to chop off the torn log
+        // need to back up a few bytes to chop off the torn
+        // log
         log::debug!(
             "recovered {} pieces of metadata",
             table.len(),
         );
-        log::debug!("rewinding log down to length {}", recovered);
+        log::debug!(
+            "rewinding log down to length {}",
+            recovered
+        );
         let log_file = reader.get_mut();
-        io_try!(log_file.seek(io::SeekFrom::Start(recovered)));
+        io_try!(
+            log_file.seek(io::SeekFrom::Start(recovered))
+        );
         io_try!(log_file.set_len(recovered));
         io_try!(log_file.sync_all());
-        io_try!(io_try!(fs::File::open(path.join(TABLE_DIR))).sync_all());
+        io_try!(io_try!(fs::File::open(
+            path.join(TABLE_DIR)
+        ))
+        .sync_all());
 
         let q = Arc::new(Queue {
             mu: Default::default(),
@@ -677,7 +816,10 @@ impl MetadataLog {
         hb_waiter.wait();
 
         let metadata_store = MetadataLog {
-            log: BufWriter::with_capacity(config.log_bufwriter_size as usize, reader.into_inner()),
+            log: BufWriter::with_capacity(
+                config.log_bufwriter_size as usize,
+                reader.into_inner(),
+            ),
             path: path.into(),
             next_table_id: max_table_id.unwrap_or(0) + 1,
             dirty_bytes: recovered as usize,
@@ -688,7 +830,8 @@ impl MetadataLog {
                 on_disk_bytes: 0,
                 read_bytes: 0,
                 written_bytes: 0,
-                resident_bytes: table.len() as u64 * (K + V) as u64,
+                resident_bytes: table.len() as u64
+                    * (K + V) as u64,
                 space_amp: 0.,
                 write_amp: 0.,
             },
@@ -699,9 +842,14 @@ impl MetadataLog {
         Ok((table, metadata_store))
     }
 
-    /// Returns previous non-zero values for each item in batch
-    pub fn log_batch(&mut self, write_batch: &[(u64, Option<u64>)]) -> Result<()> {
-        let batch_len: [u8; 8] = (write_batch.len() as u64).to_le_bytes();
+    /// Returns previous non-zero values for each item in
+    /// batch
+    pub fn log_batch(
+        &mut self,
+        write_batch: &[(u64, Option<u64>)],
+    ) -> Result<()> {
+        let batch_len: [u8; 8] =
+            (write_batch.len() as u64).to_le_bytes();
         let crc = hash_batch_len(write_batch.len());
 
         io_try!(self.log.write_all(&crc.to_le_bytes()));
@@ -728,7 +876,11 @@ impl MetadataLog {
         Ok(())
     }
 
-    fn log_mutation(&mut self, k: u64, v: Option<u64>) -> Result<()> {
+    fn log_mutation(
+        &mut self,
+        k: u64,
+        v: Option<u64>,
+    ) -> Result<()> {
         let crc: u32 = hash(&k, &v);
         io_try!(self.log.write_all(&crc.to_le_bytes()));
         io_try!(self.log.write_all(&[v.is_some() as u8]));
@@ -773,16 +925,26 @@ impl MetadataLog {
 
         if self.dirty_bytes > self.config.max_log_length {
             log::debug!("compacting log to table");
-            let memtable = std::mem::take(&mut self.memtable);
+            let memtable =
+                std::mem::take(&mut self.memtable);
             let sst_id = self.next_table_id;
-            if let Err(e) = write_table(&self.path, sst_id, &memtable, false, &self.config) {
-                // put memtable back together before returning
+            if let Err(e) = write_table(
+                &self.path, sst_id, &memtable, false,
+            ) {
+                // put memtable back together before
+                // returning
                 self.memtable = memtable;
-                log::error!("failed to flush metadata_store log to table: {:?}", e);
+                log::error!(
+                    "failed to flush metadata_store log \
+                     to table: {:?}",
+                    e
+                );
                 return Err(e.into());
             }
 
-            let sst_sz = 8 + (memtable.len() as u64 * (4 + K + V) as u64);
+            let sst_sz = 8
+                + (memtable.len() as u64
+                    * (4 + K + V) as u64);
 
             self.worker_outbox.send(WorkerMessage::NewT {
                 id: sst_id,
@@ -791,11 +953,14 @@ impl MetadataLog {
 
             self.next_table_id += 1;
 
-            let log_file: &mut fs::File = self.log.get_mut();
+            let log_file: &mut fs::File =
+                self.log.get_mut();
             io_try!(log_file.seek(io::SeekFrom::Start(0)));
             io_try!(log_file.set_len(0));
             io_try!(log_file.sync_all());
-            let parent = io_try!(fs::File::open(self.path.join(TABLE_DIR)));
+            let parent = io_try!(fs::File::open(
+                self.path.join(TABLE_DIR)
+            ));
             io_try!(parent.sync_all());
 
             self.dirty_bytes = 0;
