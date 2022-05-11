@@ -1,11 +1,9 @@
 use std::sync::Arc;
 
-use marble::{ObjectId, Marble};
+use marble::{Marble, ObjectId};
 
-fn rdtsc () -> u64 {
-    unsafe {
-        core::arch::x86_64::_rdtsc()
-    }
+fn rdtsc() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
 }
 
 fn run(marble: Arc<Marble>) {
@@ -15,10 +13,13 @@ fn run(marble: Arc<Marble>) {
     const BATCH_SZ: u64 = 1024;
 
     for i in 0..(MAX / BATCH_SZ) {
-        let mut batch = std::collections::HashMap::default();
+        let mut batch = std::collections::HashMap::new();
 
         for _ in 1..=BATCH_SZ {
-            let pid = ObjectId::new(((rdtsc() * MUL) % KEYSPACE).max(1)).unwrap();
+            let pid = ObjectId::new(
+                ((rdtsc() * MUL) % KEYSPACE).max(1),
+            )
+            .unwrap();
             batch.insert(pid, Some(vec![0; 4 * 1024]));
         }
 
@@ -33,7 +34,8 @@ fn run(marble: Arc<Marble>) {
 fn main() {
     const CONCURRENCY: usize = 16;
 
-    let marble = Arc::new(Marble::open("bench_data").unwrap());
+    let marble =
+        Arc::new(Marble::open("bench_data").unwrap());
 
     let mut threads = vec![];
 
@@ -48,5 +50,9 @@ fn main() {
         thread.join().unwrap();
     }
 
-    dbg!(u64::MAX - marble::FAULT_INJECT_COUNTER.load(std::sync::atomic::Ordering::Acquire));
+    dbg!(
+        u64::MAX
+            - marble::FAULT_INJECT_COUNTER
+                .load(std::sync::atomic::Ordering::Acquire)
+    );
 }

@@ -1,10 +1,10 @@
 /// build with --features=serde,bincode
-use std::collections::{HashMap, BTreeMap};
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 
 use bincode::{deserialize, serialize};
-use serde::{Serialize, Deserialize};
-use marble::{ObjectId, Marble};
+use marble::{Marble, ObjectId};
+use serde::{Deserialize, Serialize};
 
 fn index_pid() -> ObjectId {
     ObjectId::new(1).unwrap()
@@ -48,16 +48,15 @@ impl Kv {
     fn recover(path: &str) -> io::Result<Kv> {
         let heap = Marble::open(path)?;
 
-        let index: Index = if let Some(index_data) = heap.read(index_pid())? {
+        let index: Index = if let Some(index_data) =
+            heap.read(index_pid())?
+        {
             deserialize(&index_data).unwrap()
         } else {
             Index::default()
         };
 
-        let mut kv = Kv {
-            index,
-            heap,
-        };
+        let mut kv = Kv { index, heap };
 
         if kv.index.pages.is_empty() {
             let genesis_page = Page {
@@ -72,44 +71,82 @@ impl Kv {
         Ok(kv)
     }
 
-    fn allocate_leaf(&mut self, leaf: Page) -> io::Result<()> {
+    fn allocate_leaf(
+        &mut self,
+        leaf: Page,
+    ) -> io::Result<()> {
         self.index.max_pid += 1;
         let pid = self.index.max_pid;
 
-        let previous = self.index.pages.insert(leaf.lo.clone(), ObjectId::new(pid).unwrap());
+        let previous = self.index.pages.insert(
+            leaf.lo.clone(),
+            ObjectId::new(pid).unwrap(),
+        );
         assert!(previous.is_none());
 
-        let write_batch: HashMap<ObjectId, Option<Vec<u8>>> = [
-            (ObjectId::new(pid).unwrap(), Some(serialize(&leaf).unwrap())),
-            (index_pid(), Some(serialize(&self.index).unwrap())),
-        ].into_iter().collect();
+        let write_batch: HashMap<
+            ObjectId,
+            Option<Vec<u8>>,
+        > = [
+            (
+                ObjectId::new(pid).unwrap(),
+                Some(serialize(&leaf).unwrap()),
+            ),
+            (
+                index_pid(),
+                Some(serialize(&self.index).unwrap()),
+            ),
+        ]
+        .into_iter()
+        .collect();
 
         self.heap.write_batch(write_batch)
     }
 
     fn pid_for_key(&self, key: Vec<u8>) -> ObjectId {
-        *self.index.pages.range(..=key).next_back().unwrap().1
+        *self
+            .index
+            .pages
+            .range(..=key)
+            .next_back()
+            .unwrap()
+            .1
     }
 
-    fn get(&mut self, key: &Vec<u8>) -> io::Result<Option<Vec<u8>>> {
+    fn get(
+        &mut self,
+        key: &Vec<u8>,
+    ) -> io::Result<Option<Vec<u8>>> {
         let pid = self.pid_for_key(key.clone());
         let leaf_data = self.heap.read(pid)?.unwrap();
         let leaf: Page = deserialize(&leaf_data).unwrap();
         Ok(leaf.kvs.get(key).cloned())
     }
 
-    fn set(&mut self, key: Vec<u8>, value: Vec<u8>) -> io::Result<Option<Vec<u8>>> {
+    fn set(
+        &mut self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> io::Result<Option<Vec<u8>>> {
         self.mutate(key, Some(value))
     }
 
-    fn remove(&mut self, key: Vec<u8>) -> io::Result<Option<Vec<u8>>> {
+    fn remove(
+        &mut self,
+        key: Vec<u8>,
+    ) -> io::Result<Option<Vec<u8>>> {
         self.mutate(key, None)
     }
 
-    fn mutate(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) -> io::Result<Option<Vec<u8>>> {
+    fn mutate(
+        &mut self,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    ) -> io::Result<Option<Vec<u8>>> {
         let pid = self.pid_for_key(key.clone());
         let leaf_data = self.heap.read(pid)?.unwrap();
-        let mut leaf: Page = deserialize(&leaf_data).unwrap();
+        let mut leaf: Page =
+            deserialize(&leaf_data).unwrap();
         let ret = if let Some(v) = value {
             // TODO Page split logic when it becomes large
             leaf.kvs.insert(key, v)
@@ -118,7 +155,9 @@ impl Kv {
             leaf.kvs.remove(&key)
         };
 
-        let write_batch = [(pid, Some(serialize(&leaf).unwrap()))].into_iter().collect();
+        let write_batch =
+            [(pid, Some(serialize(&leaf).unwrap()))]
+                .into_iter();
 
         self.heap.write_batch(write_batch)?;
 
@@ -134,6 +173,13 @@ impl Kv {
 
 fn main() {
     let mut kv = Kv::recover("kv_example").unwrap();
+
     kv.set(b"yo".into(), b"hi".into()).unwrap();
-    assert_eq!(&*kv.get(&b"yo".to_vec()).unwrap().unwrap(), b"hi");
+    assert_eq!(
+        &*kv.get(&b"yo".to_vec()).unwrap().unwrap(),
+        b"hi"
+    );
+
+    kv.remove(b"yo".into()).unwrap();
+    assert!(&kv.get(&b"yo".to_vec()).unwrap().is_none());
 }
