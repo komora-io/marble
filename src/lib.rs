@@ -594,32 +594,34 @@ impl Marble {
     /// before calling this function occasionally in the
     /// background, then deleting corresponding logs after
     /// this function returns.
-    pub fn write_batch<I>(
+    pub fn write_batch<B, I>(
         &self,
         write_batch: I,
     ) -> io::Result<()>
     where
-        I: IntoIterator<Item = (ObjectId, Option<Vec<u8>>)>,
+        B: AsRef<[u8]>,
+        I: IntoIterator<Item = (ObjectId, Option<B>)>,
     {
         let gen = 0;
         let lsn_fence_opt = None;
         self.shard_batch(write_batch, gen, lsn_fence_opt)
     }
 
-    fn shard_batch<I>(
+    fn shard_batch<B, I>(
         &self,
         write_batch: I,
         gen: u8,
         lsn_fence_opt: Option<u64>,
     ) -> io::Result<()>
     where
-        I: IntoIterator<Item = (ObjectId, Option<Vec<u8>>)>,
+        B: AsRef<[u8]>,
+        I: IntoIterator<Item = (ObjectId, Option<B>)>,
     {
         // maps from shard -> (shard size, map of object
         // id's to object data)
         let mut shards: HashMap<
             u8,
-            (usize, HashMap<ObjectId, Option<Vec<u8>>>),
+            (usize, HashMap<ObjectId, Option<B>>),
         > = HashMap::new();
 
         let mut fragmented_shards = vec![];
@@ -627,11 +629,11 @@ impl Marble {
         for (pid, data_opt) in write_batch {
             let (object_size, shard_id) =
                 if let Some(ref data) = data_opt {
+                    let len = data.as_ref().len();
                     (
-                        data.len() + HEADER_LEN,
+                        len + HEADER_LEN,
                         (self.config.partition_function)(
-                            pid,
-                            data.len(),
+                            pid, len,
                         ),
                     )
                 } else {
@@ -669,13 +671,16 @@ impl Marble {
         Ok(())
     }
 
-    fn write_batch_inner<P: AsRef<[u8]>>(
+    fn write_batch_inner<B>(
         &self,
-        objects: HashMap<ObjectId, Option<P>>,
+        objects: HashMap<ObjectId, Option<B>>,
         gen: u8,
         shard: u8,
         lsn_fence_opt: Option<u64>,
-    ) -> io::Result<()> {
+    ) -> io::Result<()>
+    where
+        B: AsRef<[u8]>,
+    {
         // allocates unique temporary file names
         static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1318,7 +1323,9 @@ mod test {
         with_tmp_instance(|marble| {
             let pid_1 = ObjectId::new(1).unwrap();
             marble
-                .write_batch([(pid_1, None)].into_iter())
+                .write_batch::<Vec<u8>, _>(
+                    [(pid_1, None)].into_iter(),
+                )
                 .unwrap();
         });
     }
@@ -1330,14 +1337,18 @@ mod test {
         with_tmp_instance(|marble| {
             let pid_1 = ObjectId::new(1).unwrap();
             marble
-                .write_batch([(pid_1, None)].into_iter())
+                .write_batch::<Vec<u8>, _>(
+                    [(pid_1, None)].into_iter(),
+                )
                 .unwrap();
 
             marble.maintenance().unwrap();
 
             let pid_1 = ObjectId::new(1).unwrap();
             marble
-                .write_batch([(pid_1, None)].into_iter())
+                .write_batch::<Vec<u8>, _>(
+                    [(pid_1, None)].into_iter(),
+                )
                 .unwrap();
         });
     }
@@ -1349,7 +1360,9 @@ mod test {
         with_tmp_instance(|marble| {
             let pid_1 = ObjectId::new(1).unwrap();
             marble
-                .write_batch([(pid_1, None)].into_iter())
+                .write_batch::<Vec<u8>, _>(
+                    [(pid_1, None)].into_iter(),
+                )
                 .unwrap();
 
             restart(marble);
