@@ -327,7 +327,6 @@ impl Marble {
         let next_file_lsn = max_file_lsn + max_file_size + 1;
 
         // initialize file tenancy from pt
-
         let page_table = PageTable::default();
         for (pid, location) in metadata {
             assert_ne!(location, 0);

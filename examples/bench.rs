@@ -9,18 +9,23 @@ const VALUE_LEN: usize = 4096;
 const OPS: usize = 2 * 1024;
 const BATCHES: usize = OPS / BATCH_SZ;
 
-fn rdtsc() -> u64 {
-    unsafe { core::arch::x86_64::_rdtsc() }
+fn advance_lfsr(lfsr: &mut u16) {
+    let bit = ((*lfsr >> 0) ^ (*lfsr >> 2) ^ (*lfsr >> 3) ^ (*lfsr >> 5)) & 1;
+    *lfsr = (*lfsr >> 1) | (bit << 15);
 }
 
 fn run(marble: Arc<Marble>) {
     let v = vec![0xFA; VALUE_LEN];
 
+    let mut lfsr: u16 = 0xACE1u16;
+
     for i in 0..BATCHES {
+        advance_lfsr(&mut lfsr);
+
         let mut batch = std::collections::HashMap::new();
 
         for _ in 1..=BATCH_SZ {
-            let pid = ObjectId::new(((rdtsc() * MUL) % KEYSPACE).max(1)).unwrap();
+            let pid = ObjectId::new(((lfsr as u64 * MUL) % KEYSPACE).max(1)).unwrap();
             batch.insert(pid, Some(&v));
         }
 
@@ -33,7 +38,7 @@ fn run(marble: Arc<Marble>) {
 }
 
 fn main() {
-    let concurrency: usize = std::thread::available_parallelism().unwrap().get();
+    let concurrency: usize = 1; //std::thread::available_parallelism().unwrap().get();
 
     let marble = Arc::new(Marble::open("bench_data").unwrap());
 
