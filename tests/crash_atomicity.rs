@@ -108,7 +108,7 @@ fn run_batches_inner(m: marble::Marble) {
         };
 
         let mut batch = vec![];
-        for key in 1..BATCH_SIZE as u64 {
+        for key in 1..=BATCH_SIZE as u64 {
             batch.push((ObjectId::new(key).unwrap(), value.clone()));
         }
         m.write_batch(batch).unwrap();
