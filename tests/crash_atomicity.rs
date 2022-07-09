@@ -1,5 +1,6 @@
 use std::env::{self, VarError};
 use std::process::{exit, Child, Command, ExitStatus};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -81,25 +82,31 @@ fn run_crash_batches() {
         ..Default::default()
     };
 
-    let marble = config.open().unwrap();
+    let m = Arc::new(config.open().unwrap());
 
-    let t1 = thread::spawn(|| run_batches_inner(marble));
+    verify_batches(&m);
+
+    let mut threads = vec![];
+    for i in 0..std::thread::available_parallelism().unwrap().get() {
+        let m = m.clone();
+        let thread = thread::spawn(move || write_batches_inner(1000 * i as u32, m));
+        threads.push(thread);
+    }
 
     if !crash_during_initialization {
         spawn_killah();
     }
 
-    if let Err(e) = t1.join() {
-        println!("worker thread failed: {:?}", e);
-        std::process::exit(15);
+    for thread in threads.into_iter() {
+        if let Err(e) = thread.join() {
+            println!("worker thread failed: {:?}", e);
+            std::process::exit(15);
+        }
     }
 }
 
-fn run_batches_inner(m: marble::Marble) {
-    verify_batches(&m);
-
-    for i in 0_u32.. {
-        dbg!(i);
+fn write_batches_inner(start: u32, m: Arc<Marble>) {
+    for i in start.. {
         let mut rng = rand::thread_rng();
         let value = if rng.gen_bool(0.1) {
             None
