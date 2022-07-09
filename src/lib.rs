@@ -1,5 +1,3 @@
-mod metadata_log;
-
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -14,12 +12,7 @@ use std::sync::{
 use fault_injection::fallible;
 use pagetable::PageTable;
 
-use metadata_log::MetadataLog;
-
-pub use metadata_log::MetadataLogConfig;
-
 const HEAP_DIR_SUFFIX: &str = "heap";
-const PT_DIR_SUFFIX: &str = "object_index";
 const LOCK_SUFFIX: &str = "lock";
 const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
 const PT_LSN_KEY: u64 = 0;
@@ -115,7 +108,6 @@ pub struct Config {
     /// The minimum number of files within a generation to
     /// collect if below the live compaction percent.
     pub min_compaction_files: usize,
-    pub metadata_log_config: MetadataLogConfig,
 }
 
 /// Shard based on rough size ranges corresponding to SSD
@@ -148,7 +140,6 @@ impl Default for Config {
             partition_function: default_partition_function,
             max_object_size: 16 * 1024 * 1024 * 1024, /* 16gb */
             min_compaction_files: 2,
-            metadata_log_config: MetadataLogConfig::default(),
         }
     }
 }
@@ -179,7 +170,6 @@ impl Config {
 
 struct WritePath {
     next_file_lsn: u64,
-    metadata_log: MetadataLog,
 }
 
 /// Garbage-collecting object store. A nice solution to back
@@ -233,12 +223,10 @@ impl Marble {
         let _file_lock = fallible!(file_lock_opts.open(config.path.join(LOCK_SUFFIX)));
         fallible!(_file_lock.try_lock_exclusive());
 
-        // recover object location index
-        let (metadata, metadata_log) = MetadataLog::recover(config.path.join(PT_DIR_SUFFIX))?;
-
         // NB LSN should initially be 1, not 0, because 0
         // represents an object being free.
-        let recovered_pt_lsn = metadata.get(&PT_LSN_KEY).copied().unwrap_or(1);
+        // TODO replace
+        let recovered_pt_lsn = 1; //metadata.get(&PT_LSN_KEY).copied().unwrap_or(1);
 
         // parse file names
         // calculate file tenancy
@@ -328,6 +316,8 @@ impl Marble {
 
         // initialize file tenancy from pt
         let page_table = PageTable::default();
+        /*
+         * TODO replace
         for (pid, location) in metadata {
             assert_ne!(location, 0);
             if location != 0 && pid != PT_LSN_KEY {
@@ -339,6 +329,7 @@ impl Marble {
                 page_table.get(pid).store(location, Ordering::Release);
             }
         }
+        */
 
         if let Some((_, lsn_fam)) = fams
             .range(..=DiskLocation::new(recovered_pt_lsn).unwrap())
@@ -350,10 +341,7 @@ impl Marble {
         Ok(Marble {
             page_table,
             fams: RwLock::new(fams),
-            write_path: Mutex::new(WritePath {
-                next_file_lsn,
-                metadata_log,
-            }),
+            write_path: Mutex::new(WritePath { next_file_lsn }),
             config,
             _file_lock,
         })
@@ -682,8 +670,11 @@ impl Marble {
         let value = Some(lsn);
         write_batch.push((key, value));
 
+        /*
+         * TODO replace
         write_path.metadata_log.log_batch(&write_batch)?;
         write_path.metadata_log.flush()?;
+        */
 
         let mut replaced_locations = Vec::with_capacity(write_batch.len());
 
