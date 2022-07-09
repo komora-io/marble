@@ -38,7 +38,7 @@ fn run(marble: Arc<Marble>) {
 }
 
 fn main() {
-    let concurrency: usize = 1; //std::thread::available_parallelism().unwrap().get();
+    let concurrency: usize = std::thread::available_parallelism().unwrap().get();
 
     let marble = Arc::new(Marble::open("bench_data").unwrap());
 
@@ -63,9 +63,15 @@ fn main() {
         u64::MAX - fault_injection::FAULT_INJECT_COUNTER.load(std::sync::atomic::Ordering::Acquire);
     let elapsed = before.elapsed();
     let writes_per_second = (total_ops as u128 * 1000) / elapsed.as_millis();
+    let bytes_per_second = (bytes_written as u128 / 1000) / elapsed.as_millis();
 
     println!(
-        "wrote {} bytes in {:?} ({} writes per second), {} fault injection points",
-        bytes_written, elapsed, writes_per_second, fault_injection_points,
+        "wrote {} mb in {:?} with {} threads ({} writes per second, {} mb per second), {} fault injection points",
+        bytes_written / 1_000_000,
+        elapsed,
+        concurrency,
+        writes_per_second,
+        bytes_per_second,
+        fault_injection_points,
     )
 }
