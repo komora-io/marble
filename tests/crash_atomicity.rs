@@ -86,8 +86,9 @@ fn run_crash_batches() {
 
     verify_batches(&m);
 
+    let concurrency = 1; //std::thread::available_parallelism().unwrap().get();
     let mut threads = vec![];
-    for i in 0..std::thread::available_parallelism().unwrap().get() {
+    for i in 0..concurrency {
         let m = m.clone();
         let thread = thread::spawn(move || write_batches_inner(1000 * i as u32, m));
         threads.push(thread);
@@ -116,7 +117,7 @@ fn write_batches_inner(start: u32, m: Arc<Marble>) {
 
         let mut batch = vec![];
         for key in 1..=BATCH_SIZE as u64 {
-            batch.push((ObjectId::new(key).unwrap(), value.clone()));
+            batch.push((ObjectId::new(key), value.clone()));
         }
         m.write_batch(batch).unwrap();
     }
@@ -127,7 +128,7 @@ fn write_batches_inner(start: u32, m: Arc<Marble>) {
 fn verify_batches(m: &Marble) {
     let values: Vec<Option<Vec<u8>>> = (1..=BATCH_SIZE as u64)
         .map(|i| {
-            let oid = ObjectId::new(i).unwrap();
+            let oid = ObjectId::new(i);
             m.read(oid).unwrap()
         })
         .collect();

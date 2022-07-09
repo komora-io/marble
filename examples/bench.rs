@@ -25,7 +25,7 @@ fn run(marble: Arc<Marble>) {
         let mut batch = std::collections::HashMap::new();
 
         for _ in 1..=BATCH_SZ {
-            let pid = ObjectId::new(((lfsr as u64 * MUL) % KEYSPACE).max(1)).unwrap();
+            let pid = ObjectId::new(((lfsr as u64 * MUL) % KEYSPACE).max(1));
             batch.insert(pid, Some(&v));
         }
 
