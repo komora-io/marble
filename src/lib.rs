@@ -6,36 +6,18 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Mutex, RwLock,
+    RwLock,
 };
 
 use fault_injection::fallible;
 use pagetable::PageTable;
 
 const HEAP_DIR_SUFFIX: &str = "heap";
-const LOCK_SUFFIX: &str = "lock";
 const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
 const HEADER_LEN: usize = 20;
 const MAX_GENERATION: u8 = 3;
 
-#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[repr(transparent)]
-pub struct ObjectId(u64);
-
-impl std::ops::Deref for ObjectId {
-    type Target = u64;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl ObjectId {
-    pub const fn new(u: u64) -> ObjectId {
-        ObjectId(u)
-    }
-}
+type ObjectId = u64;
 
 /// Statistics for file contents, to base decisions around
 /// calls to `maintenance`.
@@ -71,6 +53,7 @@ struct FileAndMetadata {
     len: AtomicU64,
     generation: u8,
     rewrite_claim: AtomicBool,
+    synced: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -99,15 +82,19 @@ pub struct Config {
     /// similar expected lifespans. Doing so minimizes
     /// the costs of copying live data over time during
     /// storage file GC.
-    pub partition_function: fn(object_id: ObjectId, object_size: usize) -> u8,
+    pub partition_function: fn(object_id: u64, object_size: usize) -> u8,
     /// The minimum number of files within a generation to
     /// collect if below the live compaction percent.
     pub min_compaction_files: usize,
+    /// Issue fsyncs on each new file and the containing directory
+    /// when it is created. This corresponds to at least one call
+    /// to fsync for each call to `write_batch`.
+    pub fsync_each_batch: bool,
 }
 
 /// Shard based on rough size ranges corresponding to SSD
 /// page and block sizes
-pub fn default_partition_function(_pid: ObjectId, size: usize) -> u8 {
+pub fn default_partition_function(_object_id: u64, size: usize) -> u8 {
     const SUBPAGE_MAX: usize = PAGE_MIN - 1;
     const PAGE_MIN: usize = 2048;
     const PAGE_MAX: usize = 16 * 1024;
@@ -135,6 +122,7 @@ impl Default for Config {
             partition_function: default_partition_function,
             max_object_size: 16 * 1024 * 1024 * 1024, /* 16gb */
             min_compaction_files: 2,
+            fsync_each_batch: false,
         }
     }
 }
@@ -161,10 +149,6 @@ impl Config {
     pub fn open(&self) -> io::Result<Marble> {
         Marble::open_with_config(self.clone())
     }
-}
-
-struct WritePath {
-    next_file_lsn: u64,
 }
 
 fn read_trailer(file: &mut File, capacity: usize) -> io::Result<Vec<(ObjectId, Option<u64>)>> {
@@ -198,13 +182,12 @@ fn read_trailer(file: &mut File, capacity: usize) -> io::Result<Vec<(ObjectId, O
     let mut ret = Vec::with_capacity(capacity);
 
     for sub_buf in buf[4..].chunks(16) {
-        let oid = u64::from_le_bytes(sub_buf[..8].try_into().unwrap());
+        let object_id = u64::from_le_bytes(sub_buf[..8].try_into().unwrap());
         let loc = u64::from_le_bytes(sub_buf[8..].try_into().unwrap());
 
-        assert_ne!(oid, 0);
         let v = if loc == u64::MAX { None } else { Some(loc) };
 
-        ret.push((ObjectId::new(oid), v));
+        ret.push((object_id, v));
     }
 
     Ok(ret)
@@ -214,18 +197,17 @@ fn write_trailer(
     mut file: impl io::Write,
     new_locations: &[(ObjectId, Option<u64>)],
 ) -> io::Result<()> {
-    // space for overall crc + each (oid, location) pair
+    // space for overall crc + each (object_id, location) pair
     let mut buf = Vec::with_capacity(4 + (new_locations.len() * 16));
     // space for crc
     buf.extend_from_slice(&[0; 4]);
 
-    for (oid, loc) in new_locations {
-        assert_ne!(oid.0, 0);
-        let oid_bytes = &oid.to_le_bytes();
+    for (object_id, loc) in new_locations {
+        let object_id_bytes = &object_id.to_le_bytes();
         let loc_bytes = &loc.unwrap_or(u64::MAX).to_le_bytes();
-        assert_eq!(oid_bytes.len(), 8);
+        assert_eq!(object_id_bytes.len(), 8);
         assert_eq!(loc_bytes.len(), 8);
-        buf.extend_from_slice(oid_bytes);
+        buf.extend_from_slice(object_id_bytes);
         buf.extend_from_slice(loc_bytes)
     }
 
@@ -252,10 +234,10 @@ fn write_trailer(
 pub struct Marble {
     // maps from ObjectId to DiskLocation
     page_table: PageTable,
-    write_path: Mutex<WritePath>,
+    next_file_lsn: AtomicU64,
     fams: RwLock<BTreeMap<DiskLocation, FileAndMetadata>>,
     config: Config,
-    _file_lock: File,
+    directory_lock: File,
 }
 
 impl Marble {
@@ -289,16 +271,8 @@ impl Marble {
         let mut file_lock_opts = OpenOptions::new();
         file_lock_opts.create(true).read(true).write(true);
 
-        let _file_lock = fallible!(file_lock_opts.open(config.path.join(LOCK_SUFFIX)));
-        fallible!(_file_lock.try_lock_exclusive());
-
-        // NB LSN should initially be 1, not 0, because 0
-        // represents an object being free.
-        // TODO replace
-        let recovered_pt_lsn = 1; //metadata.get(&PT_LSN_KEY).copied().unwrap_or(1);
-
-        // parse file names
-        // calculate file tenancy
+        let directory_lock = fallible!(File::open(config.path.join(HEAP_DIR_SUFFIX)));
+        fallible!(directory_lock.try_lock_exclusive());
 
         let mut fams = BTreeMap::new();
         let mut max_file_lsn = 0;
@@ -307,6 +281,7 @@ impl Marble {
         let mut recovery_page_table = HashMap::new();
         let mut files = vec![];
 
+        // parse file names
         for entry_res in fallible!(fs::read_dir(heap_dir)) {
             let entry = fallible!(entry_res);
             let path = entry.path();
@@ -361,14 +336,14 @@ impl Marble {
 
             let trailer = read_trailer(&mut file, usize::try_from(capacity).unwrap())?;
 
-            for (oid, relative_loc) in trailer {
+            for (object_id, relative_loc) in trailer {
                 let location = if let Some(l) = relative_loc {
                     lsn + l
                 } else {
                     0
                 };
 
-                let old = recovery_page_table.insert(*oid, location).unwrap_or(0);
+                let old = recovery_page_table.insert(object_id, location).unwrap_or(0);
                 if location != 0 {
                     assert!(
                         old < location,
@@ -389,18 +364,17 @@ impl Marble {
                 location,
                 generation,
                 rewrite_claim: false.into(),
+                synced: true.into(),
             };
 
             log::debug!("inserting new fam at location {:?}", location);
             assert!(fams.insert(location, fam).is_none());
         }
 
-        let next_file_lsn = max_file_lsn + max_file_size + 1;
-
         let page_table = PageTable::default();
 
-        // initialize file tenancy from pt
-        for (oid, location) in recovery_page_table {
+        // initialize fam utilization from page table
+        for (object_id, location) in recovery_page_table {
             assert_ne!(location, 0);
             if location != 0 {
                 let (_, fam) = fams
@@ -408,23 +382,18 @@ impl Marble {
                     .next_back()
                     .unwrap();
                 fam.len.fetch_add(1, Ordering::Acquire);
-                page_table.get(oid).store(location, Ordering::Release);
+                page_table.get(object_id).store(location, Ordering::Release);
             }
         }
 
-        if let Some((_, lsn_fam)) = fams
-            .range(..=DiskLocation::new(recovered_pt_lsn).unwrap())
-            .next_back()
-        {
-            lsn_fam.len.fetch_add(1, Ordering::Acquire);
-        }
+        let next_file_lsn = AtomicU64::new(max_file_lsn + max_file_size + 1);
 
         Ok(Marble {
             page_table,
             fams: RwLock::new(fams),
-            write_path: Mutex::new(WritePath { next_file_lsn }),
+            next_file_lsn,
             config,
-            _file_lock,
+            directory_lock,
         })
     }
 
@@ -433,10 +402,10 @@ impl Marble {
     ///
     /// May be called concurrently with background calls to
     /// `maintenance` and `write_batch`.
-    pub fn read(&self, pid: ObjectId) -> io::Result<Option<Vec<u8>>> {
+    pub fn read(&self, object_id: ObjectId) -> io::Result<Option<Vec<u8>>> {
         let fams = self.fams.read().unwrap();
 
-        let lsn = self.page_table.get(*pid).load(Ordering::Acquire);
+        let lsn = self.page_table.get(object_id).load(Ordering::Acquire);
         if lsn == 0 {
             return Ok(None);
         }
@@ -494,7 +463,7 @@ impl Marble {
 
         let read_pid = u64::from_le_bytes(pid_buf);
 
-        assert_eq!(*pid, read_pid);
+        assert_eq!(object_id, read_pid);
 
         Ok(Some(object_buf))
     }
@@ -530,8 +499,7 @@ impl Marble {
     /// idempotent operations if used in a concurrent
     /// setting.
     pub fn stable_logical_sequence_number(&self) -> u64 {
-        let write_path = self.write_path.lock().unwrap();
-        write_path.next_file_lsn.saturating_sub(1)
+        self.next_file_lsn.load(Ordering::Acquire).saturating_sub(1)
     }
 
     /// Write a batch of objects to disk. This function is
@@ -571,10 +539,13 @@ impl Marble {
 
         let mut fragmented_shards = vec![];
 
-        for (pid, data_opt) in write_batch {
+        for (object_id, data_opt) in write_batch {
             let (object_size, shard_id) = if let Some(ref data) = data_opt {
                 let len = data.as_ref().len();
-                (len + HEADER_LEN, (self.config.partition_function)(pid, len))
+                (
+                    len + HEADER_LEN,
+                    (self.config.partition_function)(object_id, len),
+                )
             } else {
                 (0, 0)
             };
@@ -587,7 +558,7 @@ impl Marble {
             }
 
             shard.0 += object_size;
-            shard.1.insert(pid, data_opt);
+            shard.1.insert(object_id, data_opt);
         }
 
         let iter = shards
@@ -597,6 +568,11 @@ impl Marble {
 
         for (shard, objects) in iter {
             self.write_batch_inner(objects, gen, shard, lsn_fence_opt)?;
+        }
+
+        // fsync directory to ensure new file is present
+        if self.config.fsync_each_batch {
+            fallible!(self.directory_lock.sync_all());
         }
 
         Ok(())
@@ -628,11 +604,11 @@ impl Marble {
 
         let mut written_bytes = 0;
         let mut capacity = 0;
-        for (pid, raw_object_opt) in &objects {
+        for (object_id, raw_object_opt) in &objects {
             let raw_object = if let Some(raw_object) = raw_object_opt {
                 raw_object.as_ref()
             } else {
-                new_locations.push((*pid, None));
+                new_locations.push((*object_id, None));
                 continue;
             };
 
@@ -643,7 +619,7 @@ impl Marble {
                         "{:?} in write batch has a size of {}, which is larger than the \
                          configured `max_object_size` of {}. If this is intentional, please \
                          increase the configured `max_object_size`.",
-                        pid,
+                        object_id,
                         raw_object.len(),
                         self.config.max_object_size,
                     ),
@@ -653,10 +629,10 @@ impl Marble {
             capacity += 1;
 
             let relative_address = written_bytes as u64;
-            new_locations.push((*pid, Some(relative_address)));
+            new_locations.push((*object_id, Some(relative_address)));
 
             let len_buf: [u8; 8] = (raw_object.len() as u64).to_le_bytes();
-            let pid_buf: [u8; 8] = pid.to_le_bytes();
+            let pid_buf: [u8; 8] = object_id.to_le_bytes();
 
             let mut hasher = crc32fast::Hasher::new();
             hasher.update(&len_buf);
@@ -682,14 +658,13 @@ impl Marble {
 
         // mv and fsync new file and directory
 
-        fallible!(file.sync_all());
+        if self.config.fsync_each_batch {
+            fallible!(file.sync_all());
+        }
 
-        let mut write_path = self.write_path.lock().unwrap();
-
-        let lsn = write_path.next_file_lsn;
-        write_path.next_file_lsn += written_bytes as u64 + 1;
-
-        drop(write_path);
+        let lsn = self
+            .next_file_lsn
+            .fetch_add(written_bytes as u64 + 1, Ordering::AcqRel);
 
         let fname = format!("{:02x}-{:016x}-{:01x}-{:016x}", shard, lsn, gen, capacity);
         let new_path = self.config.path.join(HEAP_DIR_SUFFIX).join(fname);
@@ -699,9 +674,6 @@ impl Marble {
         } else {
             fallible!(fs::remove_file(tmp_path));
         }
-
-        // fsync directory to ensure new file is present
-        fallible!(File::open(self.config.path.join(HEAP_DIR_SUFFIX)).and_then(|f| f.sync_all()));
 
         let location = DiskLocation::new(lsn).unwrap();
         if capacity > 0 {
@@ -713,6 +685,7 @@ impl Marble {
                 location,
                 path: new_path,
                 rewrite_claim: false.into(),
+                synced: self.config.fsync_each_batch.into(),
             };
 
             log::debug!("inserting new fam at location {:?}", lsn);
@@ -729,8 +702,8 @@ impl Marble {
         let mut contention_hit = 0;
         let mut write_batch: Vec<(u64, Option<u64>)> = Vec::with_capacity(new_locations.len());
 
-        for (pid, location_opt) in new_locations {
-            let key = *pid;
+        for (object_id, location_opt) in new_locations {
+            let key = object_id;
             let value = if let Some(location) = location_opt {
                 Some(location + lsn)
             } else {
@@ -752,26 +725,26 @@ impl Marble {
 
         let mut replaced_locations = Vec::with_capacity(write_batch.len());
 
-        for (pid, new_location_opt) in write_batch {
+        for (object_id, new_location_opt) in write_batch {
             let old = self
                 .page_table
-                .get(pid)
+                .get(object_id)
                 .swap(new_location_opt.unwrap_or(0), Ordering::Release);
 
             if let Some(lsn_fence) = lsn_fence_opt {
                 assert!(
                     lsn_fence > old,
-                    "lsn_fence of {} should always be higher than the replaced lsn of {} for pid \
+                    "lsn_fence of {} should always be higher than the replaced lsn of {} for object_id \
                      {}",
                     lsn_fence,
                     old,
-                    pid
+                    object_id
                 );
             }
 
             log::trace!(
-                "updating metadata for pid {} from {:?} to {:?}",
-                pid,
+                "updating metadata for object_id {} from {:?} to {:?}",
+                object_id,
                 old,
                 new_location_opt
             );
@@ -854,9 +827,7 @@ impl Marble {
 
         let mut files_to_defrag: HashMap<u8, Vec<_>> = Default::default();
 
-        let write_path = self.write_path.lock().unwrap();
-        let lsn_fence = write_path.next_file_lsn.saturating_sub(1);
-        drop(write_path);
+        let lsn_fence = self.stable_logical_sequence_number();
 
         let fams = self.fams.read().unwrap();
         for (location, meta) in &*fams {
@@ -926,7 +897,7 @@ impl Marble {
 
                     let crc_expected = u32::from_le_bytes(header[0..4].try_into().unwrap());
                     let pid_buf = header[4..12].try_into().unwrap();
-                    let pid = u64::from_le_bytes(pid_buf);
+                    let object_id = u64::from_le_bytes(pid_buf);
                     let len_buf = header[12..20].try_into().unwrap();
                     let len = usize::try_from(u64::from_le_bytes(len_buf)).unwrap();
 
@@ -967,11 +938,11 @@ impl Marble {
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "crc mismatch"));
                     }
 
-                    let current_location = self.page_table.get(pid).load(Ordering::Acquire);
+                    let current_location = self.page_table.get(object_id).load(Ordering::Acquire);
 
                     if lsn == current_location {
                         // can attempt to rewrite
-                        batch.insert(ObjectId::new(pid), Some(object_buf));
+                        batch.insert(object_id, Some(object_buf));
                     } else {
                         // object has been rewritten, this
                         // one isn't valid
@@ -991,6 +962,28 @@ impl Marble {
         self.prune_empty_fams()?;
 
         Ok(rewritten_objects)
+    }
+
+    /// If `fsync_each_batch` is set to false, this method can
+    /// be called periodically to ensure that the written
+    /// batches are durable on disk.
+    pub fn sync_all(&self) -> io::Result<()> {
+        let fams = self.fams.read().unwrap();
+
+        let mut synced_files = false;
+        for fam in fams.values() {
+            if !fam.synced.load(Ordering::Acquire) {
+                fam.file.sync_all()?;
+                fam.synced.store(true, Ordering::Release);
+                synced_files = true;
+            }
+        }
+
+        if synced_files {
+            fallible!(self.directory_lock.sync_all());
+        }
+
+        Ok(())
     }
 }
 
@@ -1057,32 +1050,32 @@ mod test {
     #[test]
     fn test_00() {
         with_tmp_instance(|mut marble| {
-            let pid = ObjectId::new(1);
+            let object_id = 1;
             marble
-                .write_batch([(pid, Some(vec![]))].into_iter())
+                .write_batch([(object_id, Some(vec![]))].into_iter())
                 .unwrap();
-            assert!(marble.read(pid).unwrap().is_some());
+            assert!(marble.read(object_id).unwrap().is_some());
             marble = restart(marble);
-            assert!(marble.read(pid).unwrap().is_some());
+            assert!(marble.read(object_id).unwrap().is_some());
         });
     }
 
     #[test]
     fn test_01() {
         with_tmp_instance(|mut marble| {
-            let pid_1 = ObjectId::new(1);
+            let object_id_1 = 1;
             marble
-                .write_batch([(pid_1, Some(vec![]))].into_iter())
+                .write_batch([(object_id_1, Some(vec![]))].into_iter())
                 .unwrap();
-            let pid_2 = ObjectId::new(2);
+            let object_id_2 = 2;
             marble
-                .write_batch([(pid_2, Some(vec![]))].into_iter())
+                .write_batch([(object_id_2, Some(vec![]))].into_iter())
                 .unwrap();
-            assert!(marble.read(pid_1).unwrap().is_some());
-            assert!(marble.read(pid_2).unwrap().is_some());
+            assert!(marble.read(object_id_1).unwrap().is_some());
+            assert!(marble.read(object_id_2).unwrap().is_some());
             marble = restart(marble);
-            assert!(marble.read(pid_1).unwrap().is_some());
-            assert!(marble.read(pid_2).unwrap().is_some());
+            assert!(marble.read(object_id_1).unwrap().is_some());
+            assert!(marble.read(object_id_2).unwrap().is_some());
         });
     }
 
@@ -1091,19 +1084,19 @@ mod test {
         let _ = env_logger::try_init();
 
         with_tmp_instance(|marble| {
-            let pid_1 = ObjectId::new(1);
+            let object_id_1 = 1;
             marble
-                .write_batch([(pid_1, Some(vec![]))].into_iter())
+                .write_batch([(object_id_1, Some(vec![]))].into_iter())
                 .unwrap();
-            let pid_2 = ObjectId::new(2);
+            let object_id_2 = 2;
             marble
-                .write_batch([(pid_2, Some(vec![]))].into_iter())
+                .write_batch([(object_id_2, Some(vec![]))].into_iter())
                 .unwrap();
-            assert!(marble.read(pid_1).unwrap().is_some());
-            assert!(marble.read(pid_2).unwrap().is_some());
+            assert!(marble.read(object_id_1).unwrap().is_some());
+            assert!(marble.read(object_id_2).unwrap().is_some());
             marble.maintenance().unwrap();
-            assert!(marble.read(pid_1).unwrap().is_some());
-            assert!(marble.read(pid_2).unwrap().is_some());
+            assert!(marble.read(object_id_1).unwrap().is_some());
+            assert!(marble.read(object_id_2).unwrap().is_some());
         });
     }
 
@@ -1112,9 +1105,9 @@ mod test {
         let _ = env_logger::try_init();
 
         with_tmp_instance(|marble| {
-            let pid_1 = ObjectId::new(1);
+            let object_id_1 = 1;
             marble
-                .write_batch::<Vec<u8>, _>([(pid_1, None)].into_iter())
+                .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
                 .unwrap();
         });
     }
@@ -1124,16 +1117,16 @@ mod test {
         let _ = env_logger::try_init();
 
         with_tmp_instance(|marble| {
-            let pid_1 = ObjectId::new(1);
+            let object_id_1 = 1;
             marble
-                .write_batch::<Vec<u8>, _>([(pid_1, None)].into_iter())
+                .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
                 .unwrap();
 
             marble.maintenance().unwrap();
 
-            let pid_1 = ObjectId::new(1);
+            let object_id_1 = 1;
             marble
-                .write_batch::<Vec<u8>, _>([(pid_1, None)].into_iter())
+                .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
                 .unwrap();
         });
     }
@@ -1143,9 +1136,9 @@ mod test {
         let _ = env_logger::try_init();
 
         with_tmp_instance(|marble| {
-            let pid_1 = ObjectId::new(1);
+            let object_id_1 = 1;
             marble
-                .write_batch::<Vec<u8>, _>([(pid_1, None)].into_iter())
+                .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
                 .unwrap();
 
             restart(marble);

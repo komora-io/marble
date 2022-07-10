@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use marble::{Marble, ObjectId};
+use marble::Marble;
 
 const MUL: u64 = 1;
 const KEYSPACE: u64 = 64 * 1024;
 const BATCH_SZ: usize = 1024;
 const VALUE_LEN: usize = 4096;
-const OPS: usize = 2 * 1024;
+const OPS: usize = 24 * 1024 * 1024;
 const BATCHES: usize = OPS / BATCH_SZ;
 
 fn advance_lfsr(lfsr: &mut u16) {
@@ -25,7 +25,7 @@ fn run(marble: Arc<Marble>) {
         let mut batch = std::collections::HashMap::new();
 
         for _ in 1..=BATCH_SZ {
-            let pid = ObjectId::new(((lfsr as u64 * MUL) % KEYSPACE).max(1));
+            let pid = ((lfsr as u64 * MUL) % KEYSPACE).max(1);
             batch.insert(pid, Some(&v));
         }
 
