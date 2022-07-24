@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     RwLock,
 };
 
@@ -16,7 +16,6 @@ const HEAP_DIR_SUFFIX: &str = "heap";
 const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
 const HEADER_LEN: usize = 20;
 const MAX_GENERATION: u8 = 3;
-const MAX_FILE_ITEMS: usize = u32::MAX as usize;
 
 type ObjectId = u64;
 
@@ -25,14 +24,14 @@ type ObjectId = u64;
 pub struct FileStats {
     /// The number of live objects stored in the backing
     /// storage files.
-    pub live_objects: u32,
+    pub live_objects: u64,
     /// The total number of (potentially duplicated)
     /// objects stored in the backing storage files.
-    pub stored_objects: u32,
+    pub stored_objects: u64,
     /// The number of dead objects that have been replaced
     /// or removed in other storage files, contributing
     /// to fragmentation.
-    pub dead_objects: u32,
+    pub dead_objects: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
@@ -45,9 +44,10 @@ impl DiskLocation {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 struct Metadata {
     lsn: u64,
-    trailer_capacity: u32,
+    trailer_capacity: u64,
     generation: u8,
 }
 
@@ -57,16 +57,17 @@ impl Metadata {
 
         Some(Metadata {
             lsn: u64::from_str_radix(&splits.next()?, 16).ok()?,
-            trailer_capacity: u32::from_str_radix(&splits.next()?, 16).ok()?,
+            trailer_capacity: u64::from_str_radix(&splits.next()?, 16).ok()?,
             generation: u8::from_str_radix(splits.next()?, 16).ok()?,
         })
     }
 
     fn to_file_name(&self) -> String {
-        format!(
-            "{:016x}-{:08x}-{:01x}",
+        let ret = format!(
+            "{:016x}-{:016x}-{:01x}",
             self.lsn, self.trailer_capacity, self.generation
-        )
+        );
+        ret
     }
 }
 
@@ -75,8 +76,8 @@ struct FileAndMetadata {
     file: File,
     location: DiskLocation,
     path: PathBuf,
-    capacity: u32,
-    len: AtomicU32,
+    capacity: u64,
+    len: AtomicU64,
     generation: u8,
     rewrite_claim: AtomicBool,
     synced: AtomicBool,
@@ -413,16 +414,18 @@ impl Marble {
         let page_table = PageTable::default();
 
         // initialize fam utilization from page table
-        for (object_id, location) in recovery_page_table {
-            assert_ne!(location, 0);
-            if location != 0 {
-                let (_, fam) = fams
-                    .range(..=DiskLocation::new(location))
-                    .next_back()
-                    .unwrap();
-                fam.len.fetch_add(1, Ordering::Release);
-                page_table.get(object_id).store(location, Ordering::Release);
-            }
+        for (object_id, shifted_location) in recovery_page_table {
+            assert_ne!(shifted_location, 0);
+            let (unshifted_location, _is_delete) = unshift_location(shifted_location);
+            assert_ne!(unshifted_location, 0);
+            let (_l, fam) = fams
+                .range(..=DiskLocation::new(unshifted_location))
+                .next_back()
+                .unwrap();
+            fam.len.fetch_add(1, Ordering::Release);
+            page_table
+                .get(object_id)
+                .store(shifted_location, Ordering::Release);
         }
 
         let next_file_lsn = AtomicU64::new(max_file_lsn + max_file_size + 1);
@@ -571,17 +574,25 @@ impl Marble {
         for (object_id, data_opt) in write_batch {
             let (object_size, shard_id) = if let Some(ref data) = data_opt {
                 let len = data.as_ref().len();
-                (
-                    len + HEADER_LEN,
-                    (self.config.partition_function)(object_id, len),
-                )
+                let shard = if gen == 0 {
+                    // only shard during gc defragmentation of
+                    // rewritten items, otherwise we break
+                    // writebatch atomicity
+                    0
+                } else {
+                    (self.config.partition_function)(object_id, len)
+                };
+                (len + HEADER_LEN, shard)
             } else {
                 (0, 0)
             };
 
             let shard = shards.entry(shard_id).or_default();
 
-            if shard.0 > self.config.target_file_size || fragmented_shards.len() == MAX_FILE_ITEMS {
+            let is_rewrite = gen > 0;
+            let over_size_preference = shard.0 > self.config.target_file_size;
+
+            if is_rewrite && over_size_preference {
                 fragmented_shards.push((shard_id, std::mem::take(&mut shard.1)));
                 shard.0 = 0;
             }
@@ -634,7 +645,7 @@ impl Marble {
         // 6. update replaced / contention-related failures
 
         // 1. write data to tmp
-        let tmp_file_name = format!("{}-tmp", TMP_COUNTER.fetch_add(1, Ordering::Relaxed));
+        let tmp_file_name = format!("{}-tmp", TMP_COUNTER.fetch_add(1, Ordering::AcqRel));
         let tmp_path = self.config.path.join(HEAP_DIR_SUFFIX).join(tmp_file_name);
 
         let mut file_options = OpenOptions::new();
@@ -712,7 +723,7 @@ impl Marble {
             .fetch_add(written_bytes as u64 + 1, Ordering::AcqRel);
 
         let location = DiskLocation::new(lsn);
-        let capacity = u32::try_from(new_shifted_relative_locations.len()).unwrap();
+        let capacity = new_shifted_relative_locations.len() as u64;
 
         let fam = FileAndMetadata {
             file,
@@ -798,6 +809,7 @@ impl Marble {
         let new_path = self.config.path.join(HEAP_DIR_SUFFIX).join(file_name);
 
         let res = write_trailer(&mut buf_writer, &new_shifted_relative_locations)
+            .and_then(|_| maybe!(buf_writer.flush()))
             .and_then(|_| maybe!(fs::rename(&tmp_path, &new_path)));
 
         if let Err(e) = res {
@@ -816,7 +828,7 @@ impl Marble {
                 .next_back()
                 .unwrap();
 
-            let old = fam.len.fetch_sub(1, Ordering::Relaxed);
+            let old = fam.len.fetch_sub(1, Ordering::AcqRel);
             assert_ne!(old, 0);
         }
 
@@ -888,7 +900,7 @@ impl Marble {
 
             assert_ne!(cap, 0);
 
-            if len != 0 && (len * 100) / cap < u32::from(self.config.file_compaction_percent) {
+            if len != 0 && (len * 100) / cap < u64::from(self.config.file_compaction_percent) {
                 if fam.rewrite_claim.swap(true, Ordering::SeqCst) {
                     // try to exclusively claim this file
                     // for rewrite to
@@ -1090,135 +1102,4 @@ fn _auto_trait_assertions() {
     fn f<T: Send + Sync + UnwindSafe + RefUnwindSafe>() {}
 
     f::<Marble>();
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    const TEST_DIR: &str = "testing_data_directories";
-
-    static TEST_COUNTER: AtomicU64 = AtomicU64::new(u64::MAX);
-
-    fn with_tmp_instance<F: FnOnce(Marble)>(f: F) {
-        let subdir = format!("test_{}", TEST_COUNTER.fetch_add(1, Ordering::SeqCst));
-        let path = std::path::Path::new(TEST_DIR).join(subdir);
-
-        let config = Config {
-            path,
-            ..Default::default()
-        };
-
-        let _ = std::fs::remove_dir_all(&config.path);
-
-        let marble = config.open().unwrap();
-
-        f(marble);
-
-        std::fs::remove_dir_all(config.path).unwrap();
-    }
-
-    fn restart(marble: Marble) -> Marble {
-        let config = marble.config.clone();
-        drop(marble);
-        config.open().unwrap()
-    }
-
-    #[test]
-    fn test_00() {
-        with_tmp_instance(|mut marble| {
-            let object_id = 1;
-            marble
-                .write_batch([(object_id, Some(vec![]))].into_iter())
-                .unwrap();
-            assert!(marble.read(object_id).unwrap().is_some());
-            marble = restart(marble);
-            assert!(marble.read(object_id).unwrap().is_some());
-        });
-    }
-
-    #[test]
-    fn test_01() {
-        with_tmp_instance(|mut marble| {
-            let object_id_1 = 1;
-            marble
-                .write_batch([(object_id_1, Some(vec![]))].into_iter())
-                .unwrap();
-            let object_id_2 = 2;
-            marble
-                .write_batch([(object_id_2, Some(vec![]))].into_iter())
-                .unwrap();
-            assert!(marble.read(object_id_1).unwrap().is_some());
-            assert!(marble.read(object_id_2).unwrap().is_some());
-            marble = restart(marble);
-            assert!(marble.read(object_id_1).unwrap().is_some());
-            assert!(marble.read(object_id_2).unwrap().is_some());
-        });
-    }
-
-    #[test]
-    fn test_02() {
-        let _ = env_logger::try_init();
-
-        with_tmp_instance(|marble| {
-            let object_id_1 = 1;
-            marble
-                .write_batch([(object_id_1, Some(vec![]))].into_iter())
-                .unwrap();
-            let object_id_2 = 2;
-            marble
-                .write_batch([(object_id_2, Some(vec![]))].into_iter())
-                .unwrap();
-            assert!(marble.read(object_id_1).unwrap().is_some());
-            assert!(marble.read(object_id_2).unwrap().is_some());
-            marble.maintenance().unwrap();
-            assert!(marble.read(object_id_1).unwrap().is_some());
-            assert!(marble.read(object_id_2).unwrap().is_some());
-        });
-    }
-
-    #[test]
-    fn test_03() {
-        let _ = env_logger::try_init();
-
-        with_tmp_instance(|marble| {
-            let object_id_1 = 1;
-            marble
-                .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
-                .unwrap();
-        });
-    }
-
-    #[test]
-    fn test_04() {
-        let _ = env_logger::try_init();
-
-        with_tmp_instance(|marble| {
-            let object_id_1 = 1;
-            marble
-                .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
-                .unwrap();
-
-            marble.maintenance().unwrap();
-
-            let object_id_1 = 1;
-            marble
-                .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
-                .unwrap();
-        });
-    }
-
-    #[test]
-    fn test_05() {
-        let _ = env_logger::try_init();
-
-        with_tmp_instance(|marble| {
-            let object_id_1 = 1;
-            marble
-                .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
-                .unwrap();
-
-            restart(marble);
-        });
-    }
 }
