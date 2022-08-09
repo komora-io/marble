@@ -1,44 +1,42 @@
 use std::sync::Arc;
 
+use rand::{thread_rng, Rng};
+
 use marble::Marble;
 
-const MUL: u64 = 1;
 const KEYSPACE: u64 = 64 * 1024;
 const BATCH_SZ: usize = 1024;
 const VALUE_LEN: usize = 4096;
 const OPS: usize = 24 * 1024 * 1024;
 const BATCHES: usize = OPS / BATCH_SZ;
 
-fn advance_lfsr(lfsr: &mut u16) {
-    let bit = ((*lfsr >> 0) ^ (*lfsr >> 2) ^ (*lfsr >> 3) ^ (*lfsr >> 5)) & 1;
-    *lfsr = (*lfsr >> 1) | (bit << 15);
-}
-
 fn run(marble: Arc<Marble>) {
     let v = vec![0xFA; VALUE_LEN];
 
-    let mut lfsr: u16 = 0xACE1u16;
+    let mut rng = thread_rng();
 
     for i in 0..BATCHES {
-        advance_lfsr(&mut lfsr);
-
+        println!("examples/bench.rs:19");
         let mut batch = std::collections::HashMap::new();
 
-        for _ in 1..=BATCH_SZ {
-            let pid = ((lfsr as u64 * MUL) % KEYSPACE).max(1);
+        for _ in 0..BATCH_SZ {
+            let pid = rng.gen_range(0..KEYSPACE);
             batch.insert(pid, Some(&v));
         }
 
         marble.write_batch(batch).unwrap();
 
         if i % 16 == 0 {
-            marble.maintenance().unwrap();
+            let cleaned_up = marble.maintenance().unwrap();
+            if cleaned_up != 0 {
+                println!("cleaned up {} files", cleaned_up);
+            }
         }
     }
 }
 
 fn main() {
-    let concurrency: usize = std::thread::available_parallelism().unwrap().get();
+    let concurrency: usize = 1; //std::thread::available_parallelism().unwrap().get();
 
     let marble = Arc::new(Marble::open("bench_data").unwrap());
 
