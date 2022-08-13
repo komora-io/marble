@@ -4,9 +4,11 @@ use marble::*;
 
 const TEST_DIR: &str = "testing_data_directories";
 
-static TEST_COUNTER: AtomicU64 = AtomicU64::new(u64::MAX);
+static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn with_instance<F: FnOnce(&Config, Marble)>(config: Config, f: F) {
+    let _ = env_logger::try_init();
+
     let _ = std::fs::remove_dir_all(&config.path);
 
     let marble = config.open().unwrap();
@@ -67,8 +69,6 @@ fn test_01() {
 
 #[test]
 fn test_02() {
-    let _ = env_logger::try_init();
-
     with_default_instance(|_config, marble| {
         let object_id_1 = 1;
         marble
@@ -88,8 +88,6 @@ fn test_02() {
 
 #[test]
 fn test_03() {
-    let _ = env_logger::try_init();
-
     with_default_instance(|_config, marble| {
         let object_id_1 = 1;
         marble
@@ -100,8 +98,6 @@ fn test_03() {
 
 #[test]
 fn test_04() {
-    let _ = env_logger::try_init();
-
     with_default_instance(|_config, marble| {
         let object_id_1 = 1;
         marble
@@ -119,8 +115,6 @@ fn test_04() {
 
 #[test]
 fn test_05() {
-    let _ = env_logger::try_init();
-
     with_default_instance(|config, marble| {
         let object_id_1 = 1;
         marble
@@ -134,8 +128,6 @@ fn test_05() {
 #[test]
 fn test_06() {
     for _ in 0..1000 {
-        let _ = env_logger::try_init();
-
         let subdir = format!("test_{}", TEST_COUNTER.fetch_add(1, Ordering::SeqCst));
 
         let config = Config {
@@ -172,8 +164,6 @@ fn test_06() {
 
 #[test]
 fn test_07() {
-    let _ = env_logger::try_init();
-
     let subdir = format!("test_{}", TEST_COUNTER.fetch_add(1, Ordering::SeqCst));
 
     let config = Config {

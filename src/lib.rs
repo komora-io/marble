@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::num::NonZeroU64;
 use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -10,7 +9,14 @@ use std::sync::{
 };
 
 use fault_injection::{annotate, fallible, maybe};
-use pagetable::PageTable;
+
+mod config;
+mod disk_location;
+mod location_table;
+
+pub use config::Config;
+use disk_location::{DiskLocation, RelativeDiskLocation};
+use location_table::LocationTable;
 
 const HEAP_DIR_SUFFIX: &str = "heap";
 const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
@@ -48,16 +54,6 @@ pub struct FileStats {
     /// or removed in other storage files, contributing
     /// to fragmentation.
     pub dead_objects: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-struct DiskLocation(NonZeroU64);
-
-impl DiskLocation {
-    fn new(u: u64) -> DiskLocation {
-        DiskLocation(NonZeroU64::new(u).unwrap())
-    }
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -102,42 +98,6 @@ struct FileAndMetadata {
     synced: AtomicBool,
 }
 
-#[derive(Debug, Clone)]
-pub struct Config {
-    /// Storage files will be kept here.
-    pub path: PathBuf,
-    /// Garbage collection will try to keep storage
-    /// files around this size or smaller.
-    pub target_file_size: usize,
-    /// Remaining live percentage of a file before
-    /// it's considered rewritabe.
-    pub file_compaction_percent: u8,
-    /// The ceiling on the largest allocation this system
-    /// will ever attempt to perform in order to read an
-    /// object off of disk.
-    pub max_object_size: usize,
-    /// A partitioning function for objects based on
-    /// object ID and object size. You may override this to
-    /// cause objects to be written into separate files so
-    /// that garbage collection may take advantage of
-    /// locality effects for your workload that are
-    /// correlated to object identifiers or the size of
-    /// data.
-    ///
-    /// Ideally, you will colocate objects that have
-    /// similar expected lifespans. Doing so minimizes
-    /// the costs of copying live data over time during
-    /// storage file GC.
-    pub partition_function: fn(object_id: u64, object_size: usize) -> u8,
-    /// The minimum number of files within a generation to
-    /// collect if below the live compaction percent.
-    pub min_compaction_files: usize,
-    /// Issue fsyncs on each new file and the containing directory
-    /// when it is created. This corresponds to at least one call
-    /// to fsync for each call to `write_batch`.
-    pub fsync_each_batch: bool,
-}
-
 /// Shard based on rough size ranges corresponding to SSD
 /// page and block sizes
 pub fn default_partition_function(_object_id: u64, size: usize) -> u8 {
@@ -159,68 +119,11 @@ pub fn default_partition_function(_object_id: u64, size: usize) -> u8 {
     }
 }
 
-impl Default for Config {
-    fn default() -> Config {
-        Config {
-            path: "".into(),
-            target_file_size: 1 << 28, // 256mb
-            file_compaction_percent: 66,
-            partition_function: default_partition_function,
-            max_object_size: 16 * 1024 * 1024 * 1024, /* 16gb */
-            min_compaction_files: 2,
-            fsync_each_batch: true,
-        }
-    }
-}
-
-impl Config {
-    fn validate(&self) -> io::Result<()> {
-        if self.target_file_size == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Config's target_file_size must be non-zero",
-            ));
-        }
-
-        if self.file_compaction_percent > 99 {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Config's file_compaction_percent must be less than 100",
-            ));
-        }
-
-        Ok(())
-    }
-
-    pub fn open(&self) -> io::Result<Marble> {
-        Marble::open_with_config(self.clone())
-    }
-}
-
-fn shift_location(location: u64, is_delete: bool) -> u64 {
-    assert_eq!(location << 1 >> 1, location);
-    let inner = if is_delete {
-        location << 1
-    } else {
-        (location << 1) + 1
-    };
-
-    inner
-}
-
-fn unshift_location(location: u64) -> (u64, bool) {
-    if location % 2 == 0 {
-        (location >> 1, true)
-    } else {
-        (location >> 1, false)
-    }
-}
-
 fn read_trailer(
     file: &File,
     trailer_offset: u64,
     trailer_items: u64,
-) -> io::Result<Vec<(ObjectId, u64)>> {
+) -> io::Result<Vec<(ObjectId, RelativeDiskLocation)>> {
     let size = usize::try_from(4 + (trailer_items * 16)).unwrap();
 
     let mut buf = Vec::with_capacity(size);
@@ -246,9 +149,10 @@ fn read_trailer(
 
     for sub_buf in buf[4..].chunks(16) {
         let object_id = u64::from_le_bytes(sub_buf[..8].try_into().unwrap());
-        let shifted_relative_loc = u64::from_le_bytes(sub_buf[8..].try_into().unwrap());
+        let raw_relative_loc = u64::from_le_bytes(sub_buf[8..].try_into().unwrap());
+        let relative_loc = RelativeDiskLocation::from_raw(raw_relative_loc);
 
-        ret.push((object_id, shifted_relative_loc));
+        ret.push((object_id, relative_loc));
     }
 
     Ok(ret)
@@ -257,7 +161,7 @@ fn read_trailer(
 fn write_trailer<'a>(
     file: &mut File,
     offset: u64,
-    new_shifted_relative_locations: &HashMap<ObjectId, u64>,
+    new_shifted_relative_locations: &HashMap<ObjectId, RelativeDiskLocation>,
 ) -> io::Result<()> {
     // space for overall crc + each (object_id, location) pair
     let mut buf = Vec::with_capacity(4 + (new_shifted_relative_locations.len() * 16));
@@ -266,7 +170,7 @@ fn write_trailer<'a>(
 
     for (object_id, relative_location) in new_shifted_relative_locations {
         let object_id_bytes: &[u8; 8] = &object_id.to_le_bytes();
-        let loc_bytes: &[u8; 8] = &relative_location.to_le_bytes();
+        let loc_bytes: &[u8; 8] = &relative_location.to_raw().to_le_bytes();
         buf.extend_from_slice(object_id_bytes);
         buf.extend_from_slice(loc_bytes)
     }
@@ -299,7 +203,7 @@ fn write_trailer<'a>(
 /// job it is to clean logs etc...
 pub struct Marble {
     // maps from ObjectId to DiskLocation
-    page_table: PageTable,
+    location_table: LocationTable,
     next_file_lsn: AtomicU64,
     fams: RwLock<BTreeMap<DiskLocation, FileAndMetadata>>,
     config: Config,
@@ -394,14 +298,13 @@ impl Marble {
             options.read(true);
 
             let mut file = fallible!(options.open(entry.path()));
-            let file_location = DiskLocation::new(metadata.lsn);
+            let file_location = DiskLocation::new(metadata.lsn, false);
 
             let trailer = read_trailer(&mut file, trailer_offset, metadata.trailer_items)?;
 
-            for (object_id, shifted_relative_loc) in trailer {
+            for (object_id, relative_loc) in trailer {
                 // add file base LSN to relative offset
-                let (relative_loc, is_delete) = unshift_location(shifted_relative_loc);
-                let location = shift_location(metadata.lsn + relative_loc, is_delete);
+                let location = relative_loc.to_absolute(metadata.lsn);
 
                 if let Some(old) = recovery_page_table.insert(object_id, location) {
                     assert!(
@@ -431,27 +334,19 @@ impl Marble {
             assert!(fams.insert(file_location, fam).is_none());
         }
 
-        let page_table = PageTable::default();
+        let location_table = LocationTable::default();
 
         // initialize fam utilization from page table
-        for (object_id, shifted_location) in recovery_page_table {
-            assert_ne!(shifted_location, 0);
-            let (unshifted_location, _is_delete) = unshift_location(shifted_location);
-            assert_ne!(unshifted_location, 0);
-            let (_l, fam) = fams
-                .range(..=DiskLocation::new(unshifted_location))
-                .next_back()
-                .unwrap();
+        for (object_id, disk_location) in recovery_page_table {
+            let (_l, fam) = fams.range(..=disk_location).next_back().unwrap();
             fam.len.fetch_add(1, Ordering::Release);
-            page_table
-                .get(object_id)
-                .store(shifted_location, Ordering::Release);
+            location_table.store(object_id, disk_location);
         }
 
         let next_file_lsn = AtomicU64::new(max_file_lsn + max_file_size + 1);
 
         Ok(Marble {
-            page_table,
+            location_table,
             fams: RwLock::new(fams),
             next_file_lsn,
             config,
@@ -467,26 +362,22 @@ impl Marble {
     pub fn read(&self, object_id: ObjectId) -> io::Result<Option<Vec<u8>>> {
         let fams = self.fams.read().unwrap();
 
-        let shifted_lsn = self.page_table.get(object_id).load(Ordering::Acquire);
-        let (lsn, is_delete) = unshift_location(shifted_lsn);
-        // TODO return io::ErrorKind::
-        if lsn == 0 {
-            return Err(annotate!(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Object with ID {object_id} has never been included in a write batch"),
-            )));
-        }
-        if is_delete {
+        let location = if let Some(location) = self.location_table.load(object_id) {
+            location
+        } else {
+            return Ok(None);
+        };
+
+        if location.is_delete() {
             return Ok(None);
         }
-        let location = DiskLocation::new(lsn);
 
         let (base_location, fam) = fams
             .range(..=location)
             .next_back()
             .expect("no possible storage file for object - likely file corruption");
 
-        let file_offset = lsn - base_location.0.get();
+        let file_offset = location.lsn() - base_location.lsn();
 
         let mut header_buf = [0_u8; HEADER_LEN];
         fallible!(fam.file.read_exact_at(&mut header_buf, file_offset));
@@ -580,7 +471,7 @@ impl Marble {
         &self,
         write_batch: I,
         gen: u8,
-        old_locations: &HashMap<ObjectId, u64>,
+        old_locations: &HashMap<ObjectId, DiskLocation>,
     ) -> io::Result<()>
     where
         B: AsRef<[u8]>,
@@ -647,7 +538,7 @@ impl Marble {
         &self,
         objects: HashMap<ObjectId, Option<B>>,
         generation: u8,
-        old_shifted_locations: &HashMap<ObjectId, u64>,
+        old_locations: &HashMap<ObjectId, DiskLocation>,
     ) -> io::Result<()>
     where
         B: AsRef<[u8]>,
@@ -675,7 +566,7 @@ impl Marble {
         let file = fallible!(file_options.open(&tmp_path));
         let mut buf_writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
 
-        let mut new_shifted_relative_locations: HashMap<ObjectId, u64> =
+        let mut new_relative_locations: HashMap<ObjectId, RelativeDiskLocation> =
             HashMap::with_capacity(objects.len());
 
         let mut written_bytes: u64 = 0;
@@ -684,7 +575,7 @@ impl Marble {
                 raw_object.as_ref()
             } else {
                 let is_delete = true;
-                new_shifted_relative_locations.insert(*object_id, shift_location(0, is_delete));
+                new_relative_locations.insert(*object_id, RelativeDiskLocation::new(0, is_delete));
                 continue;
             };
 
@@ -705,8 +596,8 @@ impl Marble {
             let relative_address = written_bytes;
 
             let is_delete = false;
-            let shifted_location = shift_location(relative_address, is_delete);
-            new_shifted_relative_locations.insert(*object_id, shifted_location);
+            let relative_location = RelativeDiskLocation::new(relative_address, is_delete);
+            new_relative_locations.insert(*object_id, relative_location);
 
             let len_buf: [u8; 8] = (raw_object.len() as u64).to_le_bytes();
             let pid_buf: [u8; 8] = object_id.to_le_bytes();
@@ -747,8 +638,8 @@ impl Marble {
             .next_file_lsn
             .fetch_add(written_bytes + 1, Ordering::AcqRel);
 
-        let location = DiskLocation::new(lsn);
-        let initial_capacity = new_shifted_relative_locations.len() as u64;
+        let location = DiskLocation::new(lsn, false);
+        let initial_capacity = new_relative_locations.len() as u64;
 
         let fam = FileAndMetadata {
             file,
@@ -775,55 +666,66 @@ impl Marble {
 
         // 3. attempt installation into pagetable
 
-        let mut replaced_locations = Vec::with_capacity(usize::try_from(initial_capacity).unwrap());
+        let mut replaced_locations: Vec<DiskLocation> =
+            Vec::with_capacity(usize::try_from(initial_capacity).unwrap());
         let mut failed_installations = vec![];
 
-        for (object_id, new_shifted_relative_location) in &new_shifted_relative_locations {
-            let new_shifted_location = new_shifted_relative_location + (lsn << 1);
-            let page_table_entry = self.page_table.get(*object_id);
+        for (object_id, new_relative_location) in &new_relative_locations {
+            let new_location = new_relative_location.to_absolute(lsn);
 
-            let (success, old_shifted_location) =
-                if let Some(old_shifted_location) = old_shifted_locations.get(&object_id) {
+            let (success, replaced_location_opt): (bool, Option<DiskLocation>) =
+                if let Some(old_location) = old_locations.get(&object_id) {
                     // CAS it
-                    let success = page_table_entry
-                        .compare_exchange(
-                            *old_shifted_location,
-                            new_shifted_location,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok();
-                    (success, *old_shifted_location)
+                    let res = self
+                        .location_table
+                        .cas(*object_id, *old_location, new_location);
+
+                    match res {
+                        Ok(replaced_opt) => (true, Some(replaced_opt)),
+                        Err(_current_opt) => (false, None),
+                    }
                 } else {
                     // fetch_max it
-                    let old_shifted_location =
-                        page_table_entry.fetch_max(new_shifted_location, Ordering::AcqRel);
-                    let success = old_shifted_location < new_shifted_location;
-                    (success, old_shifted_location)
+                    let res = self.location_table.fetch_max(*object_id, new_location);
+                    if let Ok(old_opt) = res {
+                        log::trace!(
+                            "fetch_max of {object_id} to new location {new_location:?} successful"
+                        );
+                        (true, old_opt)
+                    } else {
+                        log::trace!(
+                        "fetch_max of {object_id} to new location {new_location:?} NOT successful"
+                    );
+                        (false, None)
+                    }
                 };
 
-            if success {
-                replaced_locations.push(old_shifted_location);
-            } else {
+            if let Some(replaced_location) = replaced_location_opt {
+                assert!(success);
+
+                log::trace!(
+                    "updating metadata for object_id {} from {:?} to {:?}.",
+                    object_id,
+                    replaced_location_opt,
+                    new_location,
+                );
+                replaced_locations.push(replaced_location);
+            } else if !success {
+                log::trace!(
+                    "NOT updating metadata for object_id {} from {:?} to {:?}.",
+                    object_id,
+                    replaced_location_opt,
+                    new_location,
+                );
                 failed_installations.push(*object_id);
             }
-
-            log::trace!(
-                "updating metadata for object_id {} from {:?} to {:?}. success: {}",
-                object_id,
-                old_shifted_location,
-                new_shifted_location,
-                success,
-            );
         }
 
         for failed_installation in &failed_installations {
-            new_shifted_relative_locations
-                .remove(failed_installation)
-                .unwrap();
+            new_relative_locations.remove(failed_installation).unwrap();
         }
 
-        let trailer_items = new_shifted_relative_locations.len();
+        let trailer_items = new_relative_locations.len();
 
         if trailer_items == 0 {
             self.fams.write().unwrap().remove(&location).unwrap();
@@ -847,16 +749,15 @@ impl Marble {
             tn(),
             written_bytes,
         );
-        let res = write_trailer(&mut file_2, written_bytes, &new_shifted_relative_locations)
+        let res = write_trailer(&mut file_2, written_bytes, &new_relative_locations)
             .and_then(|_| maybe!(file_2.sync_all()))
             .and_then(|_| maybe!(fs::rename(&tmp_path, &new_path)));
 
         let file_len = fallible!(file_2.metadata()).len();
-        let expected_file_len =
-            written_bytes + 4 + (16 * new_shifted_relative_locations.len() as u64);
+        let expected_file_len = written_bytes + 4 + (16 * new_relative_locations.len() as u64);
 
         assert_eq!(file_len, expected_file_len);
-        assert_eq!(trailer_items, new_shifted_relative_locations.len());
+        assert_eq!(trailer_items, new_relative_locations.len());
 
         fallible!(fs::set_permissions(
             &new_path,
@@ -877,14 +778,10 @@ impl Marble {
         // 6. update replaced / contention-related failures
         let fams = self.fams.read().unwrap();
 
-        for replaced_shifted_location in replaced_locations.into_iter().filter(|ol| *ol != 0) {
-            let (unshifted_location, _is_delete) = unshift_location(replaced_shifted_location);
-            let (_, fam) = fams
-                .range(..=DiskLocation::new(unshifted_location))
-                .next_back()
-                .unwrap();
+        for replaced_location in replaced_locations.into_iter() {
+            let (_, fam) = fams.range(..=replaced_location).next_back().unwrap();
 
-            log::trace!("{} subtracting one from fam {}", tn(), unshifted_location);
+            log::trace!("{} subtracting one from fam {:?}", tn(), replaced_location);
             let old = fam.len.fetch_sub(1, Ordering::AcqRel);
             assert_ne!(old, 0);
         }
@@ -1007,11 +904,11 @@ impl Marble {
 
         // use this old_locations HashMap in the outer loop to reuse the allocation
         // and avoid resizing as often.
-        let mut old_shifted_locations = HashMap::new();
+        let mut old_locations: HashMap<ObjectId, DiskLocation> = HashMap::new();
 
         // rewrite the live objects
         for (generation, files) in files_to_defrag {
-            old_shifted_locations.clear();
+            old_locations.clear();
 
             log::trace!(
                 "compacting files {:?} with generation {}",
@@ -1038,7 +935,7 @@ impl Marble {
                 let mut offset = 0_u64;
 
                 while offset < trailer_offset {
-                    let lsn = base_lsn.0.get() + offset as u64;
+                    let lsn = base_lsn.lsn() + offset as u64;
                     let mut header = [0_u8; HEADER_LEN];
                     let header_res = buf_reader.read_exact(&mut header);
 
@@ -1062,10 +959,13 @@ impl Marble {
                         ));
                     }
 
-                    let current_shifted_location =
-                        self.page_table.get(object_id).load(Ordering::Acquire);
+                    let current_location = self
+                        .location_table
+                        .load(object_id)
+                        .expect("anything being rewritten should exist in the location table");
 
-                    let shifted_location = shift_location(lsn + offset, false);
+                    let rewritten_location =
+                        RelativeDiskLocation::new(offset, false).to_absolute(lsn);
 
                     // all objects present before the trailer are not deletes
                     let mut object_buf = Vec::with_capacity(len);
@@ -1099,10 +999,10 @@ impl Marble {
                         )));
                     }
 
-                    if shifted_location == current_shifted_location {
+                    if rewritten_location == current_location {
                         // can attempt to rewrite
                         batch.insert(object_id, Some(object_buf));
-                        old_shifted_locations.insert(object_id, shifted_location);
+                        old_locations.insert(object_id, rewritten_location);
                     }
 
                     offset += (HEADER_LEN + len) as u64;
@@ -1111,22 +1011,22 @@ impl Marble {
                 log::trace!(
                     "{} trying to read trailer at file for lsn {} offset {trailer_offset} items {trailer_items}",
                     tn(),
-                    base_lsn.0,
+                    base_lsn.lsn(),
                 );
                 let trailer = read_trailer(&mut file, trailer_offset, trailer_items)?;
 
-                for (object_id, shifted_location) in trailer {
-                    let (_, is_delete) = unshift_location(shifted_location);
-                    if is_delete {
+                for (object_id, relative_location) in trailer {
+                    if relative_location.is_delete() {
                         batch.insert(object_id, None);
-                        old_shifted_locations.insert(object_id, shifted_location);
+                        let location = relative_location.to_absolute(base_lsn.lsn());
+                        old_locations.insert(object_id, location);
                     }
                 }
             }
 
             rewritten_objects += batch.len();
 
-            self.shard_batch(batch, generation, &old_shifted_locations)?;
+            self.shard_batch(batch, generation, &old_locations)?;
 
             let fams = self.fams.read().unwrap();
             for location in rewritten_fam_locations {
