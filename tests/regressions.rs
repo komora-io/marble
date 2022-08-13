@@ -110,6 +110,20 @@ fn test_04() {
         marble
             .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
             .unwrap();
+
+        marble.maintenance().unwrap();
+
+        let object_id_1 = 1;
+        marble
+            .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
+            .unwrap();
+
+        marble.maintenance().unwrap();
+
+        let object_id_1 = 1;
+        marble
+            .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
+            .unwrap();
     });
 }
 
@@ -127,39 +141,37 @@ fn test_05() {
 
 #[test]
 fn test_06() {
-    for _ in 0..1000 {
-        let subdir = format!("test_{}", TEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+    let subdir = format!("test_{}", TEST_COUNTER.fetch_add(1, Ordering::SeqCst));
 
-        let config = Config {
-            target_file_size: 1,
-            max_object_size: 17179869184,
-            fsync_each_batch: false,
-            min_compaction_files: 2,
-            path: std::path::Path::new(TEST_DIR).join(subdir),
-            ..Default::default()
-        };
+    let config = Config {
+        target_file_size: 1,
+        max_object_size: 17179869184,
+        fsync_each_batch: false,
+        min_compaction_files: 2,
+        path: std::path::Path::new(TEST_DIR).join(subdir),
+        ..Default::default()
+    };
 
-        with_instance(config, |config, mut marble| {
-            marble
-                .write_batch([(1, Some([170, 170, 170].to_vec()))])
-                .unwrap();
-            marble.write_batch([(2, Some([170].to_vec()))]).unwrap();
-            marble
-                .write_batch([(3, Some([170, 170, 170, 170, 170].to_vec()))])
-                .unwrap();
+    with_instance(config, |config, mut marble| {
+        marble
+            .write_batch([(1, Some([170, 170, 170].to_vec()))])
+            .unwrap();
+        marble.write_batch([(2, Some([170].to_vec()))]).unwrap();
+        marble
+            .write_batch([(3, Some([170, 170, 170, 170, 170].to_vec()))])
+            .unwrap();
 
-            marble = restart(config, marble);
+        marble = restart(config, marble);
 
-            marble.maintenance().unwrap();
+        marble.maintenance().unwrap();
 
-            assert_eq!(marble.read(1).unwrap().unwrap(), vec![170, 170, 170]);
-            assert_eq!(marble.read(2).unwrap().unwrap(), vec![170]);
-            assert_eq!(
-                marble.read(3).unwrap().unwrap(),
-                vec![170, 170, 170, 170, 170]
-            );
-        });
-    }
+        assert_eq!(marble.read(1).unwrap().unwrap(), vec![170, 170, 170]);
+        assert_eq!(marble.read(2).unwrap().unwrap(), vec![170]);
+        assert_eq!(
+            marble.read(3).unwrap().unwrap(),
+            vec![170, 170, 170, 170, 170]
+        );
+    });
 }
 
 #[test]

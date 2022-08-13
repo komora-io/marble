@@ -298,7 +298,6 @@ impl Marble {
             options.read(true);
 
             let mut file = fallible!(options.open(entry.path()));
-            let file_location = DiskLocation::new(metadata.lsn, false);
 
             let trailer = read_trailer(&mut file, trailer_offset, metadata.trailer_items)?;
 
@@ -317,6 +316,8 @@ impl Marble {
             let file_size = fallible!(entry.metadata()).len();
             max_file_size = max_file_size.max(file_size);
             max_file_lsn = max_file_lsn.max(metadata.lsn);
+
+            let file_location = DiskLocation::new_fam(metadata.lsn);
 
             let fam = FileAndMetadata {
                 len: 0.into(),
@@ -638,7 +639,7 @@ impl Marble {
             .next_file_lsn
             .fetch_add(written_bytes + 1, Ordering::AcqRel);
 
-        let location = DiskLocation::new(lsn, false);
+        let location = DiskLocation::new_fam(lsn);
         let initial_capacity = new_relative_locations.len() as u64;
 
         let fam = FileAndMetadata {
@@ -656,7 +657,10 @@ impl Marble {
             rewrite_claim: true.into(),
         };
 
-        log::debug!("{} inserting new fam at location {:?}", tn(), lsn);
+        log::debug!(
+            "{} inserting new fam at lsn {lsn} location {location:?}",
+            tn()
+        );
 
         assert!(fams.insert(location, fam).is_none());
 
@@ -779,9 +783,15 @@ impl Marble {
         let fams = self.fams.read().unwrap();
 
         for replaced_location in replaced_locations.into_iter() {
+            log::trace!("{} subtracting one from fam {:?}", tn(), replaced_location);
+            log::trace!(
+                "fams: {:?}",
+                fams.iter()
+                    .map(|(dl, f)| (dl, f.len.load(Ordering::Acquire)))
+                    .collect::<Vec<_>>()
+            );
             let (_, fam) = fams.range(..=replaced_location).next_back().unwrap();
 
-            log::trace!("{} subtracting one from fam {:?}", tn(), replaced_location);
             let old = fam.len.fetch_sub(1, Ordering::AcqRel);
             assert_ne!(old, 0);
         }

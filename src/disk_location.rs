@@ -3,16 +3,16 @@ use std::num::NonZeroU64;
 fn shift_location(location: u64, is_delete: bool) -> u64 {
     assert_eq!(location << 1 >> 1, location);
     let inner = if is_delete {
-        location << 1
-    } else {
         (location << 1) + 1
+    } else {
+        location << 1
     };
 
     inner
 }
 
 fn unshift_location(location: u64) -> (u64, bool) {
-    if location % 2 == 0 {
+    if location % 2 == 1 {
         (location >> 1, true)
     } else {
         (location >> 1, false)
@@ -58,6 +58,10 @@ pub struct DiskLocation(NonZeroU64);
 impl DiskLocation {
     pub fn new(location: u64, is_delete: bool) -> DiskLocation {
         DiskLocation(NonZeroU64::new(shift_location(location, is_delete)).unwrap())
+    }
+
+    pub fn new_fam(location: u64) -> DiskLocation {
+        DiskLocation::new(location, false)
     }
 
     pub fn from_raw(u: u64) -> Option<DiskLocation> {
