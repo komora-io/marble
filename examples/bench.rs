@@ -35,6 +35,8 @@ fn run(marble: Arc<Marble>) {
 }
 
 fn main() {
+    env_logger::init();
+
     let concurrency: usize = std::thread::available_parallelism().unwrap().get();
 
     let marble = Arc::new(Marble::open("bench_data").unwrap());
@@ -43,11 +45,16 @@ fn main() {
 
     let before = std::time::Instant::now();
 
-    for _ in 0..concurrency {
+    for i in 0..concurrency {
         let marble = marble.clone();
-        threads.push(std::thread::spawn(move || {
-            run(marble);
-        }));
+        threads.push(
+            std::thread::Builder::new()
+                .name(format!("thread-{i}"))
+                .spawn(move || {
+                    run(marble);
+                })
+                .unwrap(),
+        )
     }
 
     for thread in threads {

@@ -169,3 +169,38 @@ fn test_06() {
         });
     }
 }
+
+#[test]
+fn test_07() {
+    let _ = env_logger::try_init();
+
+    let subdir = format!("test_{}", TEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+
+    let config = Config {
+        target_file_size: 6400,
+        file_compaction_percent: 55,
+        fsync_each_batch: true,
+        min_compaction_files: 2,
+        path: std::path::Path::new(TEST_DIR).join(subdir),
+        ..Default::default()
+    };
+
+    with_instance(config, |config, mut marble| {
+        marble
+            .write_batch([(1, Some(vec![])), (2, None), (3, None)])
+            .unwrap();
+
+        //marble = restart(config, marble);
+
+        marble
+            .write_batch([(1, None), (3, Some(vec![170; 9]))])
+            .unwrap();
+
+        let v: Option<Vec<u8>> = None;
+        marble.write_batch([(1, v)]).unwrap();
+
+        marble.maintenance().unwrap();
+
+        //restart(config, marble);
+    });
+}

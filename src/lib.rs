@@ -884,6 +884,7 @@ impl Marble {
                 .next_back()
                 .unwrap();
 
+            log::trace!("{} subtracting one from fam {}", tn(), unshifted_location);
             let old = fam.len.fetch_sub(1, Ordering::AcqRel);
             assert_ne!(old, 0);
         }
@@ -1114,11 +1115,11 @@ impl Marble {
                 );
                 let trailer = read_trailer(&mut file, trailer_offset, trailer_items)?;
 
-                for (object_id, shifted_loc) in trailer {
-                    let (_, is_delete) = unshift_location(shifted_loc);
+                for (object_id, shifted_location) in trailer {
+                    let (_, is_delete) = unshift_location(shifted_location);
                     if is_delete {
                         batch.insert(object_id, None);
-                        old_shifted_locations.insert(object_id, shifted_loc);
+                        old_shifted_locations.insert(object_id, shifted_location);
                     }
                 }
             }
