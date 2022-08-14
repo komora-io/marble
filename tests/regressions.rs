@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 
 use marble::*;
 
@@ -19,7 +19,7 @@ fn with_instance<F: FnOnce(&Config, Marble)>(config: Config, f: F) {
 }
 
 fn with_default_instance<F: FnOnce(&Config, Marble)>(f: F) {
-    let subdir = format!("test_{}", TEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+    let subdir = format!("test_{}", TEST_COUNTER.fetch_add(1, SeqCst));
     let path = std::path::Path::new(TEST_DIR).join(subdir);
 
     let config = Config {
@@ -141,7 +141,7 @@ fn test_05() {
 
 #[test]
 fn test_06() {
-    let subdir = format!("test_{}", TEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+    let subdir = format!("test_{}", TEST_COUNTER.fetch_add(1, SeqCst));
 
     let config = Config {
         target_file_size: 1,
@@ -176,7 +176,7 @@ fn test_06() {
 
 #[test]
 fn test_07() {
-    let subdir = format!("test_{}", TEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+    let subdir = format!("test_{}", TEST_COUNTER.fetch_add(1, SeqCst));
 
     let config = Config {
         target_file_size: 6400,
@@ -187,7 +187,7 @@ fn test_07() {
         ..Default::default()
     };
 
-    with_instance(config, |config, mut marble| {
+    with_instance(config, |_config, marble| {
         marble
             .write_batch([(1, Some(vec![])), (2, None), (3, None)])
             .unwrap();
@@ -204,5 +204,24 @@ fn test_07() {
         marble.maintenance().unwrap();
 
         //restart(config, marble);
+    });
+}
+
+#[test]
+fn test_08() {
+    with_default_instance(|_config, marble| {
+        marble
+            .write_batch::<Vec<u8>, _>(
+                [(1, Some(vec![])), (2, Some(vec![])), (3, Some(vec![]))].into_iter(),
+            )
+            .unwrap();
+        marble
+            .write_batch::<Vec<u8>, _>([(1, Some(vec![])), (2, Some(vec![]))].into_iter())
+            .unwrap();
+        marble
+            .write_batch::<Vec<u8>, _>([(1, Some(vec![]))].into_iter())
+            .unwrap();
+
+        marble.maintenance().unwrap();
     });
 }

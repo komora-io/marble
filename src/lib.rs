@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -9,6 +10,8 @@ use std::sync::{
 };
 
 use fault_injection::{annotate, fallible, maybe};
+
+type Map<K, V> = std::collections::BTreeMap<K, V>;
 
 mod config;
 mod disk_location;
@@ -25,12 +28,14 @@ const MAX_GENERATION: u8 = 3;
 
 type ObjectId = u64;
 
+/*
 fn tn() -> String {
     std::thread::current()
         .name()
         .unwrap_or("unknown")
         .to_owned()
 }
+*/
 
 fn hash(len_buf: [u8; 8], pid_buf: [u8; 8], object_buf: &[u8]) -> [u8; 4] {
     let mut hasher = crc32fast::Hasher::new();
@@ -161,7 +166,7 @@ fn read_trailer(
 fn write_trailer<'a>(
     file: &mut File,
     offset: u64,
-    new_shifted_relative_locations: &HashMap<ObjectId, RelativeDiskLocation>,
+    new_shifted_relative_locations: &Map<ObjectId, RelativeDiskLocation>,
 ) -> io::Result<()> {
     // space for overall crc + each (object_id, location) pair
     let mut buf = Vec::with_capacity(4 + (new_shifted_relative_locations.len() * 16));
@@ -176,12 +181,6 @@ fn write_trailer<'a>(
     }
 
     let crc = crc32fast::hash(&buf[4..]);
-    log::trace!(
-        "{} writing trailer of len {} bytes {} with crc {crc}",
-        tn(),
-        new_shifted_relative_locations.len(),
-        buf.len() - 4
-    );
     let crc_bytes = crc.to_le_bytes();
 
     buf[0..4].copy_from_slice(&crc_bytes);
@@ -191,6 +190,53 @@ fn write_trailer<'a>(
     fallible!(file.flush());
 
     Ok(())
+}
+
+fn read_storage_directory(heap_dir: PathBuf) -> io::Result<Vec<(Metadata, u64, fs::DirEntry)>> {
+    let mut files = vec![];
+    // parse file names
+    for entry_res in fallible!(fs::read_dir(heap_dir)) {
+        let entry = fallible!(entry_res);
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .expect("file without name encountered in internal directory")
+            .to_str()
+            .expect("non-utf8 file name encountered in internal directory");
+
+        log::trace!("examining filename {} in heap directory", name);
+
+        // remove files w/ temp name
+        if name.ends_with("tmp") {
+            log::warn!(
+                "removing heap file that was not fully written before the last crash: {:?}",
+                entry.path()
+            );
+
+            fallible!(fs::remove_file(entry.path()));
+            continue;
+        }
+
+        let metadata = match Metadata::parse(name) {
+            Some(mn) => mn,
+            None => {
+                log::error!(
+                    "encountered strange file in internal directory: {:?}",
+                    entry.path(),
+                );
+                continue;
+            }
+        };
+
+        let file_len = fallible!(entry.metadata()).len();
+        let trailer_offset = file_len as u64 - (4 + (metadata.trailer_items * 16));
+
+        files.push((metadata, trailer_offset, entry));
+    }
+
+    files.sort_by_key(|(metadata, _, _)| metadata.lsn);
+
+    Ok(files)
 }
 
 /// Garbage-collecting object store. A nice solution to back
@@ -248,50 +294,9 @@ impl Marble {
         let mut max_file_lsn = 0;
         let mut max_file_size = 0;
 
-        let mut recovery_page_table = HashMap::new();
-        let mut files = vec![];
+        let mut recovery_page_table = Map::new();
 
-        // parse file names
-        for entry_res in fallible!(fs::read_dir(heap_dir)) {
-            let entry = fallible!(entry_res);
-            let path = entry.path();
-            let name = path
-                .file_name()
-                .expect("file without name encountered in internal directory")
-                .to_str()
-                .expect("non-utf8 file name encountered in internal directory");
-
-            log::trace!("examining filename {} in heap directory", name);
-
-            // remove files w/ temp name
-            if name.ends_with("tmp") {
-                log::warn!(
-                    "removing heap file that was not fully written before the last crash: {:?}",
-                    entry.path()
-                );
-
-                fallible!(fs::remove_file(entry.path()));
-                continue;
-            }
-
-            let metadata = match Metadata::parse(name) {
-                Some(mn) => mn,
-                None => {
-                    log::error!(
-                        "encountered strange file in internal directory: {:?}",
-                        entry.path(),
-                    );
-                    continue;
-                }
-            };
-
-            let file_len = fallible!(entry.metadata()).len();
-            let trailer_offset = file_len as u64 - (4 + (metadata.trailer_items * 16));
-
-            files.push((metadata, trailer_offset, entry));
-        }
-
-        files.sort_by_key(|(metadata, _, _)| metadata.lsn);
+        let files = read_storage_directory(heap_dir)?;
 
         for (metadata, trailer_offset, entry) in files {
             let mut options = OpenOptions::new();
@@ -319,6 +324,8 @@ impl Marble {
 
             let file_location = DiskLocation::new_fam(metadata.lsn);
 
+            assert_ne!(metadata.trailer_items, 0);
+
             let fam = FileAndMetadata {
                 len: 0.into(),
                 metadata: metadata,
@@ -339,7 +346,10 @@ impl Marble {
 
         // initialize fam utilization from page table
         for (object_id, disk_location) in recovery_page_table {
-            let (_l, fam) = fams.range(..=disk_location).next_back().unwrap();
+            let (_l, fam) = fams
+                .range((Unbounded, Included(disk_location)))
+                .next_back()
+                .unwrap();
             fam.len.fetch_add(1, Ordering::Release);
             location_table.store(object_id, disk_location);
         }
@@ -374,7 +384,7 @@ impl Marble {
         }
 
         let (base_location, fam) = fams
-            .range(..=location)
+            .range((Unbounded, Included(location)))
             .next_back()
             .expect("no possible storage file for object - likely file corruption");
 
@@ -464,7 +474,7 @@ impl Marble {
         I: IntoIterator<Item = (ObjectId, Option<B>)>,
     {
         let gen = 0;
-        let old_locations = HashMap::new();
+        let old_locations = Map::new();
         self.shard_batch(write_batch, gen, &old_locations)
     }
 
@@ -472,7 +482,7 @@ impl Marble {
         &self,
         write_batch: I,
         gen: u8,
-        old_locations: &HashMap<ObjectId, DiskLocation>,
+        old_locations: &Map<ObjectId, DiskLocation>,
     ) -> io::Result<()>
     where
         B: AsRef<[u8]>,
@@ -480,7 +490,7 @@ impl Marble {
     {
         // maps from shard -> (shard size, map of object
         // id's to object data)
-        let mut shards: HashMap<u8, (usize, HashMap<ObjectId, Option<B>>)> = HashMap::new();
+        let mut shards: Map<u8, (usize, Map<ObjectId, Option<B>>)> = Map::new();
 
         let mut fragmented_shards = vec![];
 
@@ -537,9 +547,9 @@ impl Marble {
 
     fn write_batch_inner<B>(
         &self,
-        objects: HashMap<ObjectId, Option<B>>,
+        objects: Map<ObjectId, Option<B>>,
         generation: u8,
-        old_locations: &HashMap<ObjectId, DiskLocation>,
+        old_locations: &Map<ObjectId, DiskLocation>,
     ) -> io::Result<()>
     where
         B: AsRef<[u8]>,
@@ -567,8 +577,7 @@ impl Marble {
         let file = fallible!(file_options.open(&tmp_path));
         let mut buf_writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
 
-        let mut new_relative_locations: HashMap<ObjectId, RelativeDiskLocation> =
-            HashMap::with_capacity(objects.len());
+        let mut new_relative_locations: Map<ObjectId, RelativeDiskLocation> = Map::new();
 
         let mut written_bytes: u64 = 0;
         for (object_id, raw_object_opt) in &objects {
@@ -620,6 +629,8 @@ impl Marble {
             written_bytes += (HEADER_LEN + raw_object.len()) as u64;
         }
 
+        assert_eq!(new_relative_locations.len(), objects.len());
+
         fallible!(buf_writer.flush());
 
         let file: File = buf_writer
@@ -657,10 +668,7 @@ impl Marble {
             rewrite_claim: true.into(),
         };
 
-        log::debug!(
-            "{} inserting new fam at lsn {lsn} location {location:?}",
-            tn()
-        );
+        log::debug!("inserting new fam at lsn {lsn} location {location:?}",);
 
         assert!(fams.insert(location, fam).is_none());
 
@@ -677,32 +685,39 @@ impl Marble {
         for (object_id, new_relative_location) in &new_relative_locations {
             let new_location = new_relative_location.to_absolute(lsn);
 
-            let (success, replaced_location_opt): (bool, Option<DiskLocation>) =
-                if let Some(old_location) = old_locations.get(&object_id) {
-                    // CAS it
-                    let res = self
-                        .location_table
-                        .cas(*object_id, *old_location, new_location);
+            let (success, replaced_location_opt): (bool, Option<DiskLocation>) = if let Some(
+                old_location,
+            ) =
+                old_locations.get(&object_id)
+            {
+                // CAS it
+                let res = self
+                    .location_table
+                    .cas(*object_id, *old_location, new_location);
 
-                    match res {
-                        Ok(replaced_opt) => (true, Some(replaced_opt)),
-                        Err(_current_opt) => (false, None),
+                match res {
+                    Ok(replaced_opt) => {
+                        log::trace!("cas of {object_id} from old location {old_location:?} to new location {new_location:?} successful");
+                        (true, Some(replaced_opt))
                     }
-                } else {
-                    // fetch_max it
-                    let res = self.location_table.fetch_max(*object_id, new_location);
-                    if let Ok(old_opt) = res {
-                        log::trace!(
-                            "fetch_max of {object_id} to new location {new_location:?} successful"
-                        );
-                        (true, old_opt)
-                    } else {
-                        log::trace!(
-                        "fetch_max of {object_id} to new location {new_location:?} NOT successful"
-                    );
+                    Err(_current_opt) => {
+                        log::trace!("cas of {object_id} from old location {old_location:?} to new location {new_location:?} failed");
                         (false, None)
                     }
-                };
+                }
+            } else {
+                // fetch_max it
+                let res = self.location_table.fetch_max(*object_id, new_location);
+                if let Ok(old_opt) = res {
+                    log::trace!(
+                        "fetch_max of {object_id} to new location {new_location:?} successful"
+                    );
+                    (true, old_opt)
+                } else {
+                    log::trace!("fetch_max of {object_id} to new location {new_location:?} failed");
+                    (false, None)
+                }
+            };
 
             if let Some(replaced_location) = replaced_location_opt {
                 assert!(success);
@@ -732,7 +747,11 @@ impl Marble {
         let trailer_items = new_relative_locations.len();
 
         if trailer_items == 0 {
-            self.fams.write().unwrap().remove(&location).unwrap();
+            let mut fams = self.fams.write().unwrap();
+
+            self.verify_file_uninhabited(location, &fams);
+
+            fams.remove(&location).unwrap();
             fallible!(fs::remove_file(tmp_path));
             return Ok(());
         }
@@ -749,8 +768,7 @@ impl Marble {
         let new_path = self.config.path.join(HEAP_DIR_SUFFIX).join(file_name);
 
         log::trace!(
-            "{} writing trailer for {lsn} at offset {}, trailer items {trailer_items}",
-            tn(),
+            "writing trailer for {lsn} at offset {}, trailer items {trailer_items}",
             written_bytes,
         );
         let res = write_trailer(&mut file_2, written_bytes, &new_relative_locations)
@@ -768,8 +786,6 @@ impl Marble {
             fs::Permissions::from_mode(0o400)
         ));
 
-        log::trace!("{} finished writing and verifying trailer for {lsn}", tn());
-
         if let Err(e) = res {
             self.fams.write().unwrap().remove(&location).unwrap();
             fallible!(fs::remove_file(tmp_path));
@@ -777,44 +793,51 @@ impl Marble {
             return Err(e);
         };
 
-        log::trace!("{} renamed file to {:?}", tn(), new_path);
+        log::trace!("renamed file to {:?}", new_path);
 
         // 6. update replaced / contention-related failures
         let fams = self.fams.read().unwrap();
 
         for replaced_location in replaced_locations.into_iter() {
-            log::trace!("{} subtracting one from fam {:?}", tn(), replaced_location);
-            log::trace!(
-                "fams: {:?}",
-                fams.iter()
-                    .map(|(dl, f)| (dl, f.len.load(Ordering::Acquire)))
-                    .collect::<Vec<_>>()
-            );
-            let (_, fam) = fams.range(..=replaced_location).next_back().unwrap();
+            let (_, fam) = fams
+                .range((Unbounded, Included(replaced_location)))
+                .next_back()
+                .unwrap();
 
             let old = fam.len.fetch_sub(1, Ordering::AcqRel);
+            log::trace!(
+                "subtracting one from fam {:?}, current len is {}",
+                replaced_location,
+                old - 1
+            );
             assert_ne!(old, 0);
         }
-
         drop(fams);
 
         let mut fams = self.fams.write().unwrap();
 
         let fam = fams.get_mut(&location).unwrap();
         fam.metadata = metadata;
+        assert_ne!(fam.metadata.trailer_items, 0);
         let old = fam
             .len
             .fetch_sub(failed_installations.len() as u64, Ordering::Release);
 
-        assert_ne!(old, 0);
-
-        // TODO remove these tests
-        let t1 = read_trailer(&file_2, written_bytes, trailer_items as u64)?;
-        let t2 = read_trailer(&fam.file, written_bytes, trailer_items as u64)?;
-        assert_eq!(t1, t2);
+        assert!(old > failed_installations.len() as u64);
 
         fam.path = new_path;
         assert!(fam.rewrite_claim.swap(false, Ordering::AcqRel));
+        log::trace!(
+            "fams: {:?}",
+            fams.iter()
+                .map(|(dl, f)| (
+                    dl,
+                    f.len.load(Ordering::Acquire),
+                    f.metadata.trailer_items,
+                    f.rewrite_claim.load(Ordering::Acquire),
+                ))
+                .collect::<Vec<_>>()
+        );
 
         Ok(())
     }
@@ -828,17 +851,16 @@ impl Marble {
             if fam.len.load(Ordering::Acquire) == 0
                 && !fam.rewrite_claim.swap(true, Ordering::SeqCst)
             {
-                log::trace!(
-                    "{} fam at location {:?} is empty, marking it for removal",
-                    tn(),
-                    location
-                );
+                log::trace!("fam at location {location:?} is empty, marking it for removal",);
                 paths_to_remove.push((*location, fam.path.clone()));
             }
         }
 
         for (location, _) in &paths_to_remove {
             log::trace!("removing fam at location {:?}", location);
+
+            self.verify_file_uninhabited(*location, &fams);
+
             fams.remove(location).unwrap();
         }
 
@@ -865,7 +887,7 @@ impl Marble {
             claims: vec![],
         };
 
-        let mut files_to_defrag: HashMap<u8, Vec<_>> = Default::default();
+        let mut files_to_defrag: Map<u8, Vec<_>> = Default::default();
 
         let fams = self.fams.read().unwrap();
 
@@ -874,11 +896,14 @@ impl Marble {
             let len = fam.len.load(Ordering::Acquire);
             let trailer_items = fam.metadata.trailer_items;
 
+            assert_ne!(trailer_items, 0);
+
             if len != 0
                 && (len * 100) / trailer_items.max(1)
                     < u64::from(self.config.file_compaction_percent)
             {
-                if fam.rewrite_claim.swap(true, Ordering::SeqCst) {
+                let already_claimed = fam.rewrite_claim.swap(true, Ordering::SeqCst);
+                if already_claimed {
                     // try to exclusively claim this file
                     // for rewrite to
                     // prevent concurrent attempts at
@@ -891,8 +916,7 @@ impl Marble {
                 defer_unclaim.claims.push(*location);
 
                 log::trace!(
-                    "{} fam at location {:?} is ready to be compacted",
-                    tn(),
+                    "fam at location {:?} is ready to be compacted",
                     fam.location
                 );
 
@@ -912,30 +936,34 @@ impl Marble {
 
         let mut rewritten_objects = 0;
 
-        // use this old_locations HashMap in the outer loop to reuse the allocation
+        // use this old_locations Map in the outer loop to reuse the allocation
         // and avoid resizing as often.
-        let mut old_locations: HashMap<ObjectId, DiskLocation> = HashMap::new();
+        let mut old_locations: Map<ObjectId, DiskLocation> = Map::new();
 
         // rewrite the live objects
-        for (generation, files) in files_to_defrag {
+        for (generation, file_to_defrag) in files_to_defrag {
             old_locations.clear();
 
             log::trace!(
                 "compacting files {:?} with generation {}",
-                files,
+                file_to_defrag,
                 generation
             );
-            if files.len() < self.config.min_compaction_files {
+
+            if file_to_defrag.len() < self.config.min_compaction_files {
                 // skip batch with too few files (claims
                 // auto-released by Drop of DeferUnclaim
                 continue;
             }
 
-            let mut batch = HashMap::new();
+            let mut batch = Map::new();
             let mut rewritten_fam_locations = vec![];
 
-            for (base_lsn, path, mut file, trailer_offset, trailer_items) in files {
-                rewritten_fam_locations.push(base_lsn);
+            for (base_location, path, mut file, trailer_offset, trailer_items) in file_to_defrag {
+                log::trace!(
+                    "rewriting any surviving objects in file at location {base_location:?}"
+                );
+                rewritten_fam_locations.push(base_location);
 
                 use std::io::Seek;
                 fallible!(file.seek(io::SeekFrom::Start(0)));
@@ -945,7 +973,6 @@ impl Marble {
                 let mut offset = 0_u64;
 
                 while offset < trailer_offset {
-                    let lsn = base_lsn.lsn() + offset as u64;
                     let mut header = [0_u8; HEADER_LEN];
                     let header_res = buf_reader.read_exact(&mut header);
 
@@ -975,7 +1002,7 @@ impl Marble {
                         .expect("anything being rewritten should exist in the location table");
 
                     let rewritten_location =
-                        RelativeDiskLocation::new(offset, false).to_absolute(lsn);
+                        RelativeDiskLocation::new(offset, false).to_absolute(base_location.lsn());
 
                     // all objects present before the trailer are not deletes
                     let mut object_buf = Vec::with_capacity(len);
@@ -1011,35 +1038,54 @@ impl Marble {
 
                     if rewritten_location == current_location {
                         // can attempt to rewrite
+                        log::trace!("rewriting object {object_id} at rewritten location {rewritten_location:?}");
                         batch.insert(object_id, Some(object_buf));
                         old_locations.insert(object_id, rewritten_location);
+                    } else {
+                        log::trace!("not rewriting object {object_id}, as the location being defragmented {rewritten_location:?} does not match the current location in the location table {current_location:?}");
                     }
 
                     offset += (HEADER_LEN + len) as u64;
                 }
+
                 let mut file: File = buf_reader.into_inner();
+
                 log::trace!(
-                    "{} trying to read trailer at file for lsn {} offset {trailer_offset} items {trailer_items}",
-                    tn(),
-                    base_lsn.lsn(),
+                    "trying to read trailer at file for lsn {} offset {trailer_offset} items {trailer_items}",
+                    base_location.lsn(),
                 );
+
                 let trailer = read_trailer(&mut file, trailer_offset, trailer_items)?;
 
                 for (object_id, relative_location) in trailer {
                     if relative_location.is_delete() {
-                        batch.insert(object_id, None);
-                        let location = relative_location.to_absolute(base_lsn.lsn());
-                        old_locations.insert(object_id, location);
+                        let rewritten_location = relative_location.to_absolute(base_location.lsn());
+                        let current_location = self
+                            .location_table
+                            .load(object_id)
+                            .expect("anything being rewritten should exist in the location table");
+
+                        if rewritten_location == current_location {
+                            // can attempt to rewrite
+                            log::trace!("rewriting object {object_id} at rewritten location {rewritten_location:?}");
+                            batch.insert(object_id, None);
+                            old_locations.insert(object_id, rewritten_location);
+                        } else {
+                            log::trace!("not rewriting object {object_id}, as the location being defragmented {rewritten_location:?} does not match the current location in the location table {current_location:?}");
+                        }
                     }
                 }
             }
 
             rewritten_objects += batch.len();
 
+            log::trace!("{rewritten_objects}, {}", batch.len());
+
             self.shard_batch(batch, generation, &old_locations)?;
 
             let fams = self.fams.read().unwrap();
             for location in rewritten_fam_locations {
+                self.verify_file_uninhabited(location, &fams);
                 let fam = &fams[&location];
                 assert_eq!(fam.len.load(Ordering::Acquire), 0, "fam: {fam:?}")
             }
@@ -1072,6 +1118,29 @@ impl Marble {
         }
 
         Ok(())
+    }
+
+    fn verify_file_uninhabited(
+        &self,
+        location: DiskLocation,
+        fams: &Map<DiskLocation, FileAndMetadata>,
+    ) {
+        // TODO make this test-only
+        let next_location = fams
+            .range((Excluded(location), Unbounded))
+            .next()
+            .unwrap()
+            .0;
+
+        let present: Vec<(ObjectId, DiskLocation)> = self
+            .location_table
+            .iter()
+            .filter(|(_oid, loc)| *loc >= location && loc < next_location)
+            .collect();
+
+        if !present.is_empty() {
+            panic!("orphaned object location pairs in location table: {present:?}, which map to the file we're about to delete: {location:?} which is lower than the next highest location {next_location:?}");
+        }
     }
 }
 

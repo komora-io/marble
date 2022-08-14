@@ -1,18 +1,23 @@
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{DiskLocation, ObjectId};
 
 #[derive(Default)]
-pub struct LocationTable(pagetable::PageTable);
+pub struct LocationTable {
+    pt: pagetable::PageTable,
+    max_object_id: AtomicU64,
+}
 
 impl LocationTable {
     pub fn load(&self, object_id: ObjectId) -> Option<DiskLocation> {
-        let raw = self.0.get(object_id).load(Ordering::Acquire);
+        self.max_object_id.fetch_max(object_id, Ordering::Release);
+        let raw = self.pt.get(object_id).load(Ordering::Acquire);
         DiskLocation::from_raw(raw)
     }
 
     pub fn store(&self, object_id: ObjectId, location: DiskLocation) {
-        self.0
+        self.max_object_id.fetch_max(object_id, Ordering::Release);
+        self.pt
             .get(object_id)
             .store(location.to_raw(), Ordering::Release);
     }
@@ -23,7 +28,8 @@ impl LocationTable {
         old_location: DiskLocation,
         new_location: DiskLocation,
     ) -> Result<DiskLocation, DiskLocation> {
-        self.0
+        self.max_object_id.fetch_max(object_id, Ordering::Release);
+        self.pt
             .get(object_id)
             .compare_exchange(
                 old_location.to_raw(),
@@ -40,8 +46,9 @@ impl LocationTable {
         object_id: ObjectId,
         new_location: DiskLocation,
     ) -> Result<Option<DiskLocation>, Option<DiskLocation>> {
+        self.max_object_id.fetch_max(object_id, Ordering::Release);
         let max_result = self
-            .0
+            .pt
             .get(object_id)
             .fetch_max(new_location.to_raw(), Ordering::AcqRel);
 
@@ -50,5 +57,15 @@ impl LocationTable {
         } else {
             Err(DiskLocation::from_raw(max_result))
         }
+    }
+
+    pub fn iter<'a>(&'a self) -> impl 'a + Iterator<Item = (ObjectId, DiskLocation)> {
+        (0..=self.max_object_id.load(Ordering::Acquire)).filter_map(|object_id| {
+            if let Some(loc) = self.load(object_id) {
+                Some((object_id, loc))
+            } else {
+                None
+            }
+        })
     }
 }
