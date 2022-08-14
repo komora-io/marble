@@ -28,7 +28,7 @@ fn run(marble: Arc<Marble>) {
         if i % 16 == 0 {
             let cleaned_up = marble.maintenance().unwrap();
             if cleaned_up != 0 {
-                println!("cleaned up {} files", cleaned_up);
+                println!("defragmented {} objects", cleaned_up);
             }
         }
     }

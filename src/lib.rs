@@ -823,7 +823,7 @@ impl Marble {
             .len
             .fetch_sub(failed_installations.len() as u64, Ordering::Release);
 
-        assert!(old > failed_installations.len() as u64);
+        assert!(old >= failed_installations.len() as u64);
 
         fam.path = new_path;
         assert!(fam.rewrite_claim.swap(false, Ordering::AcqRel));
@@ -896,8 +896,6 @@ impl Marble {
             let len = fam.len.load(Ordering::Acquire);
             let trailer_items = fam.metadata.trailer_items;
 
-            assert_ne!(trailer_items, 0);
-
             if len != 0
                 && (len * 100) / trailer_items.max(1)
                     < u64::from(self.config.file_compaction_percent)
@@ -910,7 +908,6 @@ impl Marble {
                     // rewriting its contents
                     continue;
                 }
-
                 assert_ne!(trailer_items, 0);
 
                 defer_unclaim.claims.push(*location);
