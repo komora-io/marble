@@ -9,6 +9,8 @@ use rand::Rng;
 
 use marble::{Config, Marble};
 
+mod common;
+
 // test names, also used as dir names
 const BATCHES_DIR: &str = "crash_batches";
 

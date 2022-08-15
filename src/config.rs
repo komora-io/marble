@@ -46,7 +46,7 @@ impl Default for Config {
             partition_function: crate::default_partition_function,
             max_object_size: 16 * 1024 * 1024 * 1024, /* 16gb */
             min_compaction_files: 2,
-            fsync_each_batch: true,
+            fsync_each_batch: false,
         }
     }
 }

@@ -5,7 +5,7 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering::SeqCst},
     RwLock,
 };
 
@@ -14,10 +14,14 @@ use fault_injection::{annotate, fallible, maybe};
 type Map<K, V> = std::collections::BTreeMap<K, V>;
 
 mod config;
+mod debug_delay;
+#[cfg(feature = "runtime_validation")]
+mod debug_history;
 mod disk_location;
 mod location_table;
 
 pub use config::Config;
+use debug_delay::debug_delay;
 use disk_location::{DiskLocation, RelativeDiskLocation};
 use location_table::LocationTable;
 
@@ -27,15 +31,6 @@ const HEADER_LEN: usize = 20;
 const MAX_GENERATION: u8 = 3;
 
 type ObjectId = u64;
-
-/*
-fn tn() -> String {
-    std::thread::current()
-        .name()
-        .unwrap_or("unknown")
-        .to_owned()
-}
-*/
 
 fn hash(len_buf: [u8; 8], pid_buf: [u8; 8], object_buf: &[u8]) -> [u8; 4] {
     let mut hasher = crc32fast::Hasher::new();
@@ -254,6 +249,8 @@ pub struct Marble {
     fams: RwLock<BTreeMap<DiskLocation, FileAndMetadata>>,
     config: Config,
     directory_lock: File,
+    #[cfg(feature = "runtime_validation")]
+    debug_history: std::sync::Mutex<debug_history::DebugHistory>,
 }
 
 impl Marble {
@@ -343,14 +340,18 @@ impl Marble {
         }
 
         let location_table = LocationTable::default();
+        #[cfg(feature = "runtime_validation")]
+        let mut debug_history = debug_history::DebugHistory::default();
 
         // initialize fam utilization from page table
         for (object_id, disk_location) in recovery_page_table {
+            #[cfg(feature = "runtime_validation")]
+            debug_history.mark_add(object_id, disk_location);
             let (_l, fam) = fams
                 .range((Unbounded, Included(disk_location)))
                 .next_back()
                 .unwrap();
-            fam.len.fetch_add(1, Ordering::Release);
+            fam.len.fetch_add(1, SeqCst);
             location_table.store(object_id, disk_location);
         }
 
@@ -362,6 +363,8 @@ impl Marble {
             next_file_lsn,
             config,
             directory_lock,
+            #[cfg(feature = "runtime_validation")]
+            debug_history: debug_history.into(),
         })
     }
 
@@ -446,7 +449,7 @@ impl Marble {
         let mut stored_objects = 0;
 
         for (_, fam) in &*self.fams.read().unwrap() {
-            live_objects += fam.len.load(Ordering::Acquire);
+            live_objects += fam.len.load(SeqCst);
             stored_objects += fam.metadata.present_objects;
         }
 
@@ -568,7 +571,7 @@ impl Marble {
         // 6. update replaced / contention-related failures
 
         // 1. write data to tmp
-        let tmp_file_name = format!("{}-tmp", TMP_COUNTER.fetch_add(1, Ordering::AcqRel));
+        let tmp_file_name = format!("{}-tmp", TMP_COUNTER.fetch_add(1, SeqCst));
         let tmp_path = self.config.path.join(HEAP_DIR_SUFFIX).join(tmp_file_name);
 
         let mut file_options = OpenOptions::new();
@@ -646,9 +649,7 @@ impl Marble {
         // 2. assign LSN and add to fams
         let mut fams = self.fams.write().unwrap();
 
-        let lsn = self
-            .next_file_lsn
-            .fetch_add(written_bytes + 1, Ordering::AcqRel);
+        let lsn = self.next_file_lsn.fetch_add(written_bytes + 1, SeqCst);
 
         let location = DiskLocation::new_fam(lsn);
         let initial_capacity = new_relative_locations.len() as u64;
@@ -678,9 +679,11 @@ impl Marble {
 
         // 3. attempt installation into pagetable
 
-        let mut replaced_locations: Vec<DiskLocation> =
-            Vec::with_capacity(usize::try_from(initial_capacity).unwrap());
+        let mut replaced_locations: Map<DiskLocation, u64> = Default::default();
         let mut failed_installations = vec![];
+
+        #[cfg(feature = "runtime_validation")]
+        let mut debug_history = self.debug_history.lock().unwrap();
 
         for (object_id, new_relative_location) in &new_relative_locations {
             let new_location = new_relative_location.to_absolute(lsn);
@@ -719,17 +722,23 @@ impl Marble {
                 }
             };
 
-            if let Some(replaced_location) = replaced_location_opt {
-                assert!(success);
+            if success {
+                #[cfg(feature = "runtime_validation")]
+                debug_history.mark_add(*object_id, new_location);
+                if let Some(replaced_location) = replaced_location_opt {
+                    #[cfg(feature = "runtime_validation")]
+                    debug_history.mark_remove(*object_id, replaced_location);
+                    log::trace!(
+                        "updating metadata for object_id {} from {:?} to {:?}.",
+                        object_id,
+                        replaced_location_opt,
+                        new_location,
+                    );
 
-                log::trace!(
-                    "updating metadata for object_id {} from {:?} to {:?}.",
-                    object_id,
-                    replaced_location_opt,
-                    new_location,
-                );
-                replaced_locations.push(replaced_location);
-            } else if !success {
+                    let entry = replaced_locations.entry(replaced_location).or_default();
+                    *entry += 1;
+                }
+            } else {
                 log::trace!(
                     "NOT updating metadata for object_id {} from {:?} to {:?}.",
                     object_id,
@@ -739,6 +748,9 @@ impl Marble {
                 failed_installations.push(*object_id);
             }
         }
+
+        #[cfg(feature = "runtime_validation")]
+        drop(debug_history);
 
         for failed_installation in &failed_installations {
             new_relative_locations.remove(failed_installation).unwrap();
@@ -798,20 +810,22 @@ impl Marble {
         // 6. update replaced / contention-related failures
         let fams = self.fams.read().unwrap();
 
-        for replaced_location in replaced_locations.into_iter() {
+        for (replaced_location, replacement_count) in replaced_locations.into_iter() {
+            assert_ne!(replaced_location, location);
             let (_, fam) = fams
                 .range((Unbounded, Included(replaced_location)))
                 .next_back()
                 .unwrap();
 
-            let old = fam.len.fetch_sub(1, Ordering::AcqRel);
+            let old = fam.len.fetch_sub(replacement_count, SeqCst);
             log::trace!(
                 "subtracting one from fam {:?}, current len is {}",
                 replaced_location,
-                old - 1
+                old - replacement_count
             );
-            assert_ne!(old, 0);
+            assert!(old >= replacement_count);
         }
+
         drop(fams);
 
         let mut fams = self.fams.write().unwrap();
@@ -819,22 +833,23 @@ impl Marble {
         let fam = fams.get_mut(&location).unwrap();
         fam.metadata = metadata;
         assert_ne!(fam.metadata.trailer_items, 0);
-        let old = fam
-            .len
-            .fetch_sub(failed_installations.len() as u64, Ordering::Release);
+        let old = fam.len.fetch_sub(failed_installations.len() as u64, SeqCst);
 
         assert!(old >= failed_installations.len() as u64);
 
         fam.path = new_path;
-        assert!(fam.rewrite_claim.swap(false, Ordering::AcqRel));
+
+        debug_delay();
+        assert!(fam.rewrite_claim.swap(false, SeqCst));
+
         log::trace!(
             "fams: {:?}",
             fams.iter()
                 .map(|(dl, f)| (
                     dl,
-                    f.len.load(Ordering::Acquire),
+                    f.len.load(SeqCst),
                     f.metadata.trailer_items,
-                    f.rewrite_claim.load(Ordering::Acquire),
+                    f.rewrite_claim.load(SeqCst),
                 ))
                 .collect::<Vec<_>>()
         );
@@ -848,9 +863,8 @@ impl Marble {
         let mut fams = self.fams.write().unwrap();
 
         for (location, fam) in &*fams {
-            if fam.len.load(Ordering::Acquire) == 0
-                && !fam.rewrite_claim.swap(true, Ordering::SeqCst)
-            {
+            debug_delay();
+            if fam.len.load(SeqCst) == 0 && !fam.rewrite_claim.swap(true, SeqCst) {
                 log::trace!("fam at location {location:?} is empty, marking it for removal",);
                 paths_to_remove.push((*location, fam.path.clone()));
             }
@@ -893,14 +907,15 @@ impl Marble {
 
         for (location, fam) in &*fams {
             assert_eq!(*location, fam.location);
-            let len = fam.len.load(Ordering::Acquire);
+            let len = fam.len.load(SeqCst);
             let trailer_items = fam.metadata.trailer_items;
 
             if len != 0
                 && (len * 100) / trailer_items.max(1)
                     < u64::from(self.config.file_compaction_percent)
             {
-                let already_claimed = fam.rewrite_claim.swap(true, Ordering::SeqCst);
+                debug_delay();
+                let already_claimed = fam.rewrite_claim.swap(true, SeqCst);
                 if already_claimed {
                     // try to exclusively claim this file
                     // for rewrite to
@@ -1083,8 +1098,8 @@ impl Marble {
             let fams = self.fams.read().unwrap();
             for location in rewritten_fam_locations {
                 self.verify_file_uninhabited(location, &fams);
-                let fam = &fams[&location];
-                assert_eq!(fam.len.load(Ordering::Acquire), 0, "fam: {fam:?}")
+                //let fam = &fams[&location];
+                //assert_eq!(fam.len.load(SeqCst), 0, "bug with length tracking, because we have verified that this file is actually uninhabited: fam: {fam:?}")
             }
         }
 
@@ -1103,9 +1118,9 @@ impl Marble {
 
         let mut synced_files = false;
         for fam in fams.values() {
-            if !fam.synced.load(Ordering::Acquire) {
+            if !fam.synced.load(SeqCst) {
                 fam.file.sync_all()?;
-                fam.synced.store(true, Ordering::Release);
+                fam.synced.store(true, SeqCst);
                 synced_files = true;
             }
         }
@@ -1155,7 +1170,8 @@ impl<'a> Drop for DeferUnclaim<'a> {
         let fams = self.marble.fams.read().unwrap();
         for claim in &self.claims {
             if let Some(fam) = fams.get(claim) {
-                assert!(fam.rewrite_claim.swap(false, Ordering::SeqCst));
+                debug_delay();
+                assert!(fam.rewrite_claim.swap(false, SeqCst));
             }
         }
     }

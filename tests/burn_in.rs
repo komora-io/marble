@@ -4,10 +4,12 @@ use rand::{thread_rng, Rng};
 
 use marble::Marble;
 
-const KEYSPACE: u64 = 64 * 1024;
-const BATCH_SZ: usize = 1024;
-const VALUE_LEN: usize = 4096 * 16;
-const OPS: usize = 24 * 1024 * 1024;
+mod common;
+
+const KEYSPACE: u64 = 16;
+const BATCH_SZ: usize = 3;
+const VALUE_LEN: usize = 7;
+const OPS: usize = 24 * 1024;
 const BATCHES: usize = OPS / BATCH_SZ;
 
 fn run(marble: Arc<Marble>) {
@@ -34,18 +36,13 @@ fn run(marble: Arc<Marble>) {
     }
 }
 
-fn main() {
-    env_logger::init();
+#[test]
+fn burn_in() {
+    common::setup_logger();
 
-    let concurrency: usize = std::thread::available_parallelism().unwrap().get();
+    let concurrency: usize = 3; //std::thread::available_parallelism().unwrap().get() * 10;
 
-    let config = marble::Config {
-        path: "bench_data".into(),
-        fsync_each_batch: false,
-        ..Default::default()
-    };
-
-    let marble = Arc::new(config.open().unwrap());
+    let marble = Arc::new(Marble::open("bench_data").unwrap());
 
     let mut threads = vec![];
 

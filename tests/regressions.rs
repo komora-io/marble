@@ -2,12 +2,14 @@ use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 
 use marble::*;
 
+mod common;
+
 const TEST_DIR: &str = "testing_data_directories";
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn with_instance<F: FnOnce(&Config, Marble)>(config: Config, f: F) {
-    let _ = env_logger::try_init();
+    let _ = common::setup_logger();
 
     let _ = std::fs::remove_dir_all(&config.path);
 
