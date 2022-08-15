@@ -1138,16 +1138,12 @@ impl Marble {
         fams: &Map<DiskLocation, FileAndMetadata>,
     ) {
         // TODO make this test-only
-        let next_location = fams
-            .range((Excluded(location), Unbounded))
-            .next()
-            .unwrap()
-            .0;
-
+        let fam = &fams[&location];
+        let next_location = DiskLocation::new_fam(location.lsn() + fam.trailer_offset);
         let present: Vec<(ObjectId, DiskLocation)> = self
             .location_table
             .iter()
-            .filter(|(_oid, loc)| *loc >= location && loc < next_location)
+            .filter(|(_oid, loc)| *loc >= location && *loc < next_location)
             .collect();
 
         if !present.is_empty() {
