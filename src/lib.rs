@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::ops::Bound::{Excluded, Included, Unbounded};
+use std::ops::Bound::{Included, Unbounded};
 use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -718,7 +718,17 @@ impl Marble {
                     (true, old_opt)
                 } else {
                     log::trace!("fetch_max of {object_id} to new location {new_location:?} failed");
-                    (false, None)
+
+                    // NB we always mark fetch_max as true because even if items
+                    // can't be installed into the pagetable, they must still be
+                    // atomic in their batch. The reason they failed to install
+                    // is due to a "later" installation, but that later installation
+                    // may end up failing to reach durability before a crash.
+                    // So, it's important that this batch remains atomically
+                    // consistent across a crash, so we include items in the
+                    // trailer even if they were not able to be installed.
+                    let success = true;
+                    (success, None)
                 }
             };
 
