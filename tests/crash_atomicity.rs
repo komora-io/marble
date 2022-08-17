@@ -17,7 +17,7 @@ const BATCHES_DIR: &str = "crash_batches";
 const TESTS: &[(&str, fn())] = &[(BATCHES_DIR, crash_batches)];
 
 const TEST_ENV_VAR: &str = "SLED_CRASH_TEST";
-const N_TESTS: usize = 64;
+const N_TESTS: usize = 64 * 128;
 const BATCH_SIZE: u32 = 13;
 const CRASH_CHANCE: u32 = 250;
 
@@ -82,6 +82,7 @@ fn run_crash_batches() {
 
     let config = Config {
         path: BATCHES_DIR.into(),
+        fsync_each_batch: false,
         ..Default::default()
     };
 
