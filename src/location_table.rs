@@ -59,6 +59,7 @@ impl LocationTable {
         }
     }
 
+    #[cfg(feature = "runtime_validation")]
     pub fn iter<'a>(&'a self) -> impl 'a + Iterator<Item = (ObjectId, DiskLocation)> {
         (0..=self.max_object_id.load(Ordering::Acquire)).filter_map(|object_id| {
             if let Some(loc) = self.load(object_id) {

@@ -16,6 +16,9 @@ panic = "abort"
 debug = true
 panic = "abort"
 
+[features]
+runtime_validation = []
+
 [dev-dependencies]
 env_logger = "0.9.0"
 

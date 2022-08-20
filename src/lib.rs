@@ -124,12 +124,12 @@ fn read_trailer(
     trailer_offset: u64,
     trailer_items: u64,
 ) -> io::Result<Vec<(ObjectId, RelativeDiskLocation)>> {
-    let size = usize::try_from(4 + (trailer_items * 16)).unwrap();
+    let trailer_size = usize::try_from(4 + (trailer_items * 16)).unwrap();
 
-    let mut buf = Vec::with_capacity(size);
+    let mut buf = Vec::with_capacity(trailer_size);
 
     unsafe {
-        buf.set_len(size);
+        buf.set_len(trailer_size);
     }
 
     fallible!(file.read_exact_at(&mut buf, trailer_offset));
