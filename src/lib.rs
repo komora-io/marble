@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::ops::Bound::{Included, Unbounded};
-use std::os::unix::fs::{FileExt, PermissionsExt};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering::SeqCst},
@@ -43,7 +43,8 @@ fn hash(len_buf: [u8; 8], pid_buf: [u8; 8], object_buf: &[u8]) -> [u8; 4] {
 
 /// Statistics for file contents, to base decisions around
 /// calls to `maintenance`.
-pub struct FileStats {
+#[derive(Debug)]
+pub struct Stats {
     /// The number of live objects stored in the backing
     /// storage files.
     pub live_objects: u64,
@@ -441,7 +442,10 @@ impl Marble {
     /// decisions about when to call `maintenance` based on
     /// desired write and space amplification
     /// characteristics.
-    pub fn file_statistics(&self) -> FileStats {
+    #[doc(alias = "file_statistics")]
+    #[doc(alias = "statistics")]
+    #[doc(alias = "stats")]
+    pub fn file_stats(&self) -> Stats {
         let mut live_objects = 0;
         let mut stored_objects = 0;
 
@@ -450,7 +454,7 @@ impl Marble {
             stored_objects += fam.metadata.present_objects;
         }
 
-        FileStats {
+        Stats {
             live_objects,
             stored_objects,
             dead_objects: stored_objects - live_objects,
@@ -512,6 +516,7 @@ impl Marble {
 
             let shard = shards.entry(shard_id).or_default();
 
+            // only split shards on rewrite, otherwise we lose batch atomicity
             let is_rewrite = gen > 0;
             let over_size_preference = shard.0 > self.config.target_file_size;
 
@@ -521,7 +526,9 @@ impl Marble {
             }
 
             shard.0 += object_size;
-            shard.1.insert(object_id, data_opt);
+            if let Some(Some(replaced)) = shard.1.insert(object_id, data_opt) {
+                shard.0 -= replaced.as_ref().len();
+            }
         }
 
         let iter = shards
@@ -677,88 +684,79 @@ impl Marble {
 
         // 3. attempt installation into pagetable
 
-        let mut replaced_locations: Map<DiskLocation, u64> = Default::default();
-        let mut failed_installations = vec![];
+        let mut replaced_locations: Vec<(ObjectId, DiskLocation)> = vec![];
+        let mut failed_gc_locations = vec![];
+        let mut subtract_from_len = 0;
 
         for (object_id, new_relative_location) in &new_relative_locations {
+            // history debug must linearize with actual atomic operations below
+            #[cfg(feature = "runtime_validation")]
+            let mut debug_history = self.debug_history.lock().unwrap();
+
             let new_location = new_relative_location.to_absolute(lsn);
 
-            let (success, replaced_location_opt): (bool, Option<DiskLocation>) = if let Some(
-                old_location,
-            ) =
-                old_locations.get(&object_id)
-            {
+            if let Some(old_location) = old_locations.get(&object_id) {
                 // CAS it
                 let res = self
                     .location_table
                     .cas(*object_id, *old_location, new_location);
 
                 match res {
-                    Ok(replaced_opt) => {
+                    Ok(()) => {
                         log::trace!("cas of {object_id} from old location {old_location:?} to new location {new_location:?} successful");
-                        (true, Some(replaced_opt))
+
+                        #[cfg(feature = "runtime_validation")]
+                        {
+                            debug_history.mark_add(*object_id, new_location);
+                            debug_history.mark_remove(*object_id, *old_location);
+                        }
+
+                        replaced_locations.push((*object_id, *old_location));
                     }
                     Err(_current_opt) => {
                         log::trace!("cas of {object_id} from old location {old_location:?} to new location {new_location:?} failed");
-                        (false, None)
+                        failed_gc_locations.push(*object_id);
+                        subtract_from_len += 1;
                     }
                 }
             } else {
                 // fetch_max it
+                //
+                // NB spooky concurrency stuff here:
+                // even if we fail to install the item due to data races,
+                // we still need to include it in the trailer and make it
+                // potentially available to be recovered, because we can't
+                // guarantee that the write batch that happened after ours
+                // will actually write before crashing. But we must preserve
+                // batch atomicity, even when we can't actually install the
+                // item at runtime due to conflicts with "the future" that
+                // is not recoverable.
                 let res = self.location_table.fetch_max(*object_id, new_location);
+
                 if let Ok(old_opt) = res {
                     log::trace!(
                         "fetch_max of {object_id} to new location {new_location:?} successful"
                     );
-                    (true, old_opt)
+
+                    #[cfg(feature = "runtime_validation")]
+                    debug_history.mark_add(*object_id, new_location);
+
+                    if let Some(old) = old_opt {
+                        replaced_locations.push((*object_id, old));
+
+                        #[cfg(feature = "runtime_validation")]
+                        debug_history.mark_remove(*object_id, old);
+                    }
                 } else {
                     log::trace!("fetch_max of {object_id} to new location {new_location:?} failed");
 
-                    // NB we always mark fetch_max as true because even if items
-                    // can't be installed into the pagetable, they must still be
-                    // atomic in their batch. The reason they failed to install
-                    // is due to a "later" installation, but that later installation
-                    // may end up failing to reach durability before a crash.
-                    // So, it's important that this batch remains atomically
-                    // consistent across a crash, so we include items in the
-                    // trailer even if they were not able to be installed.
-                    let success = true;
-                    (success, None)
+                    subtract_from_len += 1;
                 }
             };
-
-            if success {
-                #[cfg(feature = "runtime_validation")]
-                let mut debug_history = self.debug_history.lock().unwrap();
-
-                #[cfg(feature = "runtime_validation")]
-                debug_history.mark_add(*object_id, new_location);
-                if let Some(replaced_location) = replaced_location_opt {
-                    #[cfg(feature = "runtime_validation")]
-                    debug_history.mark_remove(*object_id, replaced_location);
-                    log::trace!(
-                        "updating metadata for object_id {} from {:?} to {:?}.",
-                        object_id,
-                        replaced_location_opt,
-                        new_location,
-                    );
-
-                    let entry = replaced_locations.entry(replaced_location).or_default();
-                    *entry += 1;
-                }
-            } else {
-                log::trace!(
-                    "NOT updating metadata for object_id {} from {:?} to {:?}.",
-                    object_id,
-                    replaced_location_opt,
-                    new_location,
-                );
-                failed_installations.push(*object_id);
-            }
         }
 
-        for failed_installation in &failed_installations {
-            new_relative_locations.remove(failed_installation).unwrap();
+        for failed_gc_location in &failed_gc_locations {
+            new_relative_locations.remove(failed_gc_location).unwrap();
         }
 
         let trailer_items = new_relative_locations.len();
@@ -798,13 +796,23 @@ impl Marble {
         assert_eq!(file_len, expected_file_len);
         assert_eq!(trailer_items, new_relative_locations.len());
 
-        fallible!(fs::set_permissions(
-            &new_path,
-            fs::Permissions::from_mode(0o400)
-        ));
-
         if let Err(e) = res {
-            self.fams.write().unwrap().remove(&location).unwrap();
+            // we're in a pretty unfortunate spot because we have
+            // already installed items into the location table
+            // and reads may be going there already, but we
+            // can at least attempt to undo each of the replaced
+            // locations before removing the fam and file to mitigate
+            // additional damage.
+            for (object_id, old_location) in replaced_locations {
+                let new_relative_location = new_relative_locations.get(&object_id).unwrap();
+                let new_location = new_relative_location.to_absolute(lsn);
+                let _dont_care = self
+                    .location_table
+                    .cas(object_id, new_location, old_location);
+            }
+            let mut fams = self.fams.write().unwrap();
+            self.verify_file_uninhabited(location, &fams);
+            fams.remove(&location).unwrap();
             fallible!(fs::remove_file(tmp_path));
             log::error!("failed to write new file: {:?}", e);
             return Err(e);
@@ -815,20 +823,21 @@ impl Marble {
         // 6. update replaced / contention-related failures
         let fams = self.fams.read().unwrap();
 
-        for (replaced_location, replacement_count) in replaced_locations.into_iter() {
-            assert_ne!(replaced_location, location);
-            let (_, fam) = fams
+        for (_object_id, replaced_location) in replaced_locations.into_iter() {
+            let (fam_location, fam) = fams
                 .range((Unbounded, Included(replaced_location)))
                 .next_back()
                 .unwrap();
 
-            let old = fam.len.fetch_sub(replacement_count, SeqCst);
+            assert_ne!(*fam_location, location);
+
+            let old = fam.len.fetch_sub(1, SeqCst);
             log::trace!(
                 "subtracting one from fam {:?}, current len is {}",
                 replaced_location,
-                old - replacement_count
+                old - 1
             );
-            assert!(old >= replacement_count);
+            assert!(old >= 1, "expected old {old} to be >= 1");
         }
 
         drop(fams);
@@ -838,9 +847,12 @@ impl Marble {
         let fam = fams.get_mut(&location).unwrap();
         fam.metadata = metadata;
         assert_ne!(fam.metadata.trailer_items, 0);
-        let old = fam.len.fetch_sub(failed_installations.len() as u64, SeqCst);
+        let old = fam.len.fetch_sub(subtract_from_len, SeqCst);
 
-        assert!(old >= failed_installations.len() as u64);
+        assert!(
+            old >= subtract_from_len,
+            "expected old {old} to be >= subtract_from_len {subtract_from_len}"
+        );
 
         fam.path = new_path;
 
@@ -867,6 +879,7 @@ impl Marble {
         drop(read_fams);
 
         let mut fams = self.fams.write().unwrap();
+
         for (location, _) in &paths_to_remove {
             log::trace!("removing fam at location {:?}", location);
 
@@ -943,16 +956,14 @@ impl Marble {
         }
         drop(fams);
 
-        let mut rewritten_objects = 0;
-
         // use this old_locations Map in the outer loop to reuse the allocation
         // and avoid resizing as often.
         let mut old_locations: Map<ObjectId, DiskLocation> = Map::new();
 
+        let mut rewritten_objects = 0;
+
         // rewrite the live objects
         for (generation, file_to_defrag) in files_to_defrag {
-            old_locations.clear();
-
             log::trace!(
                 "compacting files {:?} with generation {}",
                 file_to_defrag,
@@ -983,13 +994,7 @@ impl Marble {
 
                 while offset < trailer_offset {
                     let mut header = [0_u8; HEADER_LEN];
-                    let header_res = buf_reader.read_exact(&mut header);
-
-                    match header_res {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                        Err(other) => return Err(other),
-                    }
+                    buf_reader.read_exact(&mut header)?;
 
                     let crc_expected: [u8; 4] = header[0..4].try_into().unwrap();
                     let pid_buf = header[4..12].try_into().unwrap();
@@ -1001,7 +1006,7 @@ impl Marble {
                         log::warn!("corrupt object size detected: {} bytes", len);
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "corrupt object size",
+                            "corrupt object size or configured max_object_size has gone down since this object was written",
                         ));
                     }
 
@@ -1020,13 +1025,7 @@ impl Marble {
                         object_buf.set_len(len);
                     }
 
-                    let object_res = buf_reader.read_exact(&mut object_buf);
-
-                    match object_res {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                        Err(other) => return Err(other),
-                    }
+                    buf_reader.read_exact(&mut object_buf)?;
 
                     let crc_actual = hash(len_buf, pid_buf, &object_buf);
 
@@ -1091,6 +1090,7 @@ impl Marble {
             log::trace!("{rewritten_objects}, {}", batch.len());
 
             self.shard_batch(batch, generation, &old_locations)?;
+            old_locations.clear();
 
             let fams = self.fams.read().unwrap();
             for location in rewritten_fam_locations {

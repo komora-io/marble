@@ -7,7 +7,7 @@ use marble::Marble;
 const KEYSPACE: u64 = 1024 * 1024;
 const BATCH_SZ: usize = 64 * 1024;
 const VALUE_LEN: usize = 64;
-const OPS_PER_THREAD: usize = 64 * 1024 * 1024;
+const OPS_PER_THREAD: usize = 8 * 1024 * 1024;
 const BATCHES_PER_THREAD: usize = OPS_PER_THREAD / BATCH_SZ;
 
 fn run(marble: Arc<Marble>) {
@@ -15,7 +15,7 @@ fn run(marble: Arc<Marble>) {
 
     let mut rng = thread_rng();
 
-    for i in 0..BATCHES_PER_THREAD {
+    for _ in 0..BATCHES_PER_THREAD {
         let mut batch = std::collections::HashMap::new();
 
         for _ in 0..BATCH_SZ {
@@ -23,9 +23,7 @@ fn run(marble: Arc<Marble>) {
             batch.insert(pid, Some(&v));
         }
 
-        println!("starting write batch");
         marble.write_batch(batch).unwrap();
-        println!("wrote batch");
     }
 }
 
@@ -40,7 +38,11 @@ fn main() {
         ..Default::default()
     };
 
+    println!("beginning recovery");
     let marble = Arc::new(config.open().unwrap());
+    println!("marble recovered {:?}", marble.file_stats());
+    marble.maintenance().unwrap();
+    println!("post initial maintenance: {:?}", marble.file_stats());
 
     let mut threads = vec![];
 
@@ -61,7 +63,11 @@ fn main() {
     while threads.iter().any(|t| !t.is_finished()) {
         let cleaned_up = marble.maintenance().unwrap();
         if cleaned_up != 0 {
-            println!("defragmented {} objects", cleaned_up);
+            let stats = marble.file_stats();
+            let dead_percent = (stats.dead_objects * 100) / stats.stored_objects;
+            println!(
+                "defragmented {cleaned_up} objects. stats: {stats:?} dead percent: {dead_percent}",
+            );
         }
     }
 

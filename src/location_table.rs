@@ -1,22 +1,29 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "runtime_validation")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use crate::{DiskLocation, ObjectId};
 
 #[derive(Default)]
 pub struct LocationTable {
     pt: pagetable::PageTable,
+    #[cfg(feature = "runtime_validation")]
     max_object_id: AtomicU64,
 }
 
 impl LocationTable {
     pub fn load(&self, object_id: ObjectId) -> Option<DiskLocation> {
+        #[cfg(feature = "runtime_validation")]
         self.max_object_id.fetch_max(object_id, Ordering::Release);
+
         let raw = self.pt.get(object_id).load(Ordering::Acquire);
         DiskLocation::from_raw(raw)
     }
 
     pub fn store(&self, object_id: ObjectId, location: DiskLocation) {
+        #[cfg(feature = "runtime_validation")]
         self.max_object_id.fetch_max(object_id, Ordering::Release);
+
         self.pt
             .get(object_id)
             .store(location.to_raw(), Ordering::Release);
@@ -27,8 +34,10 @@ impl LocationTable {
         object_id: ObjectId,
         old_location: DiskLocation,
         new_location: DiskLocation,
-    ) -> Result<DiskLocation, DiskLocation> {
+    ) -> Result<(), DiskLocation> {
+        #[cfg(feature = "runtime_validation")]
         self.max_object_id.fetch_max(object_id, Ordering::Release);
+
         self.pt
             .get(object_id)
             .compare_exchange(
@@ -37,7 +46,7 @@ impl LocationTable {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .map(|r| DiskLocation::from_raw(r).unwrap())
+            .map(|_| ())
             .map_err(|r| DiskLocation::from_raw(r).unwrap())
     }
 
@@ -46,7 +55,9 @@ impl LocationTable {
         object_id: ObjectId,
         new_location: DiskLocation,
     ) -> Result<Option<DiskLocation>, Option<DiskLocation>> {
+        #[cfg(feature = "runtime_validation")]
         self.max_object_id.fetch_max(object_id, Ordering::Release);
+
         let max_result = self
             .pt
             .get(object_id)
@@ -55,6 +66,7 @@ impl LocationTable {
         if max_result < new_location.to_raw() {
             Ok(DiskLocation::from_raw(max_result))
         } else {
+            assert_ne!(max_result, new_location.to_raw());
             Err(DiskLocation::from_raw(max_result))
         }
     }
