@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use rand::{thread_rng, Rng};
 
-use marble::Marble;
+use marble::{open, Marble};
 
 mod common;
 
@@ -42,7 +42,7 @@ fn burn_in() {
 
     let concurrency: usize = 3; //std::thread::available_parallelism().unwrap().get() * 10;
 
-    let marble = Arc::new(Marble::open("bench_data").unwrap());
+    let marble = Arc::new(open("bench_data").unwrap());
 
     let mut threads = vec![];
 
