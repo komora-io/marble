@@ -1,6 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 
+/// Configuration for configuring `Marble`.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Storage files will be kept here.
@@ -68,9 +69,5 @@ impl Config {
         }
 
         Ok(())
-    }
-
-    pub fn open(&self) -> io::Result<crate::Marble> {
-        crate::Marble::open_with_config(self.clone())
     }
 }
