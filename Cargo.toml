@@ -27,7 +27,7 @@ rand = "0.8.5"
 crc32fast = "1.3.2"
 log = "0.4.17"
 fs2 = "0.4.3"
-pagetable = { version = "0.2.5", path = "../pagetable" }
+pagetable = { version = "0.2.6" }
 fault-injection = "1.0.7"
 rand = { version = "0.8.5", optional = true }
 

@@ -1,4 +1,5 @@
 # marble
+<a href="https://docs.rs/marble"><img src="https://docs.rs/marble/badge.svg"></a>
 
 Garbage-collecting disk-based object-store. See `examples/kv.rs`
 for a minimal key-value store built on top of this.
@@ -11,7 +12,7 @@ Supports 4 methods:
 * `maintenance`: compacts backing storage files that have become fragmented. Blocks
   concurrent calls to `write_batch` but does not block readers any more than `write_batch`
   does. Returns the number of successfully rewritten objects.
-* `file_statistics`: returns statistics about live and total objects in the backing storage files.
+* `stats`: returns statistics about live and total objects in the backing storage files.
 
 Defragmentation is always generational, and will group rewritten
 objects together. Written objects can be further sharded based on a
