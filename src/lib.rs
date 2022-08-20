@@ -370,9 +370,6 @@ impl Marble {
 
     /// Read a object out of storage. If this object is
     /// unknown or has been removed, returns `Ok(None)`.
-    ///
-    /// May be called concurrently with background calls to
-    /// `maintenance` and `write_batch`.
     pub fn read(&self, object_id: ObjectId) -> io::Result<Option<Vec<u8>>> {
         let fams = self.fams.read().unwrap();
 
@@ -649,9 +646,12 @@ impl Marble {
         // 2. assign LSN and add to fams
         let mut fams = self.fams.write().unwrap();
 
+        // NB this fetch_add should always happen while fams write lock is being held
         let lsn = self.next_file_lsn.fetch_add(written_bytes + 1, SeqCst);
 
         let location = DiskLocation::new_fam(lsn);
+        log::debug!("inserting new fam at lsn {lsn} location {location:?}",);
+
         let initial_capacity = new_relative_locations.len() as u64;
 
         let fam = FileAndMetadata {
@@ -669,8 +669,6 @@ impl Marble {
             rewrite_claim: true.into(),
         };
 
-        log::debug!("inserting new fam at lsn {lsn} location {location:?}",);
-
         assert!(fams.insert(location, fam).is_none());
 
         drop(fams);
@@ -681,9 +679,6 @@ impl Marble {
 
         let mut replaced_locations: Map<DiskLocation, u64> = Default::default();
         let mut failed_installations = vec![];
-
-        #[cfg(feature = "runtime_validation")]
-        let mut debug_history = self.debug_history.lock().unwrap();
 
         for (object_id, new_relative_location) in &new_relative_locations {
             let new_location = new_relative_location.to_absolute(lsn);
@@ -734,6 +729,9 @@ impl Marble {
 
             if success {
                 #[cfg(feature = "runtime_validation")]
+                let mut debug_history = self.debug_history.lock().unwrap();
+
+                #[cfg(feature = "runtime_validation")]
                 debug_history.mark_add(*object_id, new_location);
                 if let Some(replaced_location) = replaced_location_opt {
                     #[cfg(feature = "runtime_validation")]
@@ -758,9 +756,6 @@ impl Marble {
                 failed_installations.push(*object_id);
             }
         }
-
-        #[cfg(feature = "runtime_validation")]
-        drop(debug_history);
 
         for failed_installation in &failed_installations {
             new_relative_locations.remove(failed_installation).unwrap();
@@ -852,27 +847,16 @@ impl Marble {
         debug_delay();
         assert!(fam.rewrite_claim.swap(false, SeqCst));
 
-        log::trace!(
-            "fams: {:?}",
-            fams.iter()
-                .map(|(dl, f)| (
-                    dl,
-                    f.len.load(SeqCst),
-                    f.metadata.trailer_items,
-                    f.rewrite_claim.load(SeqCst),
-                ))
-                .collect::<Vec<_>>()
-        );
-
         Ok(())
     }
 
     fn prune_empty_fams(&self) -> io::Result<()> {
         // get writer file lock and remove the empty fams
         let mut paths_to_remove = vec![];
-        let mut fams = self.fams.write().unwrap();
 
-        for (location, fam) in &*fams {
+        let read_fams = self.fams.read().unwrap();
+
+        for (location, fam) in &*read_fams {
             debug_delay();
             if fam.len.load(SeqCst) == 0 && !fam.rewrite_claim.swap(true, SeqCst) {
                 log::trace!("fam at location {location:?} is empty, marking it for removal",);
@@ -880,6 +864,9 @@ impl Marble {
             }
         }
 
+        drop(read_fams);
+
+        let mut fams = self.fams.write().unwrap();
         for (location, _) in &paths_to_remove {
             log::trace!("removing fam at location {:?}", location);
 
@@ -1144,20 +1131,22 @@ impl Marble {
 
     fn verify_file_uninhabited(
         &self,
-        location: DiskLocation,
-        fams: &Map<DiskLocation, FileAndMetadata>,
+        _location: DiskLocation,
+        _fams: &Map<DiskLocation, FileAndMetadata>,
     ) {
-        // TODO make this test-only
-        let fam = &fams[&location];
-        let next_location = DiskLocation::new_fam(location.lsn() + fam.trailer_offset);
-        let present: Vec<(ObjectId, DiskLocation)> = self
-            .location_table
-            .iter()
-            .filter(|(_oid, loc)| *loc >= location && *loc < next_location)
-            .collect();
+        #[cfg(feature = "runtime_validation")]
+        {
+            let fam = &_fams[&_location];
+            let next_location = DiskLocation::new_fam(_location.lsn() + fam.trailer_offset);
+            let present: Vec<(ObjectId, DiskLocation)> = self
+                .location_table
+                .iter()
+                .filter(|(_oid, loc)| *loc >= _location && *loc < next_location)
+                .collect();
 
-        if !present.is_empty() {
-            panic!("orphaned object location pairs in location table: {present:?}, which map to the file we're about to delete: {location:?} which is lower than the next highest location {next_location:?}");
+            if !present.is_empty() {
+                panic!("orphaned object location pairs in location table: {present:?}, which map to the file we're about to delete: {_location:?} which is lower than the next highest location {next_location:?}");
+            }
         }
     }
 }
