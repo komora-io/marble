@@ -1,77 +1,97 @@
 use std::sync::Arc;
 
-use marble::{Marble, ObjectId};
+use rand::{thread_rng, Rng};
 
-const MUL: u64 = 1;
-const KEYSPACE: u64 = 64 * 1024;
-const BATCH_SZ: usize = 1024;
-const VALUE_LEN: usize = 4096;
-const OPS: usize = 2 * 1024;
-const BATCHES: usize = OPS / BATCH_SZ;
+use marble::Marble;
 
-fn advance_lfsr(lfsr: &mut u16) {
-    let bit = ((*lfsr >> 0) ^ (*lfsr >> 2) ^ (*lfsr >> 3) ^ (*lfsr >> 5)) & 1;
-    *lfsr = (*lfsr >> 1) | (bit << 15);
-}
+const KEYSPACE: u64 = 1024 * 1024;
+const BATCH_SZ: usize = 64 * 1024;
+const VALUE_LEN: usize = 64;
+const OPS_PER_THREAD: usize = 8 * 1024 * 1024;
+const BATCHES_PER_THREAD: usize = OPS_PER_THREAD / BATCH_SZ;
 
 fn run(marble: Arc<Marble>) {
     let v = vec![0xFA; VALUE_LEN];
 
-    let mut lfsr: u16 = 0xACE1u16;
+    let mut rng = thread_rng();
 
-    for i in 0..BATCHES {
-        advance_lfsr(&mut lfsr);
-
+    for _ in 0..BATCHES_PER_THREAD {
         let mut batch = std::collections::HashMap::new();
 
-        for _ in 1..=BATCH_SZ {
-            let pid = ObjectId::new(((lfsr as u64 * MUL) % KEYSPACE).max(1)).unwrap();
+        for _ in 0..BATCH_SZ {
+            let pid = rng.gen_range(0..KEYSPACE);
             batch.insert(pid, Some(&v));
         }
 
         marble.write_batch(batch).unwrap();
-
-        if i % 16 == 0 {
-            marble.maintenance().unwrap();
-        }
     }
 }
 
 fn main() {
+    env_logger::init();
+
     let concurrency: usize = std::thread::available_parallelism().unwrap().get();
 
-    let marble = Arc::new(Marble::open("bench_data").unwrap());
+    let config = marble::Config {
+        path: "bench_data".into(),
+        fsync_each_batch: false,
+        ..Default::default()
+    };
+
+    println!("beginning recovery");
+    let marble = Arc::new(config.open().unwrap());
+    println!("marble recovered {:?}", marble.file_stats());
+    marble.maintenance().unwrap();
+    println!("post initial maintenance: {:?}", marble.file_stats());
 
     let mut threads = vec![];
 
     let before = std::time::Instant::now();
 
-    for _ in 0..concurrency {
+    for i in 0..concurrency {
         let marble = marble.clone();
-        threads.push(std::thread::spawn(move || {
-            run(marble);
-        }));
+        threads.push(
+            std::thread::Builder::new()
+                .name(format!("thread-{i}"))
+                .spawn(move || {
+                    run(marble);
+                })
+                .unwrap(),
+        )
+    }
+
+    while threads.iter().any(|t| !t.is_finished()) {
+        let cleaned_up = marble.maintenance().unwrap();
+        if cleaned_up != 0 {
+            let stats = marble.file_stats();
+            let dead_percent = (stats.dead_objects * 100) / stats.stored_objects;
+            println!(
+                "defragmented {cleaned_up} objects. stats: {stats:?} dead percent: {dead_percent}",
+            );
+        }
     }
 
     for thread in threads {
         thread.join().unwrap();
     }
 
-    let total_ops = concurrency * BATCH_SZ * BATCHES;
+    let cleaned_up = marble.maintenance().unwrap();
+    if cleaned_up != 0 {
+        println!("defragmented {} objects", cleaned_up);
+    }
+
+    let total_ops = concurrency * BATCH_SZ * BATCHES_PER_THREAD;
     let bytes_written = total_ops * VALUE_LEN;
     let fault_injection_points =
         u64::MAX - fault_injection::FAULT_INJECT_COUNTER.load(std::sync::atomic::Ordering::Acquire);
     let elapsed = before.elapsed();
     let writes_per_second = (total_ops as u128 * 1000) / elapsed.as_millis();
-    let bytes_per_second = (bytes_written as u128 / 1000) / elapsed.as_millis();
+    let megabytes_per_second = (bytes_written as u128 / 1000) / elapsed.as_millis();
+    let megabytes_written = bytes_written / 1_000_000;
+    let kb_per_value = VALUE_LEN / 1_000;
 
     println!(
-        "wrote {} mb in {:?} with {} threads ({} writes per second, {} mb per second), {} fault injection points",
-        bytes_written / 1_000_000,
-        elapsed,
-        concurrency,
-        writes_per_second,
-        bytes_per_second,
-        fault_injection_points,
+        "wrote {megabytes_written} mb in {elapsed:?} with {concurrency} threads ({writes_per_second} objects per second \
+        of size {kb_per_value} kb each, {megabytes_per_second} mb per second), {fault_injection_points} fault injection points",
     )
 }

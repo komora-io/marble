@@ -9,9 +9,11 @@ use std::collections::HashMap;
 
 use arbitrary::Arbitrary;
 
-use marble::{Config as MarbleConfig, ObjectId};
+use marble::Config as MarbleConfig;
 
 const TEST_DIR: &str = "testing_data_directories";
+
+type ObjectId = u64;
 
 #[derive(Debug)]
 struct Config(MarbleConfig);
@@ -20,7 +22,8 @@ impl<'a> Arbitrary<'a> for Config {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let path = std::path::Path::new(TEST_DIR)
             .join("fuzz")
-            .join(uuid::Uuid::new_v4().to_string()).into();
+            .join(uuid::Uuid::new_v4().to_string())
+            .into();
 
         Ok(Config(MarbleConfig {
             path,
@@ -41,7 +44,7 @@ impl<'a> Arbitrary<'a> for WriteBatch {
         let mut batch = HashMap::default();
         for _ in 0..pages {
             let pid: u64 = u.int_in_range(1..=8)?;
-            let sz: usize =  u.int_in_range(0..=9)?;
+            let sz: usize = u.int_in_range(0..=9)?;
 
             let page = if Arbitrary::arbitrary(u)? {
                 Some(vec![0b10101010; sz as usize])
@@ -49,7 +52,7 @@ impl<'a> Arbitrary<'a> for WriteBatch {
                 None
             };
 
-            batch.insert(ObjectId::new(pid).unwrap(), page);
+            batch.insert(pid, page);
         }
 
         Ok(WriteBatch(batch))
@@ -98,4 +101,3 @@ fuzz_target!(|args: (Config, Vec<Op>)| {
 
     std::fs::remove_dir_all(config.0.path).unwrap();
 });
-
