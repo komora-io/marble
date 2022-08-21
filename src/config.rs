@@ -32,9 +32,10 @@ pub struct Config {
     /// The minimum number of files within a generation to
     /// collect if below the live compaction percent.
     pub min_compaction_files: usize,
-    /// Issue fsyncs on each new file and the containing directory
-    /// when it is created. This corresponds to at least one call
-    /// to fsync for each call to `write_batch`.
+    /// Issue fsyncs on each new file and the containing
+    /// directory when it is created. This corresponds
+    /// to at least one call to fsync for each call to
+    /// `write_batch`.
     pub fsync_each_batch: bool,
 }
 

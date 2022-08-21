@@ -127,8 +127,8 @@ fn write_batches_inner(start: u32, m: Arc<Marble>) {
     }
 }
 
-/// Verifies that the keys in the tree are correctly recovered (i.e., equal).
-/// Panics if they don't match up.
+/// Verifies that the keys in the tree are correctly
+/// recovered (i.e., equal). Panics if they don't match up.
 fn verify_batches(m: &Marble) {
     let values: Vec<Option<Vec<u8>>> = (0..BATCH_SIZE as u64)
         .chain(once(u64::MAX))

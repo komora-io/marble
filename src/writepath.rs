@@ -69,7 +69,8 @@ impl Marble {
 
             let shard = shards.entry(shard_id).or_default();
 
-            // only split shards on rewrite, otherwise we lose batch atomicity
+            // only split shards on rewrite, otherwise we lose batch
+            // atomicity
             let is_rewrite = gen > 0;
             let over_size_preference = shard.0 > self.config.target_file_size;
 
@@ -206,7 +207,8 @@ impl Marble {
         // 2. assign LSN and add to fams
         let mut fams = self.fams.write().unwrap();
 
-        // NB this fetch_add should always happen while fams write lock is being held
+        // NB this fetch_add should always happen while fams write
+        // lock is being held
         let lsn = self.next_file_lsn.fetch_add(written_bytes + 1, SeqCst);
 
         let location = DiskLocation::new_fam(lsn);
@@ -242,7 +244,8 @@ impl Marble {
         let mut subtract_from_len = 0;
 
         for (object_id, new_relative_location) in &new_relative_locations {
-            // history debug must linearize with actual atomic operations below
+            // history debug must linearize with actual atomic
+            // operations below
             #[cfg(feature = "runtime_validation")]
             let mut debug_history = self.debug_history.lock().unwrap();
 
@@ -256,7 +259,10 @@ impl Marble {
 
                 match res {
                     Ok(()) => {
-                        log::trace!("cas of {object_id} from old location {old_location:?} to new location {new_location:?} successful");
+                        log::trace!(
+                            "cas of {object_id} from old location {old_location:?} to new \
+                             location {new_location:?} successful"
+                        );
 
                         #[cfg(feature = "runtime_validation")]
                         {
@@ -267,7 +273,10 @@ impl Marble {
                         replaced_locations.push((*object_id, *old_location));
                     }
                     Err(_current_opt) => {
-                        log::trace!("cas of {object_id} from old location {old_location:?} to new location {new_location:?} failed");
+                        log::trace!(
+                            "cas of {object_id} from old location {old_location:?} to new \
+                             location {new_location:?} failed"
+                        );
                         failed_gc_locations.push(*object_id);
                         subtract_from_len += 1;
                     }

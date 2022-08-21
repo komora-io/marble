@@ -73,7 +73,8 @@ fn burn_in() {
     let bytes_per_second = (bytes_written as u128 / 1000) / elapsed.as_millis();
 
     println!(
-        "wrote {} mb in {:?} with {} threads ({} writes per second, {} mb per second), {} fault injection points",
+        "wrote {} mb in {:?} with {} threads ({} writes per second, {} mb per second), {} fault \
+         injection points",
         bytes_written / 1_000_000,
         elapsed,
         concurrency,

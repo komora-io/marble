@@ -29,7 +29,11 @@ pub(crate) fn read_trailer(
     if actual_crc != expected_crc {
         return Err(annotate!(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("crc mismatch for object file trailer, expected {expected_crc} but got {actual_crc} for buffer of length {} trailer items {trailer_items}", buf.len() - 4)
+            format!(
+                "crc mismatch for object file trailer, expected {expected_crc} but got \
+                 {actual_crc} for buffer of length {} trailer items {trailer_items}",
+                buf.len() - 4
+            )
         )));
     }
 
