@@ -8,7 +8,7 @@ use fault_injection::{fallible, maybe};
 
 use crate::{
     debug_delay, hash, write_trailer, DiskLocation, FileAndMetadata, Map, Marble, Metadata,
-    ObjectId, RelativeDiskLocation, HEADER_LEN,
+    ObjectId, RelativeDiskLocation, ZstdDict, HEADER_LEN,
 };
 
 const HEAP_DIR_SUFFIX: &str = "heap";
@@ -69,7 +69,8 @@ impl Marble {
 
             let shard = shards.entry(shard_id).or_default();
 
-            // only split shards on rewrite, otherwise we lose batch atomicity
+            // only split shards on rewrite, otherwise we lose batch
+            // atomicity
             let is_rewrite = gen > 0;
             let over_size_preference = shard.0 > self.config.target_file_size;
 
@@ -137,6 +138,8 @@ impl Marble {
         let file = fallible!(file_options.open(&tmp_path));
         let mut buf_writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
 
+        let zstd_dict = ZstdDict::from_samples(&objects);
+
         let mut new_relative_locations: Map<ObjectId, RelativeDiskLocation> = Map::new();
 
         let mut written_bytes: u64 = 0;
@@ -165,14 +168,26 @@ impl Marble {
 
             let relative_address = written_bytes;
 
+            let compressed_object =
+                if let Some(zstd_compression_level) = self.config.zstd_compression_level {
+                    Some(zstd_dict.compress(raw_object, zstd_compression_level))
+                } else {
+                    None
+                };
+
             let is_delete = false;
             let relative_location = RelativeDiskLocation::new(relative_address, is_delete);
             new_relative_locations.insert(*object_id, relative_location);
 
-            let len_buf: [u8; 8] = (raw_object.len() as u64).to_le_bytes();
+            let output_object: &[u8] = compressed_object
+                .as_ref()
+                .map(AsRef::as_ref)
+                .unwrap_or(raw_object);
+
+            let len_buf: [u8; 8] = (output_object.len() as u64).to_le_bytes();
             let pid_buf: [u8; 8] = object_id.to_le_bytes();
 
-            let crc = hash(len_buf, pid_buf, &raw_object);
+            let crc = hash(len_buf, pid_buf, &output_object);
 
             log::trace!(
                 "writing object {} at offset {} with crc {:?}",
@@ -184,9 +199,9 @@ impl Marble {
             fallible!(buf_writer.write_all(&crc));
             fallible!(buf_writer.write_all(&pid_buf));
             fallible!(buf_writer.write_all(&len_buf));
-            fallible!(buf_writer.write_all(&raw_object));
+            fallible!(buf_writer.write_all(&output_object));
 
-            written_bytes += (HEADER_LEN + raw_object.len()) as u64;
+            written_bytes += (HEADER_LEN + output_object.len()) as u64;
         }
 
         assert_eq!(new_relative_locations.len(), objects.len());
@@ -206,15 +221,14 @@ impl Marble {
         // 2. assign LSN and add to fams
         let mut fams = self.fams.write().unwrap();
 
-        // NB this fetch_add should always happen while fams write lock is being held
+        // NB this fetch_add should always happen while fams write
+        // lock is being held
         let lsn = self.next_file_lsn.fetch_add(written_bytes + 1, SeqCst);
 
         let location = DiskLocation::new_fam(lsn);
         log::debug!("inserting new fam at lsn {lsn} location {location:?}",);
 
         let initial_capacity = new_relative_locations.len() as u64;
-
-        let zstd_dict_opt = None;
 
         let fam = FileAndMetadata {
             file,
@@ -229,7 +243,7 @@ impl Marble {
             // on us until we're done with our write operation.
             path: PathBuf::new(),
             rewrite_claim: true.into(),
-            zstd_dict_opt,
+            zstd_dict: zstd_dict.clone(),
         };
 
         assert!(fams.insert(location, fam).is_none());
@@ -245,7 +259,8 @@ impl Marble {
         let mut subtract_from_len = 0;
 
         for (object_id, new_relative_location) in &new_relative_locations {
-            // history debug must linearize with actual atomic operations below
+            // history debug must linearize with actual atomic
+            // operations below
             #[cfg(feature = "runtime_validation")]
             let mut debug_history = self.debug_history.lock().unwrap();
 
@@ -259,7 +274,10 @@ impl Marble {
 
                 match res {
                     Ok(()) => {
-                        log::trace!("cas of {object_id} from old location {old_location:?} to new location {new_location:?} successful");
+                        log::trace!(
+                            "cas of {object_id} from old location {old_location:?} to new \
+                             location {new_location:?} successful"
+                        );
 
                         #[cfg(feature = "runtime_validation")]
                         {
@@ -270,7 +288,10 @@ impl Marble {
                         replaced_locations.push((*object_id, *old_location));
                     }
                     Err(_current_opt) => {
-                        log::trace!("cas of {object_id} from old location {old_location:?} to new location {new_location:?} failed");
+                        log::trace!(
+                            "cas of {object_id} from old location {old_location:?} to new \
+                             location {new_location:?} failed"
+                        );
                         failed_gc_locations.push(*object_id);
                         subtract_from_len += 1;
                     }
@@ -343,13 +364,11 @@ impl Marble {
             written_bytes,
         );
 
-        let zstd_dict_opt = None;
-
         let res = write_trailer(
             &mut file_2,
             written_bytes,
             &new_relative_locations,
-            zstd_dict_opt,
+            zstd_dict,
         )
         .and_then(|_| maybe!(file_2.sync_all()))
         .and_then(|_| maybe!(fs::rename(&tmp_path, &new_path)));

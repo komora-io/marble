@@ -69,8 +69,8 @@ impl Marble {
         }
         drop(fams);
 
-        // use this old_locations Map in the outer loop to reuse the allocation
-        // and avoid resizing as often.
+        // use this old_locations Map in the outer loop to reuse the
+        // allocation and avoid resizing as often.
         let mut old_locations: Map<ObjectId, DiskLocation> = Map::new();
 
         let mut rewritten_objects = 0;
@@ -119,7 +119,8 @@ impl Marble {
                         log::warn!("corrupt object size detected: {} bytes", len);
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "corrupt object size or configured max_object_size has gone down since this object was written",
+                            "corrupt object size or configured max_object_size has gone down \
+                             since this object was written",
                         ));
                     }
 
@@ -144,7 +145,8 @@ impl Marble {
 
                     if crc_expected != crc_actual {
                         log::error!(
-                            "crc mismatch when reading object {} at offset {} in file {:?} - expected {:?} actual {:?}",
+                            "crc mismatch when reading object {} at offset {} in file {:?} - \
+                             expected {:?} actual {:?}",
                             object_id,
                             offset,
                             path,
@@ -159,11 +161,18 @@ impl Marble {
 
                     if rewritten_location == current_location {
                         // can attempt to rewrite
-                        log::trace!("rewriting object {object_id} at rewritten location {rewritten_location:?}");
+                        log::trace!(
+                            "rewriting object {object_id} at rewritten location \
+                             {rewritten_location:?}"
+                        );
                         batch.insert(object_id, Some(object_buf));
                         old_locations.insert(object_id, rewritten_location);
                     } else {
-                        log::trace!("not rewriting object {object_id}, as the location being defragmented {rewritten_location:?} does not match the current location in the location table {current_location:?}");
+                        log::trace!(
+                            "not rewriting object {object_id}, as the location being defragmented \
+                             {rewritten_location:?} does not match the current location in the \
+                             location table {current_location:?}"
+                        );
                     }
 
                     offset += (HEADER_LEN + len) as u64;
@@ -172,7 +181,8 @@ impl Marble {
                 let mut file: File = buf_reader.into_inner();
 
                 log::trace!(
-                    "trying to read trailer at file for lsn {} offset {trailer_offset} items {trailer_items}",
+                    "trying to read trailer at file for lsn {} offset {trailer_offset} items \
+                     {trailer_items}",
                     base_location.lsn(),
                 );
 
@@ -189,11 +199,18 @@ impl Marble {
 
                         if rewritten_location == current_location {
                             // can attempt to rewrite
-                            log::trace!("rewriting object {object_id} at rewritten location {rewritten_location:?}");
+                            log::trace!(
+                                "rewriting object {object_id} at rewritten location \
+                                 {rewritten_location:?}"
+                            );
                             batch.insert(object_id, None);
                             old_locations.insert(object_id, rewritten_location);
                         } else {
-                            log::trace!("not rewriting object {object_id}, as the location being defragmented {rewritten_location:?} does not match the current location in the location table {current_location:?}");
+                            log::trace!(
+                                "not rewriting object {object_id}, as the location being \
+                                 defragmented {rewritten_location:?} does not match the current \
+                                 location in the location table {current_location:?}"
+                            );
                         }
                     }
                 }
@@ -210,7 +227,10 @@ impl Marble {
             for location in rewritten_fam_locations {
                 self.verify_file_uninhabited(location, &fams);
                 //let fam = &fams[&location];
-                //assert_eq!(fam.len.load(SeqCst), 0, "bug with length tracking, because we have verified that this file is actually uninhabited: fam: {fam:?}")
+                //assert_eq!(fam.len.load(SeqCst), 0, "bug
+                // with length tracking, because we have
+                // verified that this file is actually
+                // uninhabited: fam: {fam:?}")
             }
         }
 

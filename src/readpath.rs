@@ -45,17 +45,23 @@ impl Marble {
             ));
         };
 
-        let mut object_buf = Vec::with_capacity(len);
+        let mut compressed_buf = Vec::with_capacity(len);
         unsafe {
-            object_buf.set_len(len);
+            compressed_buf.set_len(len);
         }
 
         let object_offset = file_offset + HEADER_LEN as u64;
-        fallible!(fam.file.read_exact_at(&mut object_buf, object_offset));
+        fallible!(fam.file.read_exact_at(&mut compressed_buf, object_offset));
+
+        let decompressed_buf = if self.config.zstd_compression_level.is_some() {
+            Some(fam.zstd_dict.decompress(&compressed_buf))
+        } else {
+            None
+        };
 
         drop(fams);
 
-        let crc_actual = hash(len_buf, pid_buf, &object_buf);
+        let crc_actual = hash(len_buf, pid_buf, &compressed_buf);
 
         if crc_expected != crc_actual {
             log::warn!(
@@ -73,6 +79,6 @@ impl Marble {
 
         assert_eq!(object_id, read_pid);
 
-        Ok(Some(object_buf))
+        Ok(Some(decompressed_buf.unwrap_or(compressed_buf)))
     }
 }

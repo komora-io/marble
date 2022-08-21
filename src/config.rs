@@ -6,6 +6,17 @@ use std::path::PathBuf;
 pub struct Config {
     /// Storage files will be kept here.
     pub path: PathBuf,
+    /// The compression level to use when compressing each
+    /// batch of objects. A value of `None` disables
+    /// compression. This is one of the most important
+    /// parameters to experiment with while finding an
+    /// appropriate configuration for your system.
+    pub zstd_compression_level: Option<i32>,
+    /// Issue fsyncs on each new file and the containing
+    /// directory when it is created. This corresponds
+    /// to at least one call to fsync for each call to
+    /// `write_batch`.
+    pub fsync_each_batch: bool,
     /// Garbage collection will try to keep storage
     /// files around this size or smaller.
     pub target_file_size: usize,
@@ -32,10 +43,6 @@ pub struct Config {
     /// The minimum number of files within a generation to
     /// collect if below the live compaction percent.
     pub min_compaction_files: usize,
-    /// Issue fsyncs on each new file and the containing directory
-    /// when it is created. This corresponds to at least one call
-    /// to fsync for each call to `write_batch`.
-    pub fsync_each_batch: bool,
 }
 
 impl Default for Config {
@@ -48,6 +55,7 @@ impl Default for Config {
             max_object_size: 16 * 1024 * 1024 * 1024, /* 16gb */
             min_compaction_files: 2,
             fsync_each_batch: false,
+            zstd_compression_level: Some(3),
         }
     }
 }

@@ -11,7 +11,7 @@ pub(crate) fn read_trailer(
     file: &File,
     trailer_offset: u64,
     trailer_items: u64,
-) -> io::Result<(Vec<(ObjectId, RelativeDiskLocation)>, Option<ZstdDict>)> {
+) -> io::Result<(Vec<(ObjectId, RelativeDiskLocation)>, ZstdDict)> {
     let trailer_size = usize::try_from(4 + (trailer_items * 16)).unwrap();
 
     let mut buf = Vec::with_capacity(trailer_size);
@@ -29,7 +29,11 @@ pub(crate) fn read_trailer(
     if actual_crc != expected_crc {
         return Err(annotate!(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("crc mismatch for object file trailer, expected {expected_crc} but got {actual_crc} for buffer of length {} trailer items {trailer_items}", buf.len() - 4)
+            format!(
+                "crc mismatch for object file trailer, expected {expected_crc} but got \
+                 {actual_crc} for buffer of length {} trailer items {trailer_items}",
+                buf.len() - 4
+            )
         )));
     }
 
@@ -43,16 +47,18 @@ pub(crate) fn read_trailer(
         ret.push((object_id, relative_loc));
     }
 
-    let zstd_dict_opt = None;
+    let zstd_dict_buf = None;
 
-    Ok((ret, zstd_dict_opt))
+    let zstd_dict = ZstdDict(zstd_dict_buf);
+
+    Ok((ret, zstd_dict))
 }
 
 pub(crate) fn write_trailer<'a>(
     file: &mut File,
     offset: u64,
     new_shifted_relative_locations: &Map<ObjectId, RelativeDiskLocation>,
-    zstd_dict_opt: Option<ZstdDict>,
+    zstd_dict: ZstdDict,
 ) -> io::Result<()> {
     // space for overall crc + each (object_id, location) pair
     let mut buf = Vec::with_capacity(4 + (new_shifted_relative_locations.len() * 16));

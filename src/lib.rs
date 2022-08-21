@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fmt;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -23,26 +22,18 @@ mod readpath;
 mod recovery;
 mod trailer;
 mod writepath;
+mod zstd_dict;
 
 pub use config::Config;
 use debug_delay::debug_delay;
 use disk_location::{DiskLocation, RelativeDiskLocation};
 use location_table::LocationTable;
 use trailer::{read_trailer, write_trailer};
+use zstd_dict::ZstdDict;
 
 const HEADER_LEN: usize = 20;
 
 type ObjectId = u64;
-
-struct ZstdDict(Vec<u8>);
-
-impl fmt::Debug for ZstdDict {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ZstdDict")
-            .field("size", &self.0.len())
-            .finish()
-    }
-}
 
 fn hash(len_buf: [u8; 8], pid_buf: [u8; 8], object_buf: &[u8]) -> [u8; 4] {
     let mut hasher = crc32fast::Hasher::new();
@@ -109,7 +100,7 @@ struct FileAndMetadata {
     generation: u8,
     rewrite_claim: AtomicBool,
     synced: AtomicBool,
-    zstd_dict_opt: Option<ZstdDict>,
+    zstd_dict: ZstdDict,
 }
 
 /// Shard based on rough size ranges corresponding to SSD
@@ -133,7 +124,8 @@ pub fn default_partition_function(_object_id: u64, size: usize) -> u8 {
     }
 }
 
-/// Open the system with default configuration at the provided path.
+/// Open the system with default configuration at the
+/// provided path.
 pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Marble> {
     let config = Config {
         path: path.as_ref().into(),
@@ -219,9 +211,10 @@ impl Marble {
 
         Ok(())
     }
-    /// If `Config::fsync_each_batch` is `false`, this method can
-    /// be called at a desired interval to ensure that the written
-    /// batches are durable on disk.
+    /// If `Config::fsync_each_batch` is `false`, this
+    /// method can be called at a desired interval to
+    /// ensure that the written batches are durable on
+    /// disk.
     pub fn sync_all(&self) -> io::Result<()> {
         let fams = self.fams.read().unwrap();
 
@@ -257,7 +250,11 @@ impl Marble {
                 .collect();
 
             if !present.is_empty() {
-                panic!("orphaned object location pairs in location table: {present:?}, which map to the file we're about to delete: {_location:?} which is lower than the next highest location {next_location:?}");
+                panic!(
+                    "orphaned object location pairs in location table: {present:?}, which map to \
+                     the file we're about to delete: {_location:?} which is lower than the next \
+                     highest location {next_location:?}"
+                );
             }
         }
     }

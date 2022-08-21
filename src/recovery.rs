@@ -57,7 +57,7 @@ impl Config {
 
             let mut file = fallible!(options.open(entry.path()));
 
-            let (trailer, zstd_dict_opt) =
+            let (trailer, zstd_dict) =
                 read_trailer(&mut file, trailer_offset, metadata.trailer_items)?;
 
             for (object_id, relative_loc) in trailer {
@@ -90,7 +90,7 @@ impl Config {
                 generation: metadata.generation,
                 rewrite_claim: false.into(),
                 synced: true.into(),
-                zstd_dict_opt,
+                zstd_dict,
             };
 
             log::debug!("inserting new fam at location {:?}", file_location);

@@ -2,9 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{DiskLocation, ObjectId};
 
-/// `DebugHistory` asserts that when objects are added to new files
-/// and marked as removed from old ones, that the operation is unique
-/// and that removals only happen for things that were already added.
+/// `DebugHistory` asserts that when objects are added to
+/// new files and marked as removed from old ones, that the
+/// operation is unique and that removals only happen for
+/// things that were already added.
 #[derive(Default, Debug)]
 pub struct DebugHistory {
     adds: HashMap<ObjectId, HashSet<DiskLocation>>,
