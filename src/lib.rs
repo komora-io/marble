@@ -9,7 +9,7 @@ use std::sync::{
 
 use fault_injection::fallible;
 
-type Map<K, V> = std::collections::BTreeMap<K, V>;
+type Map<K, V> = std::collections::HashMap<K, V>;
 
 mod config;
 mod debug_delay;
@@ -121,7 +121,8 @@ pub fn default_partition_function(_object_id: u64, size: usize) -> u8 {
     }
 }
 
-/// Open the system with default configuration at the provided path.
+/// Open the system with default configuration at the
+/// provided path.
 pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Marble> {
     let config = Config {
         path: path.as_ref().into(),
@@ -207,9 +208,10 @@ impl Marble {
 
         Ok(())
     }
-    /// If `Config::fsync_each_batch` is `false`, this method can
-    /// be called at a desired interval to ensure that the written
-    /// batches are durable on disk.
+    /// If `Config::fsync_each_batch` is `false`, this
+    /// method can be called at a desired interval to
+    /// ensure that the written batches are durable on
+    /// disk.
     pub fn sync_all(&self) -> io::Result<()> {
         let fams = self.fams.read().unwrap();
 
@@ -232,7 +234,7 @@ impl Marble {
     fn verify_file_uninhabited(
         &self,
         _location: DiskLocation,
-        _fams: &Map<DiskLocation, FileAndMetadata>,
+        _fams: &BTreeMap<DiskLocation, FileAndMetadata>,
     ) {
         #[cfg(feature = "runtime_validation")]
         {
@@ -245,7 +247,11 @@ impl Marble {
                 .collect();
 
             if !present.is_empty() {
-                panic!("orphaned object location pairs in location table: {present:?}, which map to the file we're about to delete: {_location:?} which is lower than the next highest location {next_location:?}");
+                panic!(
+                    "orphaned object location pairs in location table: {present:?}, which map to \
+                     the file we're about to delete: {_location:?} which is lower than the next \
+                     highest location {next_location:?}"
+                );
             }
         }
     }

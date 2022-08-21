@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::ops::Bound::{Included, Unbounded};
@@ -43,7 +44,7 @@ impl Config {
         let directory_lock = fallible!(File::open(config.path.join(HEAP_DIR_SUFFIX)));
         fallible!(directory_lock.try_lock_exclusive());
 
-        let mut fams = Map::new();
+        let mut fams = BTreeMap::new();
         let mut max_file_lsn = 0;
         let mut max_file_size = 0;
 
