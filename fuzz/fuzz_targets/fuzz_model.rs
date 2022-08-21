@@ -15,8 +15,6 @@ const TEST_DIR: &str = "testing_data_directories";
 const KEYSPACE: u64 = 64;
 const BATCH_MIN_SZ: usize = 0;
 const BATCH_MAX_SZ: usize = 16;
-const VAL_MIN_SZ: usize = 0;
-const VAL_MAX_SZ: usize = 1;
 
 type ObjectId = u64;
 
