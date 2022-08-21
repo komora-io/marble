@@ -26,6 +26,10 @@ impl ZstdDict {
         for value_opt in samples.values().filter(|v_opt| v_opt.is_some()) {
             let value: &[u8] = value_opt.as_ref().unwrap().as_ref();
 
+            if value.is_empty() {
+                continue;
+            }
+
             sizes.push(value.len());
             total_size += value.len();
         }
@@ -33,14 +37,19 @@ impl ZstdDict {
         let mut buffer = Vec::with_capacity(total_size);
         for value_opt in samples.values().filter(|v_opt| v_opt.is_some()) {
             let value: &[u8] = value_opt.as_ref().unwrap().as_ref();
+
+            if value.is_empty() {
+                continue;
+            }
+
             buffer.extend_from_slice(value.as_ref());
         }
 
         assert_eq!(sizes.iter().sum::<usize>(), buffer.len());
 
-        let max_size = 128 * 1024; //(total_size / 100).min(128 * 1024).max(50000);
+        let max_size = (total_size / 100).min(128 * 1024).max(4096);
 
-        let mut dict_buf = vec![0; max_size];
+        let mut dict_buf = Vec::with_capacity(max_size);
 
         match zstd_safe::train_from_buffer(&mut dict_buf, &buffer, &sizes) {
             Ok(len) => {
