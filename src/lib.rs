@@ -9,7 +9,7 @@ use std::sync::{
 
 use fault_injection::fallible;
 
-type Map<K, V> = std::collections::BTreeMap<K, V>;
+type Map<K, V> = std::collections::HashMap<K, V>;
 
 mod config;
 mod debug_delay;
@@ -237,7 +237,7 @@ impl Marble {
     fn verify_file_uninhabited(
         &self,
         _location: DiskLocation,
-        _fams: &Map<DiskLocation, FileAndMetadata>,
+        _fams: &BTreeMap<DiskLocation, FileAndMetadata>,
     ) {
         #[cfg(feature = "runtime_validation")]
         {

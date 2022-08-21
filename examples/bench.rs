@@ -10,7 +10,7 @@ const VALUE_LEN: usize = 64;
 const OPS_PER_THREAD: usize = 8 * 1024 * 1024;
 const BATCHES_PER_THREAD: usize = OPS_PER_THREAD / BATCH_SZ;
 
-fn run(marble: Arc<Marble>) {
+fn run_writer(marble: Arc<Marble>) {
     let v = vec![0xFA; VALUE_LEN];
 
     let mut rng = thread_rng();
@@ -24,6 +24,15 @@ fn run(marble: Arc<Marble>) {
         }
 
         marble.write_batch(batch).unwrap();
+    }
+}
+
+fn run_reader(marble: Arc<Marble>) {
+    let mut rng = thread_rng();
+
+    for _ in 0..(BATCH_SZ * BATCHES_PER_THREAD) {
+        let pid = rng.gen_range(0..KEYSPACE);
+        marble.read(pid).unwrap();
     }
 }
 
@@ -49,15 +58,27 @@ fn main() {
     let before = std::time::Instant::now();
 
     for i in 0..concurrency {
+        {
+            let marble = marble.clone();
+            threads.push(
+                std::thread::Builder::new()
+                    .name(format!("writer-{i}"))
+                    .spawn(move || {
+                        run_writer(marble);
+                    })
+                    .unwrap(),
+            );
+        }
+
         let marble = marble.clone();
         threads.push(
             std::thread::Builder::new()
-                .name(format!("thread-{i}"))
+                .name(format!("reader-{i}"))
                 .spawn(move || {
-                    run(marble);
+                    run_reader(marble);
                 })
                 .unwrap(),
-        )
+        );
     }
 
     while threads.iter().any(|t| !t.is_finished()) {
@@ -91,7 +112,8 @@ fn main() {
     let kb_per_value = VALUE_LEN / 1_000;
 
     println!(
-        "wrote {megabytes_written} mb in {elapsed:?} with {concurrency} threads ({writes_per_second} objects per second \
-        of size {kb_per_value} kb each, {megabytes_per_second} mb per second), {fault_injection_points} fault injection points",
+        "wrote {megabytes_written} mb in {elapsed:?} with {concurrency} threads \
+         ({writes_per_second} objects per second of size {kb_per_value} kb each, \
+         {megabytes_per_second} mb per second), {fault_injection_points} fault injection points",
     )
 }
