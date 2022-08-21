@@ -12,6 +12,11 @@ use arbitrary::Arbitrary;
 use marble::Config as MarbleConfig;
 
 const TEST_DIR: &str = "testing_data_directories";
+const KEYSPACE: u64 = 64;
+const BATCH_MIN_SZ: usize = 0;
+const BATCH_MAX_SZ: usize = 16;
+const VAL_MIN_SZ: usize = 0;
+const VAL_MAX_SZ: usize = 1;
 
 type ObjectId = u64;
 
@@ -27,8 +32,8 @@ impl<'a> Arbitrary<'a> for Config {
 
         Ok(Config(MarbleConfig {
             path,
-            target_file_size: u.int_in_range(1..=16384)?,
-            file_compaction_percent: u.int_in_range(0..=99)?,
+            target_file_size: u.int_in_range(1..=16384).unwrap_or(1),
+            file_compaction_percent: u.int_in_range(0..=99).unwrap_or(0),
             ..Default::default()
         }))
     }
@@ -39,14 +44,16 @@ struct WriteBatch(HashMap<ObjectId, Option<Vec<u8>>>);
 
 impl<'a> Arbitrary<'a> for WriteBatch {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let pages: usize = u.int_in_range(1..=5)?;
+        let pages: usize = u
+            .int_in_range(BATCH_MIN_SZ..=BATCH_MAX_SZ)
+            .unwrap_or(BATCH_MIN_SZ);
 
         let mut batch = HashMap::default();
         for _ in 0..pages {
-            let pid: u64 = u.int_in_range(1..=8)?;
+            let pid: u64 = u.int_in_range(0..=KEYSPACE).unwrap_or(0);
 
-            let page = if Arbitrary::arbitrary(u)? {
-                Some(Arbitrary::arbitrary(u)?)
+            let page = if Arbitrary::arbitrary(u).unwrap_or(false) {
+                Some(Arbitrary::arbitrary(u).unwrap_or(vec![]))
             } else {
                 None
             };

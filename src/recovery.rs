@@ -52,23 +52,24 @@ impl Config {
 
         let files = read_storage_directory(heap_dir)?;
 
-        for (metadata, trailer_offset, entry) in files {
+        for (metadata, entry) in files {
             let mut options = OpenOptions::new();
             options.read(true);
 
             let mut file = fallible!(options.open(entry.path()));
 
-            let (trailer, zstd_dict) =
-                read_trailer(&mut file, trailer_offset, metadata.trailer_items)?;
+            let (trailer, zstd_dict) = read_trailer(&mut file, metadata.trailer_offset)?;
 
             for (object_id, relative_loc) in trailer {
                 // add file base LSN to relative offset
                 let location = relative_loc.to_absolute(metadata.lsn);
 
+                log::trace!("inserting object_id {object_id} at location {location:?}");
                 if let Some(old) = recovery_page_table.insert(object_id, location) {
                     assert!(
                         old < location,
-                        "must always apply locations in monotonic order"
+                        "must always apply locations in monotonic order. old {old:?} should be < \
+                         new {location:?}"
                     );
                 }
             }
@@ -79,12 +80,9 @@ impl Config {
 
             let file_location = DiskLocation::new_fam(metadata.lsn);
 
-            assert_ne!(metadata.trailer_items, 0);
-
             let fam = FileAndMetadata {
                 len: 0.into(),
                 metadata: metadata,
-                trailer_offset,
                 path: entry.path().into(),
                 file,
                 location: file_location,
@@ -128,7 +126,7 @@ impl Config {
     }
 }
 
-fn read_storage_directory(heap_dir: PathBuf) -> io::Result<Vec<(Metadata, u64, fs::DirEntry)>> {
+fn read_storage_directory(heap_dir: PathBuf) -> io::Result<Vec<(Metadata, fs::DirEntry)>> {
     let mut files = vec![];
     // parse file names
     for entry_res in fallible!(fs::read_dir(heap_dir)) {
@@ -164,13 +162,10 @@ fn read_storage_directory(heap_dir: PathBuf) -> io::Result<Vec<(Metadata, u64, f
             }
         };
 
-        let file_len = fallible!(entry.metadata()).len();
-        let trailer_offset = file_len as u64 - (4 + (metadata.trailer_items * 16));
-
-        files.push((metadata, trailer_offset, entry));
+        files.push((metadata, entry));
     }
 
-    files.sort_by_key(|(metadata, _, _)| metadata.lsn);
+    files.sort_by_key(|(metadata, _)| metadata.lsn);
 
     Ok(files)
 }

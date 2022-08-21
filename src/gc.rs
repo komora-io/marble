@@ -31,10 +31,10 @@ impl Marble {
         for (location, fam) in &*fams {
             assert_eq!(*location, fam.location);
             let len = fam.len.load(SeqCst);
-            let trailer_items = fam.metadata.trailer_items;
+            let present_objects = fam.metadata.present_objects;
 
             if len != 0
-                && (len * 100) / trailer_items.max(1)
+                && (len * 100) / present_objects.max(1)
                     < u64::from(self.config.file_compaction_percent)
             {
                 debug_delay();
@@ -46,7 +46,7 @@ impl Marble {
                     // rewriting its contents
                     continue;
                 }
-                assert_ne!(trailer_items, 0);
+                assert_ne!(present_objects, 0);
 
                 defer_unclaim.claims.push(*location);
 
@@ -62,8 +62,7 @@ impl Marble {
                     *location,
                     fam.path.clone(),
                     fam.file.try_clone()?,
-                    fam.trailer_offset,
-                    trailer_items,
+                    fam.metadata.trailer_offset,
                 ));
             }
         }
@@ -92,7 +91,7 @@ impl Marble {
             let mut batch = Map::new();
             let mut rewritten_fam_locations = vec![];
 
-            for (base_location, path, mut file, trailer_offset, trailer_items) in file_to_defrag {
+            for (base_location, path, mut file, trailer_offset) in file_to_defrag {
                 log::trace!(
                     "rewriting any surviving objects in file at location {base_location:?}"
                 );
@@ -181,13 +180,11 @@ impl Marble {
                 let mut file: File = buf_reader.into_inner();
 
                 log::trace!(
-                    "trying to read trailer at file for lsn {} offset {trailer_offset} items \
-                     {trailer_items}",
+                    "trying to read trailer at file for lsn {} offset {trailer_offset} items",
                     base_location.lsn(),
                 );
 
-                let (trailer, _zstd_dict_opt) =
-                    read_trailer(&mut file, trailer_offset, trailer_items)?;
+                let (trailer, _zstd_dict_opt) = read_trailer(&mut file, trailer_offset)?;
 
                 for (object_id, relative_location) in trailer {
                     if relative_location.is_delete() {

@@ -2,6 +2,11 @@ use std::fmt;
 
 use crate::{Map, ObjectId};
 
+fn zstd_error(errno: usize) -> std::io::Error {
+    let name = zstd_safe::get_error_name(errno);
+    std::io::Error::new(std::io::ErrorKind::Other, name.to_string())
+}
+
 #[derive(Clone)]
 pub(crate) struct ZstdDict(pub(crate) Option<Vec<u8>>);
 
@@ -31,20 +36,33 @@ impl ZstdDict {
             buffer.extend_from_slice(value.as_ref());
         }
 
-        let max_size = (total_size / 100).min(128 * 1024).max(512);
+        let max_size = (total_size / 100).min(128 * 1024).max(256);
 
-        if let Ok(dict_buf) = zstd::dict::from_continuous(&buffer, &sizes, max_size) {
-            ZstdDict(Some(dict_buf))
-        } else {
-            ZstdDict(None)
+        let mut dict_buf = Vec::with_capacity(max_size);
+
+        match zstd_safe::train_from_buffer(&mut dict_buf, &buffer, &sizes) {
+            Ok(len) => {
+                assert_eq!(len, dict_buf.len());
+                dict_buf.shrink_to_fit();
+                ZstdDict(Some(dict_buf))
+            }
+            Err(e) => {
+                log::trace!(
+                    "failed to create dictionary for write batch: {}",
+                    zstd_error(e)
+                );
+                ZstdDict(None)
+            }
         }
     }
 
     pub(crate) fn decompress(&self, buf: &[u8]) -> Vec<u8> {
         if let Some(dict_buffer) = &self.0 {
-            let mut out = vec![];
+            let exact_size = usize::try_from(zstd_safe::find_decompressed_size(buf)).unwrap();
+            let mut out = Vec::with_capacity(exact_size);
             let mut cx = zstd_safe::DCtx::create();
             cx.decompress_using_dict(&mut out, buf, &dict_buffer)
+                .map_err(zstd_error)
                 .unwrap();
             out
         } else {
@@ -54,21 +72,23 @@ impl ZstdDict {
 
     pub(crate) fn compress(&self, buf: &[u8], level: i32) -> Vec<u8> {
         if let Some(dict_buffer) = &self.0 {
-            let mut out = Vec::with_capacity(buf.len().max(128));
+            let mut out = Vec::with_capacity(zstd_safe::compress_bound(buf.len()));
             let mut cx = zstd_safe::CCtx::create();
 
-            fn map_error_code(code: usize) -> std::io::Error {
-                let msg = zstd_safe::get_error_name(code);
-                std::io::Error::new(std::io::ErrorKind::Other, msg.to_string())
-            }
-
             cx.compress_using_dict(&mut out, buf, &dict_buffer, level)
-                .map_err(map_error_code)
+                .map_err(zstd_error)
                 .unwrap();
             out
         } else {
-            panic!();
             buf.to_vec()
+        }
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        if let Some(dict_buffer) = &self.0 {
+            &dict_buffer
+        } else {
+            &[]
         }
     }
 }

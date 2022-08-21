@@ -227,3 +227,67 @@ fn test_08() {
         marble.maintenance().unwrap();
     });
 }
+
+#[test]
+fn test_09() {
+    with_default_instance(|config, mut marble| {
+        // high entropy, should be very low compression
+        let big_value: Vec<u8> = (0..1024 * 1024).map(|_| rand::random::<u8>()).collect();
+        let big_slice: &[u8] = &big_value;
+        marble
+            .write_batch::<&[u8], _>(
+                [
+                    (1_u64, Some(big_slice)),
+                    (2_u64, Some(big_slice)),
+                    (3_u64, Some(big_slice)),
+                    (4_u64, Some(big_slice)),
+                    (5_u64, Some(big_slice)),
+                    (6_u64, Some(big_slice)),
+                    (7_u64, Some(big_slice)),
+                    (8_u64, Some(big_slice)),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+
+        assert_eq!(marble.read(1).unwrap().unwrap(), big_slice);
+
+        marble = restart(config, marble);
+
+        assert_eq!(marble.read(1).unwrap().unwrap(), big_slice);
+
+        marble.maintenance().unwrap();
+    });
+}
+
+#[test]
+fn test_10() {
+    with_default_instance(|config, mut marble| {
+        // low entropy, should be very high compression
+        let big_value = vec![0xFA; 1024 * 1024];
+        let big_slice: &[u8] = &big_value;
+        marble
+            .write_batch::<&[u8], _>(
+                [
+                    (1_u64, Some(big_slice)),
+                    (2_u64, Some(big_slice)),
+                    (3_u64, Some(big_slice)),
+                    (4_u64, Some(big_slice)),
+                    (5_u64, Some(big_slice)),
+                    (6_u64, Some(big_slice)),
+                    (7_u64, Some(big_slice)),
+                    (8_u64, Some(big_slice)),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+
+        assert_eq!(marble.read(1).unwrap().unwrap(), big_slice);
+
+        marble = restart(config, marble);
+
+        assert_eq!(marble.read(1).unwrap().unwrap(), big_slice);
+
+        marble.maintenance().unwrap();
+    });
+}

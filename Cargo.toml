@@ -31,8 +31,7 @@ fs2 = "0.4.3"
 pagetable = { version = "0.2.6" }
 fault-injection = "1.0.7"
 rand = { version = "0.8.5", optional = true }
-zstd = { version = "0.11.2", features = ["zdict_builder"] }
-zstd-safe = "5.0.2"
+zstd-safe = { version="5.0.2", features=["std", "experimental"] }
 
 [[bench]]
 name = "marble_bench"

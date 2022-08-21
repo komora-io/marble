@@ -233,7 +233,6 @@ impl Marble {
         let fam = FileAndMetadata {
             file,
             metadata: Metadata::default(),
-            trailer_offset: written_bytes,
             len: initial_capacity.into(),
             generation,
             location,
@@ -351,7 +350,7 @@ impl Marble {
         // 5. write trailer then rename file
         let metadata = Metadata {
             lsn,
-            trailer_items: trailer_items as u64,
+            trailer_offset: written_bytes,
             present_objects: objects.len() as u64,
             generation,
         };
@@ -368,13 +367,18 @@ impl Marble {
             &mut file_2,
             written_bytes,
             &new_relative_locations,
-            zstd_dict,
+            &zstd_dict,
         )
         .and_then(|_| maybe!(file_2.sync_all()))
         .and_then(|_| maybe!(fs::rename(&tmp_path, &new_path)));
 
         let file_len = fallible!(file_2.metadata()).len();
-        let expected_file_len = written_bytes + 4 + (16 * new_relative_locations.len() as u64);
+        let expected_file_len = written_bytes
+            + 4
+            + 8
+            + 8
+            + (16 * new_relative_locations.len() as u64)
+            + zstd_dict.as_bytes().len() as u64;
 
         assert_eq!(file_len, expected_file_len);
         assert_eq!(trailer_items, new_relative_locations.len());
@@ -429,7 +433,6 @@ impl Marble {
 
         let fam = fams.get_mut(&location).unwrap();
         fam.metadata = metadata;
-        assert_ne!(fam.metadata.trailer_items, 0);
         let old = fam.len.fetch_sub(subtract_from_len, SeqCst);
 
         assert!(

@@ -17,7 +17,7 @@ const BATCHES_DIR: &str = "crash_batches";
 const TESTS: &[(&str, fn())] = &[(BATCHES_DIR, crash_batches)];
 
 const TEST_ENV_VAR: &str = "SLED_CRASH_TEST";
-const N_TESTS: usize = 64 * 128;
+const N_TESTS: usize = 64;
 const BATCH_SIZE: u32 = 13;
 const CRASH_CHANCE: u32 = 250;
 
@@ -104,7 +104,7 @@ fn run_crash_batches() {
 
     for thread in threads.into_iter() {
         if let Err(e) = thread.join() {
-            println!("worker thread failed: {:?}", e);
+            log::error!("worker thread failed: {:?}", e);
             std::process::exit(15);
         }
     }
@@ -138,12 +138,14 @@ fn verify_batches(m: &Marble) {
         })
         .collect();
     let equal = values.windows(2).all(|w| w[0] == w[1]);
-    println!("values: {:?}", values);
+    log::debug!("values: {:?}", values);
 
     assert!(equal, "values not equal: {:?}", values);
 }
 
 fn main() {
+    common::setup_logger();
+
     match env::var(TEST_ENV_VAR) {
         Err(VarError::NotPresent) => {
             let filtered: Vec<(&'static str, fn())> = if let Some(filter) = std::env::args().nth(1)
@@ -159,8 +161,7 @@ fn main() {
 
             let filtered_len = filtered.len();
 
-            println!();
-            println!(
+            log::info!(
                 "running {} test{}",
                 filtered.len(),
                 if filtered.len() == 1 { "" } else { "s" },
@@ -170,7 +171,7 @@ fn main() {
             for (test_name, test_fn) in filtered.into_iter() {
                 let test = thread::spawn(move || {
                     let res = std::panic::catch_unwind(test_fn);
-                    println!(
+                    log::info!(
                         "test {} ... {}",
                         test_name,
                         if res.is_ok() { "ok" } else { "panicked" }
@@ -184,13 +185,11 @@ fn main() {
                 test.join().unwrap();
             }
 
-            println!();
-            println!(
+            log::info!(
                 "test result: ok. {} passed; {} filtered out",
                 filtered_len,
                 TESTS.len() - filtered_len,
             );
-            println!();
         }
 
         Ok(ref s) if s == BATCHES_DIR => run_crash_batches(),
