@@ -291,3 +291,27 @@ fn test_10() {
         marble.maintenance().unwrap();
     });
 }
+
+#[test]
+fn test_11() {
+    with_default_instance(|_config, marble| {
+        marble.write_batch::<&[u8], _>([].into_iter()).unwrap();
+
+        marble
+            .write_batch::<&[u8], _>(
+                [
+                    (1_u64, Some(&[] as &[u8])),
+                    (2_u64, Some(&[])),
+                    (3_u64, Some(&[])),
+                    (4_u64, None),
+                    (5_u64, Some(&[0])),
+                    (6_u64, Some(&[252])),
+                    (7_u64, None),
+                    (8_u64, Some(&[])),
+                    (9_u64, Some(&[255, 255, 35, 255, 2, 14])),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+    });
+}

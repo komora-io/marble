@@ -36,9 +36,11 @@ impl ZstdDict {
             buffer.extend_from_slice(value.as_ref());
         }
 
-        let max_size = (total_size / 100).min(128 * 1024).max(256);
+        assert_eq!(sizes.iter().sum::<usize>(), buffer.len());
 
-        let mut dict_buf = Vec::with_capacity(max_size);
+        let max_size = 128 * 1024; //(total_size / 100).min(128 * 1024).max(50000);
+
+        let mut dict_buf = vec![0; max_size];
 
         match zstd_safe::train_from_buffer(&mut dict_buf, &buffer, &sizes) {
             Ok(len) => {
