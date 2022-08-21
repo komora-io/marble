@@ -44,10 +44,9 @@ impl<'a> Arbitrary<'a> for WriteBatch {
         let mut batch = HashMap::default();
         for _ in 0..pages {
             let pid: u64 = u.int_in_range(1..=8)?;
-            let sz: usize = u.int_in_range(0..=9)?;
 
             let page = if Arbitrary::arbitrary(u)? {
-                Some(vec![0b10101010; sz as usize])
+                Some(Arbitrary::arbitrary(u)?)
             } else {
                 None
             };
