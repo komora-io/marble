@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,16 @@ use trailer::{read_trailer, write_trailer};
 const HEADER_LEN: usize = 20;
 
 type ObjectId = u64;
+
+struct ZstdDict(Vec<u8>);
+
+impl fmt::Debug for ZstdDict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ZstdDict")
+            .field("size", &self.0.len())
+            .finish()
+    }
+}
 
 fn hash(len_buf: [u8; 8], pid_buf: [u8; 8], object_buf: &[u8]) -> [u8; 4] {
     let mut hasher = crc32fast::Hasher::new();
@@ -98,6 +109,7 @@ struct FileAndMetadata {
     generation: u8,
     rewrite_claim: AtomicBool,
     synced: AtomicBool,
+    zstd_dict_opt: Option<ZstdDict>,
 }
 
 /// Shard based on rough size ranges corresponding to SSD

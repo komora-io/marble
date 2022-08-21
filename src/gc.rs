@@ -176,7 +176,8 @@ impl Marble {
                     base_location.lsn(),
                 );
 
-                let trailer = read_trailer(&mut file, trailer_offset, trailer_items)?;
+                let (trailer, _zstd_dict_opt) =
+                    read_trailer(&mut file, trailer_offset, trailer_items)?;
 
                 for (object_id, relative_location) in trailer {
                     if relative_location.is_delete() {

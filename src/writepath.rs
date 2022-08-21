@@ -214,6 +214,8 @@ impl Marble {
 
         let initial_capacity = new_relative_locations.len() as u64;
 
+        let zstd_dict_opt = None;
+
         let fam = FileAndMetadata {
             file,
             metadata: Metadata::default(),
@@ -227,6 +229,7 @@ impl Marble {
             // on us until we're done with our write operation.
             path: PathBuf::new(),
             rewrite_claim: true.into(),
+            zstd_dict_opt,
         };
 
         assert!(fams.insert(location, fam).is_none());
@@ -339,9 +342,17 @@ impl Marble {
             "writing trailer for {lsn} at offset {}, trailer items {trailer_items}",
             written_bytes,
         );
-        let res = write_trailer(&mut file_2, written_bytes, &new_relative_locations)
-            .and_then(|_| maybe!(file_2.sync_all()))
-            .and_then(|_| maybe!(fs::rename(&tmp_path, &new_path)));
+
+        let zstd_dict_opt = None;
+
+        let res = write_trailer(
+            &mut file_2,
+            written_bytes,
+            &new_relative_locations,
+            zstd_dict_opt,
+        )
+        .and_then(|_| maybe!(file_2.sync_all()))
+        .and_then(|_| maybe!(fs::rename(&tmp_path, &new_path)));
 
         let file_len = fallible!(file_2.metadata()).len();
         let expected_file_len = written_bytes + 4 + (16 * new_relative_locations.len() as u64);

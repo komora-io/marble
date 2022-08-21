@@ -5,13 +5,13 @@ use std::os::unix::fs::FileExt;
 
 use fault_injection::{annotate, fallible};
 
-use crate::{Map, ObjectId, RelativeDiskLocation};
+use crate::{Map, ObjectId, RelativeDiskLocation, ZstdDict};
 
 pub(crate) fn read_trailer(
     file: &File,
     trailer_offset: u64,
     trailer_items: u64,
-) -> io::Result<Vec<(ObjectId, RelativeDiskLocation)>> {
+) -> io::Result<(Vec<(ObjectId, RelativeDiskLocation)>, Option<ZstdDict>)> {
     let trailer_size = usize::try_from(4 + (trailer_items * 16)).unwrap();
 
     let mut buf = Vec::with_capacity(trailer_size);
@@ -43,13 +43,16 @@ pub(crate) fn read_trailer(
         ret.push((object_id, relative_loc));
     }
 
-    Ok(ret)
+    let zstd_dict_opt = None;
+
+    Ok((ret, zstd_dict_opt))
 }
 
 pub(crate) fn write_trailer<'a>(
     file: &mut File,
     offset: u64,
     new_shifted_relative_locations: &Map<ObjectId, RelativeDiskLocation>,
+    zstd_dict_opt: Option<ZstdDict>,
 ) -> io::Result<()> {
     // space for overall crc + each (object_id, location) pair
     let mut buf = Vec::with_capacity(4 + (new_shifted_relative_locations.len() * 16));
