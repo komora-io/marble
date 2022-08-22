@@ -23,25 +23,24 @@ impl ZstdDict {
         let mut sizes = vec![];
         let mut total_size = 0;
 
-        for value_opt in samples.values().filter(|v_opt| v_opt.is_some()) {
-            let value: &[u8] = value_opt.as_ref().unwrap().as_ref();
+        let samples_iter = || {
+            // filter-out deletions and empty objects before
+            // constructing a zstd dictionary for this batch
+            samples
+                .values()
+                .filter_map(|v_opt| v_opt.as_ref())
+                .map(AsRef::as_ref)
+                .filter(|v| !v.is_empty())
+        };
 
-            if value.is_empty() {
-                continue;
-            }
-
+        for value in samples_iter() {
             sizes.push(value.len());
             total_size += value.len();
         }
 
         let mut buffer = Vec::with_capacity(total_size);
-        for value_opt in samples.values().filter(|v_opt| v_opt.is_some()) {
-            let value: &[u8] = value_opt.as_ref().unwrap().as_ref();
 
-            if value.is_empty() {
-                continue;
-            }
-
+        for value in samples_iter() {
             buffer.extend_from_slice(value.as_ref());
         }
 
