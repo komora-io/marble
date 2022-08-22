@@ -315,3 +315,56 @@ fn test_11() {
             .unwrap();
     });
 }
+
+#[test]
+fn test_12() {
+    let subdir = format!("test_{}", TEST_COUNTER.fetch_add(1, SeqCst));
+
+    let config = Config {
+        target_file_size: 247,
+        file_compaction_percent: 99,
+        zstd_compression_level: Some(3),
+        max_object_size: 17179869184,
+        fsync_each_batch: false,
+        min_compaction_files: 2,
+        path: std::path::Path::new(TEST_DIR).join(subdir),
+        ..Default::default()
+    };
+
+    with_instance(config, |_config, marble| {
+        marble
+            .write_batch::<&[u8], _>(
+                [
+                    (14_u64, Some(&[65_u8] as &[u8])),
+                    (1_u64, None),
+                    (17_u64, Some(&[253])),
+                    (9_u64, None),
+                    (42_u64, None),
+                    (0_u64, None),
+                    (25_u64, Some(&[255])),
+                    (55_u64, None),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+
+        marble
+            .write_batch::<&[u8], _>(
+                [
+                    (3_u64, Some(&[139_u8] as &[u8])),
+                    (0_u64, None),
+                    (19_u64, Some(&[2])),
+                    (42_u64, None),
+                    (60_u64, Some(&[255])),
+                    (46_u64, Some(&[0, 0])),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+
+        marble
+            .write_batch::<&[u8], _>([(0_u64, None as Option<&[u8]>)].into_iter())
+            .unwrap();
+        marble.maintenance().unwrap();
+    });
+}

@@ -47,6 +47,7 @@ impl ZstdDict {
 
         assert_eq!(sizes.iter().sum::<usize>(), buffer.len());
 
+        // set max_size to somewhere in the range [4k, 128k)
         let max_size = (total_size / 100).min(128 * 1024).max(4096);
 
         let mut dict_buf = Vec::with_capacity(max_size);
