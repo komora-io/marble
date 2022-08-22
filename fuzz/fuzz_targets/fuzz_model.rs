@@ -51,7 +51,14 @@ impl<'a> Arbitrary<'a> for WriteBatch {
             let pid: u64 = u.int_in_range(0..=KEYSPACE).unwrap_or(0);
 
             let page = if Arbitrary::arbitrary(u).unwrap_or(false) {
-                Some(Arbitrary::arbitrary(u).unwrap_or(vec![]))
+                let mut base = if Arbitrary::arbitrary(u).unwrap_or(false) {
+                    vec![1, 2, 3, 4, 5, 6, 7]
+                } else {
+                    vec![]
+                };
+                let mut additional = Arbitrary::arbitrary(u).unwrap_or(vec![]);
+                base.append(&mut additional);
+                Some(base)
             } else {
                 None
             };
