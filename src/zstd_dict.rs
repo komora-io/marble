@@ -47,6 +47,12 @@ impl ZstdDict {
 
         assert_eq!(sizes.iter().sum::<usize>(), buffer.len());
 
+        if sizes.len() < 8 || buffer.len() / sizes.len() <= 8 {
+            // don't bother with dictionaries if there are less than 8 non-empty samples
+            // don't bother with dictionaries if the average size is <= 8
+            return ZstdDict(None);
+        }
+
         // set max_size to somewhere in the range [4k, 128k)
         let max_size = (total_size / 100).min(128 * 1024).max(4096);
 
