@@ -12,6 +12,7 @@ use fault_injection::fallible;
 
 use crate::{
     read_trailer, Config, DiskLocation, FileAndMetadata, LocationTable, Map, Marble, Metadata,
+    NEW_WRITE_BATCH_MASK,
 };
 
 const HEAP_DIR_SUFFIX: &str = "heap";
@@ -76,7 +77,7 @@ impl Config {
 
             let file_size = fallible!(entry.metadata()).len();
             max_file_size = max_file_size.max(file_size);
-            max_file_lsn = max_file_lsn.max(metadata.lsn);
+            max_file_lsn = max_file_lsn.max(metadata.lsn & NEW_WRITE_BATCH_MASK);
 
             let file_location = DiskLocation::new_fam(metadata.lsn);
 

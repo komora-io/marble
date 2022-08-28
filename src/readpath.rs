@@ -53,14 +53,6 @@ impl Marble {
         let object_offset = file_offset + HEADER_LEN as u64;
         fallible!(fam.file.read_exact_at(&mut compressed_buf, object_offset));
 
-        let decompressed_buf = if self.config.zstd_compression_level.is_some() {
-            Some(fam.zstd_dict.decompress(&compressed_buf))
-        } else {
-            None
-        };
-
-        drop(fams);
-
         let crc_actual = hash(len_buf, pid_buf, &compressed_buf);
 
         if crc_expected != crc_actual {
@@ -79,6 +71,6 @@ impl Marble {
 
         assert_eq!(object_id, read_pid);
 
-        Ok(Some(decompressed_buf.unwrap_or(compressed_buf)))
+        Ok(Some(fam.zstd_dict.decompress(compressed_buf)))
     }
 }

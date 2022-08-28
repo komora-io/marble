@@ -55,7 +55,7 @@ impl Default for Config {
             max_object_size: 16 * 1024 * 1024 * 1024, /* 16gb */
             min_compaction_files: 2,
             fsync_each_batch: false,
-            zstd_compression_level: Some(3),
+            zstd_compression_level: None,
         }
     }
 }

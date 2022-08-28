@@ -7,7 +7,7 @@ fn zstd_error(errno: usize) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, name.to_string())
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct ZstdDict(pub(crate) Option<Vec<u8>>);
 
 impl fmt::Debug for ZstdDict {
@@ -73,17 +73,17 @@ impl ZstdDict {
         }
     }
 
-    pub(crate) fn decompress(&self, buf: &[u8]) -> Vec<u8> {
+    pub(crate) fn decompress(&self, buf: Vec<u8>) -> Vec<u8> {
         if let Some(dict_buffer) = &self.0 {
-            let exact_size = usize::try_from(zstd_safe::find_decompressed_size(buf)).unwrap();
+            let exact_size = usize::try_from(zstd_safe::find_decompressed_size(&buf)).unwrap();
             let mut out = Vec::with_capacity(exact_size);
             let mut cx = zstd_safe::DCtx::create();
-            cx.decompress_using_dict(&mut out, buf, &dict_buffer)
+            cx.decompress_using_dict(&mut out, &buf, &dict_buffer)
                 .map_err(zstd_error)
                 .unwrap();
             out
         } else {
-            buf.to_vec()
+            buf
         }
     }
 

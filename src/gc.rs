@@ -1,5 +1,4 @@
-use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Seek};
 use std::sync::atomic::Ordering::SeqCst;
 
 use fault_injection::{annotate, fallible};
@@ -97,7 +96,8 @@ impl Marble {
                 );
                 rewritten_fam_locations.push(base_location);
 
-                use std::io::Seek;
+                let (trailer, zstd_dict) = read_trailer(&mut file, trailer_offset)?;
+
                 fallible!(file.seek(io::SeekFrom::Start(0)));
 
                 let mut buf_reader = BufReader::new(file);
@@ -164,7 +164,7 @@ impl Marble {
                             "rewriting object {object_id} at rewritten location \
                              {rewritten_location:?}"
                         );
-                        batch.insert(object_id, Some(object_buf));
+                        batch.insert(object_id, Some(zstd_dict.decompress(object_buf)));
                         old_locations.insert(object_id, rewritten_location);
                     } else {
                         log::trace!(
@@ -177,14 +177,10 @@ impl Marble {
                     offset += (HEADER_LEN + len) as u64;
                 }
 
-                let mut file: File = buf_reader.into_inner();
-
                 log::trace!(
                     "trying to read trailer at file for lsn {} offset {trailer_offset} items",
                     base_location.lsn(),
                 );
-
-                let (trailer, _zstd_dict_opt) = read_trailer(&mut file, trailer_offset)?;
 
                 for (object_id, relative_location) in trailer {
                     if relative_location.is_delete() {

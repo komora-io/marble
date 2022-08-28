@@ -8,10 +8,11 @@ use fault_injection::{fallible, maybe};
 
 use crate::{
     debug_delay, hash, write_trailer, DiskLocation, FileAndMetadata, Map, Marble, Metadata,
-    ObjectId, RelativeDiskLocation, ZstdDict, HEADER_LEN,
+    ObjectId, RelativeDiskLocation, ZstdDict, HEADER_LEN, NEW_WRITE_BATCH_BIT,
 };
 
 const HEAP_DIR_SUFFIX: &str = "heap";
+const NEW_WRITE_GENERATION: u8 = 0;
 
 impl Marble {
     /// Write a batch of objects to disk. This function is
@@ -30,9 +31,8 @@ impl Marble {
         B: AsRef<[u8]>,
         I: IntoIterator<Item = (ObjectId, Option<B>)>,
     {
-        let gen = 0;
         let old_locations = Map::new();
-        self.shard_batch(write_batch, gen, &old_locations)
+        self.shard_batch(write_batch, NEW_WRITE_GENERATION, &old_locations)
     }
 
     pub(crate) fn shard_batch<B, I>(
@@ -54,7 +54,7 @@ impl Marble {
         for (object_id, data_opt) in write_batch {
             let (object_size, shard_id) = if let Some(ref data) = data_opt {
                 let len = data.as_ref().len();
-                let shard = if gen == 0 {
+                let shard = if gen == NEW_WRITE_GENERATION {
                     // only shard during gc defragmentation of
                     // rewritten items, otherwise we break
                     // writebatch atomicity
@@ -71,7 +71,7 @@ impl Marble {
 
             // only split shards on rewrite, otherwise we lose batch
             // atomicity
-            let is_rewrite = gen > 0;
+            let is_rewrite = gen > NEW_WRITE_GENERATION;
             let over_size_preference = shard.0 > self.config.target_file_size;
 
             if is_rewrite && over_size_preference {
@@ -120,6 +120,14 @@ impl Marble {
 
         assert!(!objects.is_empty());
 
+        let is_gc = if generation == NEW_WRITE_GENERATION {
+            assert!(old_locations.is_empty());
+            false
+        } else {
+            assert!(!old_locations.is_empty());
+            true
+        };
+
         // Common write path:
         // 1. write data to tmp
         // 2. assign LSN and add to fams
@@ -138,7 +146,11 @@ impl Marble {
         let file = fallible!(file_options.open(&tmp_path));
         let mut buf_writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
 
-        let zstd_dict = ZstdDict::from_samples(&objects);
+        let zstd_dict = if self.config.zstd_compression_level.is_some() {
+            ZstdDict::from_samples(&objects)
+        } else {
+            ZstdDict::default()
+        };
 
         let mut new_relative_locations: Map<ObjectId, RelativeDiskLocation> = Map::new();
 
@@ -223,7 +235,13 @@ impl Marble {
 
         // NB this fetch_add should always happen while fams write
         // lock is being held
-        let lsn = self.next_file_lsn.fetch_add(written_bytes + 1, SeqCst);
+        let lsn_base = self.next_file_lsn.fetch_add(written_bytes + 1, SeqCst);
+
+        let lsn = if is_gc {
+            lsn_base
+        } else {
+            lsn_base | NEW_WRITE_BATCH_BIT
+        };
 
         let location = DiskLocation::new_fam(lsn);
         log::debug!("inserting new fam at lsn {lsn} location {location:?}",);

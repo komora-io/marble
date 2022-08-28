@@ -32,6 +32,8 @@ use trailer::{read_trailer, write_trailer};
 use zstd_dict::ZstdDict;
 
 const HEADER_LEN: usize = 20;
+const NEW_WRITE_BATCH_BIT: u64 = 1 << 62;
+const NEW_WRITE_BATCH_MASK: u64 = u64::MAX - NEW_WRITE_BATCH_BIT;
 
 type ObjectId = u64;
 
