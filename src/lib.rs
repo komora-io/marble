@@ -9,7 +9,11 @@ use std::sync::{
 
 use fault_injection::fallible;
 
+#[cfg(not(feature = "runtime_validation"))]
 type Map<K, V> = std::collections::HashMap<K, V>;
+
+#[cfg(feature = "runtime_validation")]
+type Map<K, V> = std::collections::BTreeMap<K, V>;
 
 mod config;
 mod debug_delay;
@@ -22,14 +26,18 @@ mod readpath;
 mod recovery;
 mod trailer;
 mod writepath;
+mod zstd_dict;
 
 pub use config::Config;
 use debug_delay::debug_delay;
 use disk_location::{DiskLocation, RelativeDiskLocation};
 use location_table::LocationTable;
 use trailer::{read_trailer, write_trailer};
+use zstd_dict::ZstdDict;
 
 const HEADER_LEN: usize = 20;
+const NEW_WRITE_BATCH_BIT: u64 = 1 << 62;
+const NEW_WRITE_BATCH_MASK: u64 = u64::MAX - NEW_WRITE_BATCH_BIT;
 
 type ObjectId = u64;
 
@@ -61,7 +69,7 @@ pub struct Stats {
 #[derive(Default, Debug, Clone, Copy)]
 struct Metadata {
     lsn: u64,
-    trailer_items: u64,
+    trailer_offset: u64,
     present_objects: u64,
     generation: u8,
 }
@@ -72,7 +80,7 @@ impl Metadata {
 
         Some(Metadata {
             lsn: u64::from_str_radix(&splits.next()?, 16).ok()?,
-            trailer_items: u64::from_str_radix(&splits.next()?, 16).ok()?,
+            trailer_offset: u64::from_str_radix(&splits.next()?, 16).ok()?,
             present_objects: u64::from_str_radix(&splits.next()?, 16).ok()?,
             generation: u8::from_str_radix(splits.next()?, 16).ok()?,
         })
@@ -81,7 +89,7 @@ impl Metadata {
     fn to_file_name(&self) -> String {
         let ret = format!(
             "{:016x}-{:016x}-{:016x}-{:01x}",
-            self.lsn, self.trailer_items, self.present_objects, self.generation
+            self.lsn, self.trailer_offset, self.present_objects, self.generation
         );
         ret
     }
@@ -93,11 +101,11 @@ struct FileAndMetadata {
     location: DiskLocation,
     path: PathBuf,
     metadata: Metadata,
-    trailer_offset: u64,
     len: AtomicU64,
     generation: u8,
     rewrite_claim: AtomicBool,
     synced: AtomicBool,
+    zstd_dict: ZstdDict,
 }
 
 /// Shard based on rough size ranges corresponding to SSD
@@ -239,7 +247,8 @@ impl Marble {
         #[cfg(feature = "runtime_validation")]
         {
             let fam = &_fams[&_location];
-            let next_location = DiskLocation::new_fam(_location.lsn() + fam.trailer_offset);
+            let next_location =
+                DiskLocation::new_fam(_location.lsn() + fam.metadata.trailer_offset);
             let present: Vec<(ObjectId, DiskLocation)> = self
                 .location_table
                 .iter()

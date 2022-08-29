@@ -9,7 +9,7 @@ mod common;
 const KEYSPACE: u64 = 16;
 const BATCH_SZ: usize = 3;
 const VALUE_LEN: usize = 7;
-const OPS: usize = 24 * 1024;
+const OPS: usize = 16;
 const BATCHES: usize = OPS / BATCH_SZ;
 
 fn run(marble: Arc<Marble>) {
@@ -30,7 +30,7 @@ fn run(marble: Arc<Marble>) {
         if i % 16 == 0 {
             let cleaned_up = marble.maintenance().unwrap();
             if cleaned_up != 0 {
-                println!("defragmented {} objects", cleaned_up);
+                log::info!("defragmented {} objects", cleaned_up);
             }
         }
     }
@@ -40,9 +40,9 @@ fn run(marble: Arc<Marble>) {
 fn burn_in() {
     common::setup_logger();
 
-    let concurrency: usize = 3; //std::thread::available_parallelism().unwrap().get() * 10;
+    let concurrency: usize = std::thread::available_parallelism().unwrap().get() * 10;
 
-    let marble = Arc::new(open("bench_data").unwrap());
+    let marble = Arc::new(open("testing_data_directories/burn_in").unwrap());
 
     let mut threads = vec![];
 
@@ -72,7 +72,7 @@ fn burn_in() {
     let writes_per_second = (total_ops as u128 * 1000) / elapsed.as_millis();
     let bytes_per_second = (bytes_written as u128 / 1000) / elapsed.as_millis();
 
-    println!(
+    log::info!(
         "wrote {} mb in {:?} with {} threads ({} writes per second, {} mb per second), {} fault \
          injection points",
         bytes_written / 1_000_000,
@@ -81,5 +81,7 @@ fn burn_in() {
         writes_per_second,
         bytes_per_second,
         fault_injection_points,
-    )
+    );
+
+    let _ = std::fs::remove_dir_all("testing_data_directories/burn_in");
 }

@@ -20,6 +20,7 @@ panic = "abort"
 runtime_validation = ["rand"]
 
 [dev-dependencies]
+criterion = {version = "0.3.6", features = ["html_reports"]}
 env_logger = "0.9.0"
 rand = "0.8.5"
 
@@ -30,6 +31,12 @@ fs2 = "0.4.3"
 pagetable = { version = "0.2.6" }
 fault-injection = "1.0.7"
 rand = { version = "0.8.5", optional = true }
+zstd-safe = { version="5.0.2", features=["std", "experimental"] }
+
+[[bench]]
+name = "marble_bench"
+path = "benches/marble_bench.rs"
+harness = false
 
 [[test]]
 name = "crash_atomicity"
