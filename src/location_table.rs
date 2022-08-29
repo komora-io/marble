@@ -1,4 +1,3 @@
-#[cfg(feature = "runtime_validation")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -7,21 +6,16 @@ use crate::{DiskLocation, ObjectId};
 #[derive(Default)]
 pub struct LocationTable {
     pt: pagetable::PageTable,
-    #[cfg(feature = "runtime_validation")]
     max_object_id: AtomicU64,
 }
 
 impl LocationTable {
     pub fn load(&self, object_id: ObjectId) -> Option<DiskLocation> {
-        #[cfg(feature = "runtime_validation")]
-        self.max_object_id.fetch_max(object_id, Ordering::Release);
-
         let raw = self.pt.get(object_id).load(Ordering::Acquire);
         DiskLocation::from_raw(raw)
     }
 
     pub fn store(&self, object_id: ObjectId, location: DiskLocation) {
-        #[cfg(feature = "runtime_validation")]
         self.max_object_id.fetch_max(object_id, Ordering::Release);
 
         self.pt
@@ -35,7 +29,6 @@ impl LocationTable {
         old_location: DiskLocation,
         new_location: DiskLocation,
     ) -> Result<(), DiskLocation> {
-        #[cfg(feature = "runtime_validation")]
         self.max_object_id.fetch_max(object_id, Ordering::Release);
 
         self.pt
@@ -55,7 +48,6 @@ impl LocationTable {
         object_id: ObjectId,
         new_location: DiskLocation,
     ) -> Result<Option<DiskLocation>, Option<DiskLocation>> {
-        #[cfg(feature = "runtime_validation")]
         self.max_object_id.fetch_max(object_id, Ordering::Release);
 
         let max_result = self
@@ -69,6 +61,10 @@ impl LocationTable {
             assert_ne!(max_result, new_location.to_raw());
             Err(DiskLocation::from_raw(max_result))
         }
+    }
+
+    pub fn max_object_id(&self) -> u64 {
+        self.max_object_id.load(Ordering::Acquire)
     }
 
     #[cfg(feature = "runtime_validation")]

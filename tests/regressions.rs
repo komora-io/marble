@@ -47,6 +47,11 @@ fn test_00() {
         assert!(marble.read(object_id).unwrap().is_some());
         marble = restart(config, marble);
         assert!(marble.read(object_id).unwrap().is_some());
+
+        let (max, mut iter) = marble.free_object_ids();
+        assert_eq!(max, object_id + 1);
+        assert_eq!(iter.next(), Some(0));
+        assert_eq!(iter.next(), None);
     });
 }
 

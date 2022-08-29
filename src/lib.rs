@@ -239,6 +239,23 @@ impl Marble {
         Ok(())
     }
 
+    /// Intended for use in recovery, to bootstrap a higher level object ID allocator.
+    ///
+    /// Returns a tuple of 1 higher than the current max allocated object ID,
+    /// and an iterator over all object IDs beneath that which are
+    /// currently deleted (due to being stored as a `None` in a write batch).
+    pub fn free_object_ids<'a>(&'a self) -> (u64, impl 'a + Iterator<Item = u64>) {
+        let max = self.location_table.max_object_id() + 1;
+        let iter = (0..max).filter_map(|oid| {
+            if self.location_table.load(oid).is_none() {
+                Some(oid)
+            } else {
+                None
+            }
+        });
+        (max, iter)
+    }
+
     fn verify_file_uninhabited(
         &self,
         _location: DiskLocation,
