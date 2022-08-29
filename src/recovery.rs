@@ -68,7 +68,8 @@ impl Config {
                 log::trace!("inserting object_id {object_id} at location {location:?}");
                 if let Some(old) = recovery_page_table.insert(object_id, location) {
                     assert!(
-                        old < location,
+                        (old.lsn() & NEW_WRITE_BATCH_MASK)
+                            < (location.lsn() & NEW_WRITE_BATCH_MASK),
                         "must always apply locations in monotonic order. old {old:?} should be < \
                          new {location:?}"
                     );
@@ -99,7 +100,7 @@ impl Config {
 
         let location_table = LocationTable::default();
         #[cfg(feature = "runtime_validation")]
-        let mut debug_history = debug_history::DebugHistory::default();
+        let mut debug_history = crate::debug_history::DebugHistory::default();
 
         // initialize fam utilization from page table
         for (object_id, disk_location) in recovery_page_table {
@@ -166,7 +167,7 @@ fn read_storage_directory(heap_dir: PathBuf) -> io::Result<Vec<(Metadata, fs::Di
         files.push((metadata, entry));
     }
 
-    files.sort_by_key(|(metadata, _)| metadata.lsn);
+    files.sort_by_key(|(metadata, _)| metadata.lsn & NEW_WRITE_BATCH_MASK);
 
     Ok(files)
 }

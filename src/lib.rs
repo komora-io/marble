@@ -9,7 +9,11 @@ use std::sync::{
 
 use fault_injection::fallible;
 
+#[cfg(not(feature = "runtime_validation"))]
 type Map<K, V> = std::collections::HashMap<K, V>;
+
+#[cfg(feature = "runtime_validation")]
+type Map<K, V> = std::collections::BTreeMap<K, V>;
 
 mod config;
 mod debug_delay;
@@ -243,7 +247,8 @@ impl Marble {
         #[cfg(feature = "runtime_validation")]
         {
             let fam = &_fams[&_location];
-            let next_location = DiskLocation::new_fam(_location.lsn() + fam.trailer_offset);
+            let next_location =
+                DiskLocation::new_fam(_location.lsn() + fam.metadata.trailer_offset);
             let present: Vec<(ObjectId, DiskLocation)> = self
                 .location_table
                 .iter()
