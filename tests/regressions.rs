@@ -335,3 +335,75 @@ fn test_12() {
             .unwrap();
     });
 }
+
+#[test]
+fn test_13() {
+    let subdir = format!("test_{}", TEST_COUNTER.fetch_add(1, SeqCst));
+
+    let config = Config {
+        target_file_size: 247,
+        fsync_each_batch: false,
+        min_compaction_files: 2,
+        file_compaction_percent: 55,
+        path: std::path::Path::new(TEST_DIR).join(subdir),
+        ..Default::default()
+    };
+
+    with_instance(config, |config, mut marble| {
+        marble
+            .write_batch::<&[u8], _>([(56_u64, None), (46, None)].into_iter())
+            .unwrap();
+
+        marble
+            .write_batch::<&[u8], _>(
+                [
+                    (46, None),
+                    (55, None),
+                    (50, None),
+                    (60, Some(&[255_u8, 50, 86, 255] as &[u8])),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+
+        assert_eq!(marble.read(60).unwrap().unwrap(), vec![255, 50, 86, 255]);
+
+        marble
+            .write_batch::<&[u8], _>(
+                [
+                    (60_u64, Some(&[1_u8, 2, 3, 4, 5, 6, 7, 0] as &[u8])),
+                    (37, None),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            marble.read(60).unwrap().unwrap(),
+            vec![1_u8, 2, 3, 4, 5, 6, 7, 0]
+        );
+
+        marble
+            .write_batch::<&[u8], _>([(37_u64, None), (0_u64, None)].into_iter())
+            .unwrap();
+
+        assert_eq!(
+            marble.read(60).unwrap().unwrap(),
+            vec![1_u8, 2, 3, 4, 5, 6, 7, 0]
+        );
+
+        marble.maintenance().unwrap();
+
+        assert_eq!(
+            marble.read(60).unwrap().unwrap(),
+            vec![1_u8, 2, 3, 4, 5, 6, 7, 0]
+        );
+
+        marble = restart(config, marble);
+
+        assert_eq!(
+            marble.read(60).unwrap().unwrap(),
+            vec![1_u8, 2, 3, 4, 5, 6, 7, 0]
+        );
+    });
+}
