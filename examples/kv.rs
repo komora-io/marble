@@ -46,7 +46,7 @@ struct Kv {
 
 impl Kv {
     fn recover(path: &str) -> io::Result<Kv> {
-        let heap = Marble::open(path)?;
+        let heap = marble::open(path)?;
 
         let index: Index = if let Some(index_data) = heap.read(INDEX_OBJECT_ID)? {
             deserialize(&index_data).unwrap()
@@ -121,7 +121,7 @@ impl Kv {
 
         self.heap.write_batch(write_batch)?;
 
-        let stats = self.heap.file_statistics();
+        let stats = self.heap.file_stats();
 
         if stats.dead_objects > stats.live_objects {
             self.heap.maintenance()?;
