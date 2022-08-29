@@ -12,10 +12,12 @@ use arbitrary::Arbitrary;
 use marble::Config as MarbleConfig;
 
 const TEST_DIR: &str = "testing_data_directories";
-const KEYSPACE: u64 = 64;
-const BATCH_MIN_SZ: u64 = 0;
-const BATCH_MAX_SZ: u64 = 16;
-const VALUE_MAX_SZ: usize = 16;
+
+const KEYSPACE: u8 = 32;
+const BATCH_MIN_SZ: u8 = 0;
+const BATCH_MAX_SZ: u8 = 16;
+const VALUE_MAX_SZ: u8 = 16;
+const OPS: usize = 6;
 
 type ObjectId = u64;
 
@@ -29,7 +31,7 @@ impl<'a> Arbitrary<'a> for Config {
             .join(uuid::Uuid::new_v4().to_string())
             .into();
 
-        let zstd_compression_level = if u.int_in_range(1..=10).unwrap_or(1) < 5 {
+        let zstd_compression_level = if Arbitrary::arbitrary(u).unwrap_or(false) {
             None
         } else {
             Some(Arbitrary::arbitrary(u).unwrap_or(3))
@@ -37,8 +39,8 @@ impl<'a> Arbitrary<'a> for Config {
 
         Ok(Config(MarbleConfig {
             path,
-            target_file_size: u.int_in_range(1..=16384).unwrap_or(50),
-            file_compaction_percent: u.int_in_range(0..=99).unwrap_or(50),
+            target_file_size: u.int_in_range(1_u16..=1024).unwrap_or(50) as usize,
+            file_compaction_percent: u.int_in_range(0_u8..=99).unwrap_or(50) as u8,
             zstd_compression_level,
             ..Default::default()
         }))
@@ -50,23 +52,25 @@ struct WriteBatch<'a>(HashMap<ObjectId, Option<&'a [u8]>>);
 
 impl<'a> Arbitrary<'a> for WriteBatch<'a> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let pages: u64 = u
+        let pages: u8 = u
             .int_in_range(BATCH_MIN_SZ..=BATCH_MAX_SZ)
             .unwrap_or(BATCH_MIN_SZ);
 
         let mut batch = HashMap::default();
         for pid_default in 0..pages {
-            let pid: u64 = u.int_in_range(0..=KEYSPACE).unwrap_or(pid_default);
+            let pid: u8 = u.int_in_range(0..=KEYSPACE).unwrap_or(pid_default);
 
             let page = if Arbitrary::arbitrary(u).unwrap_or(true) {
-                let len: u8 = u.int_in_range(0..=VALUE_MAX_SZ as u8).unwrap_or(0);
-                let value = u.bytes(len as usize).unwrap_or(&[1, 2, 3, 4, 5, 6, 7, 8]);
+                let len: u8 = u.int_in_range(0..=VALUE_MAX_SZ).unwrap_or(0);
+                let value = u
+                    .bytes(usize::from(len))
+                    .unwrap_or(&[1, 2, 3, 4, 5, 6, 7, 8]);
                 Some(value)
             } else {
                 None
             };
 
-            batch.insert(pid, page);
+            batch.insert(u64::from(pid), page);
         }
 
         Ok(WriteBatch(batch))
@@ -82,7 +86,7 @@ enum Op<'a> {
 
 impl<'a> Arbitrary<'a> for Op<'a> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let choice = u.int_in_range(0..=2).unwrap_or(0);
+        let choice: u8 = u.int_in_range(0..=2).unwrap_or(0);
         Ok(match choice {
             0 => Op::Gc,
             1 => Op::WriteBatch(
@@ -94,7 +98,7 @@ impl<'a> Arbitrary<'a> for Op<'a> {
     }
 }
 
-fuzz_target!(|args: (Config, [Op<'_>; 6])| {
+fuzz_target!(|args: (Config, [Op<'_>; OPS])| {
     let (config, ops) = args;
 
     let mut marble = config.0.clone().open().unwrap();

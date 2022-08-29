@@ -1,18 +1,22 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 
-use rand::{thread_rng, Rng};
+use rand::{thread_rng, Rng, RngCore};
 
 use marble::Marble;
 
 const KEYSPACE: u64 = 1024 * 1024;
 const BATCH_SZ: usize = 64 * 1024;
 const VALUE_LEN: usize = 64;
-const OPS_PER_THREAD: usize = 8 * 1024 * 1024;
+const OPS_PER_THREAD: usize = 2 * 1024 * 1024;
 const BATCHES_PER_THREAD: usize = OPS_PER_THREAD / BATCH_SZ;
 
-fn run_writer(marble: Arc<Marble>) {
-    let v = vec![0xFA; VALUE_LEN];
+static ANY_WRITERS_DONE: AtomicBool = AtomicBool::new(false);
 
+fn run_writer(marble: Arc<Marble>) {
     let mut rng = thread_rng();
 
     for _ in 0..BATCHES_PER_THREAD {
@@ -20,20 +24,39 @@ fn run_writer(marble: Arc<Marble>) {
 
         for _ in 0..BATCH_SZ {
             let pid = rng.gen_range(0..KEYSPACE);
-            batch.insert(pid, Some(&v));
+            let v: Option<Vec<u8>> = if rng.gen_bool(0.1) {
+                None
+            } else {
+                let len = rng.gen_range(0..VALUE_LEN * 2);
+                let mut v = Vec::with_capacity(len);
+                unsafe {
+                    v.set_len(len);
+                }
+                rng.fill_bytes(&mut v);
+                Some(v)
+            };
+            batch.insert(pid, v);
         }
 
         marble.write_batch(batch).unwrap();
     }
+
+    ANY_WRITERS_DONE.store(true, Ordering::Release);
 }
 
 fn run_reader(marble: Arc<Marble>) {
     let mut rng = thread_rng();
 
-    for _ in 0..(BATCH_SZ * BATCHES_PER_THREAD) {
+    let mut worst_time = Duration::default();
+
+    while !ANY_WRITERS_DONE.load(Ordering::Relaxed) {
+        let before = Instant::now();
         let pid = rng.gen_range(0..KEYSPACE);
         marble.read(pid).unwrap();
+        worst_time = worst_time.max(before.elapsed());
     }
+
+    println!("worst read latency: {worst_time:?}");
 }
 
 fn main() {
