@@ -123,7 +123,7 @@ fuzz_target!(|args: (Config, [Op<'_>; OPS])| {
 
         for (pid, expected) in &model {
             let expected_ref: Option<&[u8]> = expected.as_deref();
-            let actual: Option<Vec<u8>> = marble.read(*pid).unwrap();
+            let actual: Option<Box<[u8]>> = marble.read(*pid).unwrap();
             let actual_ref: Option<&[u8]> = actual.as_deref();
             assert_eq!(expected_ref, actual_ref);
         }

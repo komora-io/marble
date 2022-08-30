@@ -4,8 +4,8 @@ use std::sync::atomic::Ordering::SeqCst;
 use fault_injection::{annotate, fallible};
 
 use crate::{
-    debug_delay, hash, read_trailer, DeferUnclaim, DiskLocation, Map, Marble, ObjectId,
-    RelativeDiskLocation, HEADER_LEN,
+    debug_delay, hash, read_trailer, uninit_boxed_slice, DeferUnclaim, DiskLocation, Map, Marble,
+    ObjectId, RelativeDiskLocation, HEADER_LEN,
 };
 
 const MAX_GENERATION: u8 = 3;
@@ -132,11 +132,7 @@ impl Marble {
                         RelativeDiskLocation::new(offset, false).to_absolute(base_location.lsn());
 
                     // all objects present before the trailer are not deletes
-                    let mut object_buf = Vec::with_capacity(len);
-
-                    unsafe {
-                        object_buf.set_len(len);
-                    }
+                    let mut object_buf = uninit_boxed_slice(len);
 
                     buf_reader.read_exact(&mut object_buf)?;
 

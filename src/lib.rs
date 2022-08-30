@@ -41,6 +41,18 @@ const NEW_WRITE_BATCH_MASK: u64 = u64::MAX - NEW_WRITE_BATCH_BIT;
 
 type ObjectId = u64;
 
+fn uninit_boxed_slice(len: usize) -> Box<[u8]> {
+    use std::alloc::{alloc, Layout};
+
+    let layout = Layout::array::<u8>(len).unwrap();
+
+    unsafe {
+        let ptr = alloc(layout);
+        let slice = std::slice::from_raw_parts_mut(ptr, len);
+        Box::from_raw(slice)
+    }
+}
+
 fn hash(len_buf: [u8; 8], pid_buf: [u8; 8], object_buf: &[u8]) -> [u8; 4] {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&len_buf);

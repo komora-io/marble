@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{Map, ObjectId};
+use crate::{uninit_boxed_slice, Map, ObjectId};
 
 fn zstd_error(errno: usize) -> std::io::Error {
     let name = zstd_safe::get_error_name(errno);
@@ -73,12 +73,12 @@ impl ZstdDict {
         }
     }
 
-    pub(crate) fn decompress(&self, buf: Vec<u8>) -> Vec<u8> {
+    pub(crate) fn decompress(&self, buf: Box<[u8]>) -> Box<[u8]> {
         if let Some(dict_buffer) = &self.0 {
             let exact_size = usize::try_from(zstd_safe::find_decompressed_size(&buf)).unwrap();
-            let mut out = Vec::with_capacity(exact_size);
+            let mut out = uninit_boxed_slice(exact_size);
             let mut cx = zstd_safe::DCtx::create();
-            cx.decompress_using_dict(&mut out, &buf, &dict_buffer)
+            cx.decompress_using_dict(&mut *out, &buf, &dict_buffer)
                 .map_err(zstd_error)
                 .unwrap();
             out
