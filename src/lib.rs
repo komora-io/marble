@@ -26,14 +26,14 @@ mod readpath;
 mod recovery;
 mod trailer;
 mod writepath;
-mod zstd_dict;
+mod zstd;
 
 pub use config::Config;
 use debug_delay::debug_delay;
 use disk_location::{DiskLocation, RelativeDiskLocation};
 use location_table::LocationTable;
 use trailer::{read_trailer, write_trailer};
-use zstd_dict::ZstdDict;
+use zstd::ZstdDict;
 
 const HEADER_LEN: usize = 20;
 const NEW_WRITE_BATCH_BIT: u64 = 1 << 62;
@@ -76,6 +76,9 @@ pub struct Stats {
     /// or removed in other storage files, contributing
     /// to fragmentation.
     pub dead_objects: u64,
+    /// The percentage of all objects on disk that are
+    /// live. This is another way of expressing fragmentation.
+    pub live_percent: u8,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -189,6 +192,7 @@ impl Marble {
             live_objects,
             stored_objects,
             dead_objects: stored_objects - live_objects,
+            live_percent: u8::try_from((live_objects * 100) / stored_objects.max(1)).unwrap(),
         }
     }
 
