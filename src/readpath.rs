@@ -9,6 +9,7 @@ use crate::{hash, uninit_boxed_slice, Marble, ObjectId, HEADER_LEN};
 impl Marble {
     /// Read a object out of storage. If this object is
     /// unknown or has been removed, returns `Ok(None)`.
+    /// If there is an IO problem, returns Err.
     pub fn read(&self, object_id: ObjectId) -> io::Result<Option<Box<[u8]>>> {
         let fams = self.fams.read().unwrap();
 

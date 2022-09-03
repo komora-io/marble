@@ -108,10 +108,7 @@ fn main() {
         let cleaned_up = marble.maintenance().unwrap();
         if cleaned_up != 0 {
             let stats = marble.file_stats();
-            let dead_percent = (stats.dead_objects * 100) / stats.stored_objects;
-            println!(
-                "defragmented {cleaned_up} objects. stats: {stats:?} dead percent: {dead_percent}",
-            );
+            println!("defragmented {cleaned_up} objects. stats: {stats:?}",);
         }
     }
 
@@ -121,8 +118,11 @@ fn main() {
 
     let cleaned_up = marble.maintenance().unwrap();
     if cleaned_up != 0 {
-        println!("defragmented {} objects", cleaned_up);
+        let stats = marble.file_stats();
+        println!("defragmented {cleaned_up} objects. stats: {stats:?}",);
     }
+    let cleaned_up_2 = marble.maintenance().unwrap();
+    assert_eq!(cleaned_up_2, 0);
 
     let total_ops = concurrency * BATCH_SZ * BATCHES_PER_THREAD;
     let bytes_written = total_ops * VALUE_LEN;
