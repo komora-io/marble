@@ -41,9 +41,7 @@ fn restart(config: &Config, marble: Marble) -> Marble {
 fn test_00() {
     with_default_instance(|config, mut marble| {
         let object_id = 1;
-        marble
-            .write_batch([(object_id, Some(vec![]))].into_iter())
-            .unwrap();
+        marble.write_batch([(object_id, Some(vec![]))]).unwrap();
         assert!(marble.read(object_id).unwrap().is_some());
         marble = restart(config, marble);
         assert!(marble.read(object_id).unwrap().is_some());
@@ -59,13 +57,9 @@ fn test_00() {
 fn test_01() {
     with_default_instance(|config, mut marble| {
         let object_id_1 = 1;
-        marble
-            .write_batch([(object_id_1, Some(vec![]))].into_iter())
-            .unwrap();
+        marble.write_batch([(object_id_1, Some(vec![]))]).unwrap();
         let object_id_2 = 2;
-        marble
-            .write_batch([(object_id_2, Some(vec![]))].into_iter())
-            .unwrap();
+        marble.write_batch([(object_id_2, Some(vec![]))]).unwrap();
         assert!(marble.read(object_id_1).unwrap().is_some());
         assert!(marble.read(object_id_2).unwrap().is_some());
         marble = restart(config, marble);
@@ -78,13 +72,9 @@ fn test_01() {
 fn test_02() {
     with_default_instance(|_config, marble| {
         let object_id_1 = 1;
-        marble
-            .write_batch([(object_id_1, Some(vec![]))].into_iter())
-            .unwrap();
+        marble.write_batch([(object_id_1, Some(vec![]))]).unwrap();
         let object_id_2 = 2;
-        marble
-            .write_batch([(object_id_2, Some(vec![]))].into_iter())
-            .unwrap();
+        marble.write_batch([(object_id_2, Some(vec![]))]).unwrap();
         assert!(marble.read(object_id_1).unwrap().is_some());
         assert!(marble.read(object_id_2).unwrap().is_some());
         marble.maintenance().unwrap();
@@ -98,7 +88,7 @@ fn test_03() {
     with_default_instance(|_config, marble| {
         let object_id_1 = 1;
         marble
-            .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
+            .write_batch::<Vec<u8>, _>([(object_id_1, None)])
             .unwrap();
     });
 }
@@ -108,28 +98,28 @@ fn test_04() {
     with_default_instance(|_config, marble| {
         let object_id_1 = 1;
         marble
-            .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
+            .write_batch::<Vec<u8>, _>([(object_id_1, None)])
             .unwrap();
 
         marble.maintenance().unwrap();
 
         let object_id_1 = 1;
         marble
-            .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
+            .write_batch::<Vec<u8>, _>([(object_id_1, None)])
             .unwrap();
 
         marble.maintenance().unwrap();
 
         let object_id_1 = 1;
         marble
-            .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
+            .write_batch::<Vec<u8>, _>([(object_id_1, None)])
             .unwrap();
 
         marble.maintenance().unwrap();
 
         let object_id_1 = 1;
         marble
-            .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
+            .write_batch::<Vec<u8>, _>([(object_id_1, None)])
             .unwrap();
     });
 }
@@ -139,7 +129,7 @@ fn test_05() {
     with_default_instance(|config, marble| {
         let object_id_1 = 1;
         marble
-            .write_batch::<Vec<u8>, _>([(object_id_1, None)].into_iter())
+            .write_batch::<Vec<u8>, _>([(object_id_1, None)])
             .unwrap();
 
         restart(config, marble);
@@ -172,10 +162,10 @@ fn test_06() {
 
         marble.maintenance().unwrap();
 
-        assert_eq!(marble.read(1).unwrap().unwrap(), vec![170, 170, 170]);
-        assert_eq!(marble.read(2).unwrap().unwrap(), vec![170]);
+        assert_eq!(&*marble.read(1).unwrap().unwrap(), vec![170, 170, 170]);
+        assert_eq!(&*marble.read(2).unwrap().unwrap(), vec![170]);
         assert_eq!(
-            marble.read(3).unwrap().unwrap(),
+            &*marble.read(3).unwrap().unwrap(),
             vec![170, 170, 170, 170, 170]
         );
     });
@@ -218,15 +208,13 @@ fn test_07() {
 fn test_08() {
     with_default_instance(|_config, marble| {
         marble
-            .write_batch::<Vec<u8>, _>(
-                [(1, Some(vec![])), (2, Some(vec![])), (3, Some(vec![]))].into_iter(),
-            )
+            .write_batch::<Vec<u8>, _>([(1, Some(vec![])), (2, Some(vec![])), (3, Some(vec![]))])
             .unwrap();
         marble
-            .write_batch::<Vec<u8>, _>([(1, Some(vec![])), (2, Some(vec![]))].into_iter())
+            .write_batch::<Vec<u8>, _>([(1, Some(vec![])), (2, Some(vec![]))])
             .unwrap();
         marble
-            .write_batch::<Vec<u8>, _>([(1, Some(vec![]))].into_iter())
+            .write_batch::<Vec<u8>, _>([(1, Some(vec![]))])
             .unwrap();
 
         marble.maintenance().unwrap();
@@ -240,26 +228,23 @@ fn test_09() {
         let big_value: Vec<u8> = (0..1024 * 1024).map(|_| rand::random::<u8>()).collect();
         let big_slice: &[u8] = &big_value;
         marble
-            .write_batch::<&[u8], _>(
-                [
-                    (1_u64, Some(big_slice)),
-                    (2_u64, Some(big_slice)),
-                    (3_u64, Some(big_slice)),
-                    (4_u64, Some(big_slice)),
-                    (5_u64, Some(big_slice)),
-                    (6_u64, Some(big_slice)),
-                    (7_u64, Some(big_slice)),
-                    (8_u64, Some(big_slice)),
-                ]
-                .into_iter(),
-            )
+            .write_batch::<&[u8], _>([
+                (1_u64, Some(big_slice)),
+                (2_u64, Some(big_slice)),
+                (3_u64, Some(big_slice)),
+                (4_u64, Some(big_slice)),
+                (5_u64, Some(big_slice)),
+                (6_u64, Some(big_slice)),
+                (7_u64, Some(big_slice)),
+                (8_u64, Some(big_slice)),
+            ])
             .unwrap();
 
-        assert_eq!(marble.read(1).unwrap().unwrap(), big_slice);
+        assert_eq!(&*marble.read(1).unwrap().unwrap(), big_slice);
 
         marble = restart(config, marble);
 
-        assert_eq!(marble.read(1).unwrap().unwrap(), big_slice);
+        assert_eq!(&*marble.read(1).unwrap().unwrap(), big_slice);
 
         marble.maintenance().unwrap();
     });
@@ -272,26 +257,23 @@ fn test_10() {
         let big_value = vec![0xFA; 1024 * 1024];
         let big_slice: &[u8] = &big_value;
         marble
-            .write_batch::<&[u8], _>(
-                [
-                    (1_u64, Some(big_slice)),
-                    (2_u64, Some(big_slice)),
-                    (3_u64, Some(big_slice)),
-                    (4_u64, Some(big_slice)),
-                    (5_u64, Some(big_slice)),
-                    (6_u64, Some(big_slice)),
-                    (7_u64, Some(big_slice)),
-                    (8_u64, Some(big_slice)),
-                ]
-                .into_iter(),
-            )
+            .write_batch::<&[u8], _>([
+                (1_u64, Some(big_slice)),
+                (2_u64, Some(big_slice)),
+                (3_u64, Some(big_slice)),
+                (4_u64, Some(big_slice)),
+                (5_u64, Some(big_slice)),
+                (6_u64, Some(big_slice)),
+                (7_u64, Some(big_slice)),
+                (8_u64, Some(big_slice)),
+            ])
             .unwrap();
 
-        assert_eq!(marble.read(1).unwrap().unwrap(), big_slice);
+        assert_eq!(&*marble.read(1).unwrap().unwrap(), big_slice);
 
         marble = restart(config, marble);
 
-        assert_eq!(marble.read(1).unwrap().unwrap(), big_slice);
+        assert_eq!(&*marble.read(1).unwrap().unwrap(), big_slice);
 
         marble.maintenance().unwrap();
     });
@@ -300,23 +282,20 @@ fn test_10() {
 #[test]
 fn test_11() {
     with_default_instance(|_config, marble| {
-        marble.write_batch::<&[u8], _>([].into_iter()).unwrap();
+        marble.write_batch::<&[u8], _>([]).unwrap();
 
         marble
-            .write_batch::<&[u8], _>(
-                [
-                    (1_u64, Some(&[] as &[u8])),
-                    (2_u64, Some(&[])),
-                    (3_u64, Some(&[])),
-                    (4_u64, None),
-                    (5_u64, Some(&[0])),
-                    (6_u64, Some(&[252])),
-                    (7_u64, None),
-                    (8_u64, Some(&[])),
-                    (9_u64, Some(&[255, 255, 35, 255, 2, 14])),
-                ]
-                .into_iter(),
-            )
+            .write_batch::<&[u8], _>([
+                (1_u64, Some(&[] as &[u8])),
+                (2_u64, Some(&[])),
+                (3_u64, Some(&[])),
+                (4_u64, None),
+                (5_u64, Some(&[0])),
+                (6_u64, Some(&[252])),
+                (7_u64, None),
+                (8_u64, Some(&[])),
+                (9_u64, Some(&[255, 255, 35, 255, 2, 14])),
+            ])
             .unwrap();
     });
 }
@@ -325,18 +304,15 @@ fn test_11() {
 fn test_12() {
     with_default_instance(|_config, marble| {
         marble
-            .write_batch::<&[u8], _>(
-                [
-                    (14_u64, Some(&[65_u8] as &[u8])),
-                    (3_u64, Some(&[139_u8])),
-                    (19_u64, Some(&[2])),
-                    (25_u64, Some(&[255])),
-                    (17_u64, Some(&[253])),
-                    (60_u64, Some(&[255])),
-                    (46_u64, Some(&[0, 0])),
-                ]
-                .into_iter(),
-            )
+            .write_batch::<&[u8], _>([
+                (14_u64, Some(&[65_u8] as &[u8])),
+                (3_u64, Some(&[139_u8])),
+                (19_u64, Some(&[2])),
+                (25_u64, Some(&[255])),
+                (17_u64, Some(&[253])),
+                (60_u64, Some(&[255])),
+                (46_u64, Some(&[0, 0])),
+            ])
             .unwrap();
     });
 }
@@ -356,58 +332,52 @@ fn test_13() {
 
     with_instance(config, |config, mut marble| {
         marble
-            .write_batch::<&[u8], _>([(56_u64, None), (46, None)].into_iter())
+            .write_batch::<&[u8], _>([(56_u64, None), (46, None)])
             .unwrap();
 
         marble
-            .write_batch::<&[u8], _>(
-                [
-                    (46, None),
-                    (55, None),
-                    (50, None),
-                    (60, Some(&[255_u8, 50, 86, 255] as &[u8])),
-                ]
-                .into_iter(),
-            )
+            .write_batch::<&[u8], _>([
+                (46, None),
+                (55, None),
+                (50, None),
+                (60, Some(&[255_u8, 50, 86, 255] as &[u8])),
+            ])
             .unwrap();
 
-        assert_eq!(marble.read(60).unwrap().unwrap(), vec![255, 50, 86, 255]);
+        assert_eq!(&*marble.read(60).unwrap().unwrap(), vec![255, 50, 86, 255]);
 
         marble
-            .write_batch::<&[u8], _>(
-                [
-                    (60_u64, Some(&[1_u8, 2, 3, 4, 5, 6, 7, 0] as &[u8])),
-                    (37, None),
-                ]
-                .into_iter(),
-            )
+            .write_batch::<&[u8], _>([
+                (60_u64, Some(&[1_u8, 2, 3, 4, 5, 6, 7, 0] as &[u8])),
+                (37, None),
+            ])
             .unwrap();
 
         assert_eq!(
-            marble.read(60).unwrap().unwrap(),
+            &*marble.read(60).unwrap().unwrap(),
             vec![1_u8, 2, 3, 4, 5, 6, 7, 0]
         );
 
         marble
-            .write_batch::<&[u8], _>([(37_u64, None), (0_u64, None)].into_iter())
+            .write_batch::<&[u8], _>([(37_u64, None), (0_u64, None)])
             .unwrap();
 
         assert_eq!(
-            marble.read(60).unwrap().unwrap(),
+            &*marble.read(60).unwrap().unwrap(),
             vec![1_u8, 2, 3, 4, 5, 6, 7, 0]
         );
 
         marble.maintenance().unwrap();
 
         assert_eq!(
-            marble.read(60).unwrap().unwrap(),
+            &*marble.read(60).unwrap().unwrap(),
             vec![1_u8, 2, 3, 4, 5, 6, 7, 0]
         );
 
         marble = restart(config, marble);
 
         assert_eq!(
-            marble.read(60).unwrap().unwrap(),
+            &*marble.read(60).unwrap().unwrap(),
             vec![1_u8, 2, 3, 4, 5, 6, 7, 0]
         );
     });

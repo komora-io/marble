@@ -117,11 +117,11 @@ impl Kv {
             leaf.kvs.remove(&key)
         };
 
-        let write_batch = [(object_id, Some(serialize(&leaf).unwrap()))].into_iter();
+        let write_batch = [(object_id, Some(serialize(&leaf).unwrap()))];
 
         self.heap.write_batch(write_batch)?;
 
-        let stats = self.heap.file_stats();
+        let stats = self.heap.stats();
 
         if stats.dead_objects > stats.live_objects {
             self.heap.maintenance()?;

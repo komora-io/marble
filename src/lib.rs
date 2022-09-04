@@ -53,7 +53,7 @@
 //! marble.write_batch([
 //!     (0_u64, Some(&[32_u8] as &[u8])),
 //!     (4_u64, None),
-//! ].into_iter()).unwrap();
+//! ]).unwrap();
 //!
 //! // read it back
 //! assert_eq!(marble.read(0).unwrap(), Some(vec![32].into_boxed_slice()));
