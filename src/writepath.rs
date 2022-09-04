@@ -26,6 +26,9 @@ impl Marble {
     /// before calling this function occasionally in the
     /// background, then deleting corresponding logs after
     /// this function returns.
+    #[doc(alias = "insert")]
+    #[doc(alias = "set")]
+    #[doc(alias = "put")]
     pub fn write_batch<B, I>(&self, write_batch: I) -> io::Result<()>
     where
         B: AsRef<[u8]>,
@@ -146,11 +149,28 @@ impl Marble {
         let file = fallible!(file_options.open(&tmp_path));
         let mut buf_writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
 
-        let zstd_dict = if self.config.zstd_compression_level.is_some() {
-            ZstdDict::from_samples(&objects)
-        } else {
-            ZstdDict::default()
-        };
+        let (dict_bytes_opt, mut compressor_and_level_opt, decompressor) =
+            if let Some(compression_level) = self.config.zstd_compression_level {
+                let dict_bytes_opt = crate::zstd::from_samples(&objects);
+                let (compressor_and_level_opt, decompressor) =
+                    if let Some(ref dict_bytes) = dict_bytes_opt {
+                        let mut compressor = zstd_safe::CCtx::create();
+                        compressor
+                            .load_dictionary(&dict_bytes)
+                            .map_err(crate::zstd::zstd_error)
+                            .unwrap();
+
+                        let decompressor = ZstdDict::from_dict_bytes(&dict_bytes);
+
+                        (Some((compressor, compression_level)), decompressor)
+                    } else {
+                        (None, ZstdDict::default())
+                    };
+
+                (dict_bytes_opt, compressor_and_level_opt, decompressor)
+            } else {
+                (None, None, ZstdDict::default())
+            };
 
         let mut new_relative_locations: Map<ObjectId, RelativeDiskLocation> = Map::new();
 
@@ -180,9 +200,15 @@ impl Marble {
 
             let relative_address = written_bytes;
 
-            let compressed_object =
-                if let Some(zstd_compression_level) = self.config.zstd_compression_level {
-                    Some(zstd_dict.compress(raw_object, zstd_compression_level))
+            let compressed_object: Option<Vec<u8>> =
+                if let Some((ref mut compressor, ref level)) = compressor_and_level_opt {
+                    let max_size = zstd_safe::compress_bound(raw_object.len());
+                    let mut out = Vec::with_capacity(max_size);
+                    compressor
+                        .compress(&mut out, raw_object, *level)
+                        .map_err(crate::zstd::zstd_error)
+                        .unwrap();
+                    Some(out)
                 } else {
                     None
                 };
@@ -260,7 +286,7 @@ impl Marble {
             // on us until we're done with our write operation.
             path: PathBuf::new(),
             rewrite_claim: true.into(),
-            zstd_dict: zstd_dict.clone(),
+            zstd_dict: decompressor,
         };
 
         assert!(fams.insert(location, fam).is_none());
@@ -385,10 +411,16 @@ impl Marble {
             &mut file_2,
             written_bytes,
             &new_relative_locations,
-            &zstd_dict,
+            &dict_bytes_opt,
         )
         .and_then(|_| maybe!(file_2.sync_all()))
         .and_then(|_| maybe!(fs::rename(&tmp_path, &new_path)));
+
+        let dict_len = if let Some(dict_bytes) = dict_bytes_opt {
+            dict_bytes.len()
+        } else {
+            0
+        };
 
         let file_len = fallible!(file_2.metadata()).len();
         let expected_file_len = written_bytes
@@ -396,7 +428,7 @@ impl Marble {
             + 8
             + 8
             + (16 * new_relative_locations.len() as u64)
-            + zstd_dict.as_bytes().len() as u64;
+            + dict_len as u64;
 
         assert_eq!(file_len, expected_file_len);
         assert_eq!(trailer_items, new_relative_locations.len());

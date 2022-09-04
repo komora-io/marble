@@ -65,20 +65,18 @@ pub(crate) fn read_trailer(
         ret.push((object_id, relative_loc));
     }
 
-    let zstd_dict_buf = if zstd_dict_size > 0 {
-        let dict_buf = buf[zstd_dict_buf_start..zstd_dict_buf_end].to_vec();
+    let zstd_dict = if zstd_dict_size > 0 {
+        let dict_buf = &buf[zstd_dict_buf_start..zstd_dict_buf_end];
         log::trace!(
             "read zstd dict with crc {} between offsets {} and {}",
             crc32fast::hash(&dict_buf),
             zstd_dict_buf_start,
             zstd_dict_buf_end
         );
-        Some(dict_buf)
+        ZstdDict::from_dict_bytes(dict_buf)
     } else {
-        None
+        ZstdDict::default()
     };
-
-    let zstd_dict = ZstdDict(zstd_dict_buf);
 
     Ok((ret, zstd_dict))
 }
@@ -87,13 +85,17 @@ pub(crate) fn write_trailer<'a>(
     file: &mut File,
     trailer_offset: u64,
     new_shifted_relative_locations: &Map<ObjectId, RelativeDiskLocation>,
-    zstd_dict: &ZstdDict,
+    dict_bytes_opt: &Option<Vec<u8>>,
 ) -> io::Result<()> {
     // space for overall crc + offset table + zstd dict + each
     // (object_id, location) pair
     let header_size = 4 + 8 + 8;
     let offsets = new_shifted_relative_locations.len();
-    let zstd_dict_buffer = zstd_dict.as_bytes();
+    let zstd_dict_buffer: &[u8] = if let Some(dict_bytes) = dict_bytes_opt {
+        &dict_bytes
+    } else {
+        &[]
+    };
     let zstd_dict_size = zstd_dict_buffer.len();
 
     let mut buf = Vec::with_capacity(header_size + (offsets * 16) + zstd_dict_size);

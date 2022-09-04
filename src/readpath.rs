@@ -4,12 +4,13 @@ use std::os::unix::fs::FileExt;
 
 use fault_injection::{annotate, fallible};
 
-use crate::{hash, Marble, ObjectId, HEADER_LEN};
+use crate::{hash, uninit_boxed_slice, Marble, ObjectId, HEADER_LEN};
 
 impl Marble {
     /// Read a object out of storage. If this object is
     /// unknown or has been removed, returns `Ok(None)`.
-    pub fn read(&self, object_id: ObjectId) -> io::Result<Option<Vec<u8>>> {
+    /// If there is an IO problem, returns Err.
+    pub fn read(&self, object_id: ObjectId) -> io::Result<Option<Box<[u8]>>> {
         let fams = self.fams.read().unwrap();
 
         let location = if let Some(location) = self.location_table.load(object_id) {
@@ -45,10 +46,7 @@ impl Marble {
             ));
         };
 
-        let mut compressed_buf = Vec::with_capacity(len);
-        unsafe {
-            compressed_buf.set_len(len);
-        }
+        let mut compressed_buf: Box<[u8]> = uninit_boxed_slice(len);
 
         let object_offset = file_offset + HEADER_LEN as u64;
         fallible!(fam.file.read_exact_at(&mut compressed_buf, object_offset));
