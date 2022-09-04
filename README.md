@@ -5,6 +5,8 @@
 Garbage-collecting disk-based object-store. See `examples/kv.rs`
 for a minimal key-value store built on top of this.
 
+Marble is sled's future storage engine.
+
 Supports 4 methods:
 * `read`: designed for low-latency, concurrent reads of objects
 * `write_batch`: designed for bulky, high-throughput writes of large batches of objects,
@@ -60,7 +62,7 @@ average item length is less than or equal to 8.
 
 # Examples
 
-```
+```rust
 let marble = marble::open("heap").unwrap();
 
 // Write new data keyed by a `u64` object ID.
@@ -99,7 +101,7 @@ marble.stats() = Stats {
 If you want to customize the settings passed to Marble,
 you may specify your own `Config`:
 
-```
+```rust
 let config = marble::Config {
     path: "my_path".into(),
     zstd_compression_level: Some(7),
@@ -126,7 +128,7 @@ write batch must be written together in one
 file to retain write batch atomicity in the
 face of crashes.
 
-```
+```rust
 // This function shards objects into partitions
 // similarly to a slab allocator that groups objects
 // into size buckets based on powers of two.
