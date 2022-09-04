@@ -26,6 +26,9 @@ impl Marble {
     /// before calling this function occasionally in the
     /// background, then deleting corresponding logs after
     /// this function returns.
+    #[doc(alias = "insert")]
+    #[doc(alias = "set")]
+    #[doc(alias = "put")]
     pub fn write_batch<B, I>(&self, write_batch: I) -> io::Result<()>
     where
         B: AsRef<[u8]>,

@@ -4,7 +4,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use rand::{thread_rng, Rng, RngCore};
+use rand::{thread_rng, Rng};
 
 use marble::Marble;
 
@@ -19,21 +19,19 @@ static ANY_WRITERS_DONE: AtomicBool = AtomicBool::new(false);
 fn run_writer(marble: Arc<Marble>) {
     let mut rng = thread_rng();
 
+    let lorem_ipsum = include_bytes!("lorem_ipsum.txt");
+    let max_offset = lorem_ipsum.len().max(VALUE_LEN) - VALUE_LEN;
+
     for _ in 0..BATCHES_PER_THREAD {
         let mut batch = std::collections::HashMap::new();
 
         for _ in 0..BATCH_SZ {
             let pid = rng.gen_range(0..KEYSPACE);
-            let v: Option<Vec<u8>> = if rng.gen_bool(0.1) {
+            let v: Option<&[u8]> = if rng.gen_bool(0.1) {
                 None
             } else {
-                let len = rng.gen_range(0..VALUE_LEN * 2);
-                let mut v = Vec::with_capacity(len);
-                unsafe {
-                    v.set_len(len);
-                }
-                rng.fill_bytes(&mut v);
-                Some(v)
+                let start = rng.gen_range(0..max_offset);
+                Some(&lorem_ipsum[start..start + VALUE_LEN])
             };
             batch.insert(pid, v);
         }
@@ -56,7 +54,7 @@ fn run_reader(marble: Arc<Marble>) {
         worst_time = worst_time.max(before.elapsed());
     }
 
-    println!("worst read latency: {worst_time:?}");
+    println!("worst read latency: {:?}us", worst_time.as_micros());
 }
 
 fn main() {
@@ -67,14 +65,15 @@ fn main() {
     let config = marble::Config {
         path: "bench_data".into(),
         fsync_each_batch: false,
+        zstd_compression_level: None,
         ..Default::default()
     };
 
     println!("beginning recovery");
     let marble = Arc::new(config.open().unwrap());
-    println!("marble recovered {:?}", marble.file_stats());
+    println!("marble recovered {:?}", marble.stats());
     marble.maintenance().unwrap();
-    println!("post initial maintenance: {:?}", marble.file_stats());
+    println!("post initial maintenance: {:?}", marble.stats());
 
     let mut threads = vec![];
 
@@ -107,7 +106,7 @@ fn main() {
     while threads.iter().any(|t| !t.is_finished()) {
         let cleaned_up = marble.maintenance().unwrap();
         if cleaned_up != 0 {
-            let stats = marble.file_stats();
+            let stats = marble.stats();
             println!("defragmented {cleaned_up} objects. stats: {stats:?}",);
         }
     }
@@ -118,7 +117,7 @@ fn main() {
 
     let cleaned_up = marble.maintenance().unwrap();
     if cleaned_up != 0 {
-        let stats = marble.file_stats();
+        let stats = marble.stats();
         println!("defragmented {cleaned_up} objects. stats: {stats:?}",);
     }
     let cleaned_up_2 = marble.maintenance().unwrap();

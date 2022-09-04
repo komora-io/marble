@@ -1,3 +1,138 @@
+//! # Marble
+//!
+//! Marble is a low-level object store that can be used
+//! to build your own storage engines and databases on
+//! top of.
+//!
+//! At a high-level, it supports atomic batch writes and
+//! single-object reads. Garbage collection is manual.
+//! All operations are blocking. Nothing is cached
+//! in-memory except for zstd dictionaries and file
+//! handles to all storage files. Objects may be
+//! sharded upon GC by providing a custom
+//! `Config::partition_function`. Partitioning
+//! is not performed on the write batch when it
+//! is initially written, because the write batch
+//! must be stored in a single file for it to be atomic.
+//! But when future calls to `Marble::maintenance`
+//! defragment the storage files by rewriting objects
+//! that are still live, it will use this function
+//! to assign the rewritten objects into a particular
+//! partition.
+//!
+//! You should think of Marble as the heap that you
+//! flush your write-ahead logs into periodically.
+//! It will create a new file for each write batch,
+//! and this might actually expand to more files after
+//! garbage collection if the batch is significantly
+//! larger than the `Config::target_file_size`.
+//!
+//! Marble does not create any threads or call
+//! `Marble::maintenance` automatically under any
+//! conditions. You should probably create a background
+//! thread that calls this periodically.
+//!
+//! Pretty much the only "fancy" thing that Marble does
+//! is that it can be configured to create a zstd dictionary
+//! that is tuned specifically to your write batches.
+//! This is disabled by default and can be configured
+//! by setting the `Config::zstd_compression_level` to
+//! something other than `None` (the level is passed
+//! directly to zstd during compression). Compression is
+//! bypassed if batches have fewer than 8 items or the
+//! average item length is less than or equal to 8.
+//!
+//! # Examples
+//!
+//! ```
+//! let marble = marble::open("heap").unwrap();
+//!
+//! // Write new data keyed by a `u64` object ID.
+//! // Batches contain insertions and deletions
+//! // based on whether the value is a Some or None.
+//! marble.write_batch([
+//!     (0_u64, Some(&[32_u8] as &[u8])),
+//!     (4_u64, None),
+//! ].into_iter()).unwrap();
+//!
+//! // read it back
+//! assert_eq!(marble.read(0).unwrap(), Some(vec![32].into_boxed_slice()));
+//! assert_eq!(marble.read(4).unwrap(), None);
+//! assert_eq!(marble.read(6).unwrap(), None);
+//!
+//! // after a few more batches that may have caused fragmentation
+//! // by overwriting previous objects, perform maintenance which
+//! // will defragment the object store based on `Config` settings.
+//! let objects_defragmented = marble.maintenance().unwrap();
+//!
+//! // print out system statistics
+//! dbg!(marble.stats());
+//! # drop(marble);
+//! # std::fs::remove_dir_all("heap").unwrap();
+//! ```
+//!
+//! which prints out something like
+//! ```txt,no_run
+//! marble.stats() = Stats {
+//!     live_objects: 1048576,
+//!     stored_objects: 1181100,
+//!     dead_objects: 132524,
+//!     live_percent: 88,
+//!     files: 11,
+//! }
+//! ```
+//!
+//! If you want to customize the settings passed to Marble,
+//! you may specify your own `Config`:
+//!
+//! ```
+//! let config = marble::Config {
+//!     path: "my_path".into(),
+//!     zstd_compression_level: Some(7),
+//!     fsync_each_batch: true,
+//!     target_file_size: 64 * 1024 * 1024,
+//!     file_compaction_percent: 50,
+//!     ..Default::default()
+//! };
+//!
+//! let marble = config.open().unwrap();
+//! # drop(marble);
+//! # std::fs::remove_dir_all("my_path").unwrap();
+//! ```
+//!
+//! A custom GC sharding function may be provided
+//! for partitioning objects based on the object ID
+//! and size. This may be useful if your higher-level
+//! system allocates certain ranges of object IDs for
+//! certain types of objects that you would like to
+//! group together in the hope of grouping items together
+//! that have similar fragmentation properties (similar
+//! expected lifespan etc...). This will only shard
+//! objects when they are defragmented through the
+//! `Marble::maintenance` method, because each new
+//! write batch must be written together in one
+//! file to retain write batch atomicity in the
+//! face of crashes.
+//!
+//! ```
+//! // This function shards objects into partitions
+//! // similarly to a slab allocator that groups objects
+//! // into size buckets based on powers of two.
+//! fn shard_by_size(object_id: u64, object_size: usize) -> u8 {
+//!     let next_po2 = object_size.next_power_of_two();
+//!     u8::try_from(next_po2.trailing_zeros()).unwrap()
+//! }
+//!
+//! let config = marble::Config {
+//!     path: "my_sharded_path".into(),
+//!     partition_function: shard_by_size,
+//!     ..Default::default()
+//! };
+//!
+//! let marble = config.open().unwrap();
+//! # drop(marble);
+//! # std::fs::remove_dir_all("my_sharded_path").unwrap();
+//! ```
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
@@ -79,6 +214,9 @@ pub struct Stats {
     /// The percentage of all objects on disk that are
     /// live. This is another way of expressing fragmentation.
     pub live_percent: u8,
+    /// The number of backing storage files that exist and are
+    /// being held open.
+    pub files: usize,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -178,12 +316,15 @@ impl Marble {
     /// characteristics.
     #[doc(alias = "file_statistics")]
     #[doc(alias = "statistics")]
-    #[doc(alias = "stats")]
-    pub fn file_stats(&self) -> Stats {
+    #[doc(alias = "metrics")]
+    #[doc(alias = "info")]
+    pub fn stats(&self) -> Stats {
         let mut live_objects = 0;
         let mut stored_objects = 0;
 
-        for (_, fam) in &*self.fams.read().unwrap() {
+        let fams = self.fams.read().unwrap();
+
+        for (_, fam) in &*fams {
             live_objects += fam.len.load(SeqCst);
             stored_objects += fam.metadata.present_objects;
         }
@@ -193,6 +334,7 @@ impl Marble {
             stored_objects,
             dead_objects: stored_objects - live_objects,
             live_percent: u8::try_from((live_objects * 100) / stored_objects.max(1)).unwrap(),
+            files: fams.len(),
         }
     }
 
