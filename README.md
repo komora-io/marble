@@ -5,7 +5,7 @@
 Garbage-collecting disk-based object-store. See `examples/kv.rs`
 for a minimal key-value store built on top of this.
 
-Marble is sled's future storage engine.
+Marble is [sled](https://github.com/spacejam/sled)'s future storage engine.
 
 Supports 4 methods:
 * `read`: designed for low-latency, concurrent reads of objects
