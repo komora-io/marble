@@ -1,14 +1,11 @@
-use std::io::{self, BufReader, Read, Seek};
-use std::sync::atomic::Ordering::SeqCst;
+use std::io::{self, Read};
 
-use fault_injection::{annotate, fallible};
+use fault_injection::annotate;
 
 use crate::{
-    debug_delay, hash, read_trailer, uninit_boxed_slice, DeferUnclaim, DiskLocation, Map, Marble,
+    hash, read_range_at, read_trailer_from_buf, uninit_boxed_slice, DiskLocation, Map, Marble,
     ObjectId, RelativeDiskLocation, HEADER_LEN,
 };
-
-const MAX_GENERATION: u8 = 3;
 
 impl Marble {
     /// Defragments backing storage files, blocking
@@ -18,54 +15,8 @@ impl Marble {
     pub fn maintenance(&self) -> io::Result<usize> {
         log::debug!("performing maintenance");
 
-        let mut defer_unclaim = DeferUnclaim {
-            marble: self,
-            claims: vec![],
-        };
-
-        let mut files_to_defrag: Map<u8, Vec<_>> = Default::default();
-
-        let fams = self.fams.read().unwrap();
-
-        for (location, fam) in &*fams {
-            assert_eq!(*location, fam.location);
-            let len = fam.len.load(SeqCst);
-            let present_objects = fam.metadata.present_objects;
-
-            if len != 0
-                && (len * 100) / present_objects.max(1)
-                    < u64::from(self.config.file_compaction_percent)
-            {
-                debug_delay();
-                let already_claimed = fam.rewrite_claim.swap(true, SeqCst);
-                if already_claimed {
-                    // try to exclusively claim this file
-                    // for rewrite to
-                    // prevent concurrent attempts at
-                    // rewriting its contents
-                    continue;
-                }
-                assert_ne!(present_objects, 0);
-
-                defer_unclaim.claims.push(*location);
-
-                log::trace!(
-                    "fam at location {:?} is ready to be compacted",
-                    fam.location
-                );
-
-                let generation = fam.generation.saturating_add(1).min(MAX_GENERATION);
-
-                let entry = files_to_defrag.entry(generation).or_default();
-                entry.push((
-                    *location,
-                    fam.path.clone(),
-                    fam.file.try_clone()?,
-                    fam.metadata.trailer_offset,
-                ));
-            }
-        }
-        drop(fams);
+        let (files_to_defrag, claims): (Map<u8, Vec<_>>, _) =
+            self.file_map.files_to_defrag(&self.config)?;
 
         // use this old_locations Map in the outer loop to reuse the
         // allocation and avoid resizing as often.
@@ -90,17 +41,19 @@ impl Marble {
             let mut batch = Map::new();
             let mut rewritten_fam_locations = vec![];
 
-            for (base_location, path, mut file, trailer_offset) in file_to_defrag {
+            for (base_location, path, file, trailer_offset, file_size) in file_to_defrag {
                 log::trace!(
                     "rewriting any surviving objects in file at location {base_location:?}"
                 );
                 rewritten_fam_locations.push(base_location);
 
-                let (trailer, zstd_dict) = read_trailer(&mut file, trailer_offset)?;
+                // TODO handle trailer read using full buf
+                let file_buf = read_range_at(&file, 0, file_size)?;
 
-                fallible!(file.seek(io::SeekFrom::Start(0)));
+                let (trailer, zstd_dict) =
+                    read_trailer_from_buf(&file_buf[usize::try_from(trailer_offset).unwrap()..])?;
 
-                let mut buf_reader = BufReader::new(file);
+                let mut buf_reader = std::io::Cursor::new(file_buf);
 
                 let mut offset = 0_u64;
 
@@ -212,20 +165,13 @@ impl Marble {
             self.shard_batch(batch, generation, &old_locations)?;
             old_locations.clear();
 
-            let fams = self.fams.read().unwrap();
-            for location in rewritten_fam_locations {
-                self.verify_file_uninhabited(location, &fams);
-                //let fam = &fams[&location];
-                //assert_eq!(fam.len.load(SeqCst), 0, "bug
-                // with length tracking, because we have
-                // verified that this file is actually
-                // uninhabited: fam: {fam:?}")
-            }
+            self.file_map
+                .verify_files_uninhabited(&rewritten_fam_locations);
         }
 
-        drop(defer_unclaim);
+        drop(claims);
 
-        self.prune_empty_fams()?;
+        self.prune_empty_files()?;
 
         Ok(rewritten_objects)
     }

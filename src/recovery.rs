@@ -5,14 +5,14 @@ use std::ops::Bound::{Included, Unbounded};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering::SeqCst},
-    RwLock,
+    Arc, RwLock,
 };
 
 use fault_injection::fallible;
 
 use crate::{
-    read_trailer, Config, DiskLocation, FileAndMetadata, LocationTable, Map, Marble, Metadata,
-    NEW_WRITE_BATCH_MASK,
+    read_trailer, Config, DiskLocation, FileAndMetadata, FileMap, LocationTable, Map, Marble,
+    Metadata, NEW_WRITE_BATCH_MASK,
 };
 
 const HEAP_DIR_SUFFIX: &str = "heap";
@@ -59,7 +59,8 @@ impl Config {
 
             let mut file = fallible!(options.open(entry.path()));
 
-            let (trailer, zstd_dict) = read_trailer(&mut file, metadata.trailer_offset)?;
+            let (trailer, zstd_dict) =
+                read_trailer(&mut file, metadata.trailer_offset, metadata.file_size)?;
 
             for (object_id, relative_loc) in trailer {
                 // add file base LSN to relative offset
@@ -86,12 +87,12 @@ impl Config {
                 len: 0.into(),
                 metadata: metadata,
                 path: entry.path().into(),
-                file,
+                file: Arc::new(file),
                 location: file_location,
                 generation: metadata.generation,
                 rewrite_claim: false.into(),
                 synced: true.into(),
-                zstd_dict,
+                zstd_dict: Arc::new(zstd_dict),
             };
 
             log::debug!("inserting new fam at location {:?}", file_location);
@@ -118,8 +119,10 @@ impl Config {
 
         Ok(Marble {
             location_table,
-            fams: RwLock::new(fams),
-            next_file_lsn,
+            file_map: FileMap {
+                inner: RwLock::new(fams),
+                next_file_lsn,
+            },
             config,
             directory_lock,
             #[cfg(feature = "runtime_validation")]
@@ -133,6 +136,7 @@ fn read_storage_directory(heap_dir: PathBuf) -> io::Result<Vec<(Metadata, fs::Di
     // parse file names
     for entry_res in fallible!(fs::read_dir(heap_dir)) {
         let entry = fallible!(entry_res);
+        let file_size = fallible!(entry.metadata()).len();
         let path = entry.path();
         let name = path
             .file_name()
@@ -153,7 +157,7 @@ fn read_storage_directory(heap_dir: PathBuf) -> io::Result<Vec<(Metadata, fs::Di
             continue;
         }
 
-        let metadata = match Metadata::parse(name) {
+        let metadata = match Metadata::parse(name, file_size) {
             Some(mn) => mn,
             None => {
                 log::error!(

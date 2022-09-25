@@ -1,5 +1,4 @@
 use std::io;
-use std::ops::Bound::{Included, Unbounded};
 use std::os::unix::fs::FileExt;
 
 use fault_injection::{annotate, fallible};
@@ -11,7 +10,7 @@ impl Marble {
     /// unknown or has been removed, returns `Ok(None)`.
     /// If there is an IO problem, returns Err.
     pub fn read(&self, object_id: ObjectId) -> io::Result<Option<Box<[u8]>>> {
-        let fams = self.fams.read().unwrap();
+        let guard = self.file_map.pin();
 
         let location = if let Some(location) = self.location_table.load(object_id) {
             location
@@ -23,15 +22,12 @@ impl Marble {
             return Ok(None);
         }
 
-        let (base_location, fam) = fams
-            .range((Unbounded, Included(location)))
-            .next_back()
-            .expect("no possible storage file for object - likely file corruption");
+        let (base_location, file, dict) = self.file_map.file_and_dict_for_object(location);
 
         let file_offset = location.lsn() - base_location.lsn();
 
         let mut header_buf = [0_u8; HEADER_LEN];
-        fallible!(fam.file.read_exact_at(&mut header_buf, file_offset));
+        fallible!(file.read_exact_at(&mut header_buf, file_offset));
 
         let crc_expected: [u8; 4] = header_buf[0..4].try_into().unwrap();
         let pid_buf: [u8; 8] = header_buf[4..12].try_into().unwrap();
@@ -49,7 +45,9 @@ impl Marble {
         let mut compressed_buf: Box<[u8]> = uninit_boxed_slice(len);
 
         let object_offset = file_offset + HEADER_LEN as u64;
-        fallible!(fam.file.read_exact_at(&mut compressed_buf, object_offset));
+        fallible!(file.read_exact_at(&mut compressed_buf, object_offset));
+
+        drop(guard);
 
         let crc_actual = hash(len_buf, pid_buf, &compressed_buf);
 
@@ -69,6 +67,6 @@ impl Marble {
 
         assert_eq!(object_id, read_pid);
 
-        Ok(Some(fam.zstd_dict.decompress(compressed_buf)))
+        Ok(Some(dict.decompress(compressed_buf)))
     }
 }

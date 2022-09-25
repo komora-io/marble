@@ -133,13 +133,12 @@
 //! # drop(marble);
 //! # std::fs::remove_dir_all("my_sharded_path").unwrap();
 //! ```
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering::SeqCst},
-    RwLock,
+    atomic::{AtomicBool, AtomicU64},
+    Arc,
 };
 
 use fault_injection::fallible;
@@ -155,6 +154,7 @@ mod debug_delay;
 #[cfg(feature = "runtime_validation")]
 mod debug_history;
 mod disk_location;
+mod file_map;
 mod gc;
 mod location_table;
 mod readpath;
@@ -166,8 +166,9 @@ mod zstd;
 pub use config::Config;
 use debug_delay::debug_delay;
 use disk_location::{DiskLocation, RelativeDiskLocation};
+use file_map::FileMap;
 use location_table::LocationTable;
-use trailer::{read_trailer, write_trailer};
+use trailer::{read_trailer, read_trailer_from_buf, write_trailer};
 use zstd::ZstdDict;
 
 const HEADER_LEN: usize = 20;
@@ -175,6 +176,22 @@ const NEW_WRITE_BATCH_BIT: u64 = 1 << 62;
 const NEW_WRITE_BATCH_MASK: u64 = u64::MAX - NEW_WRITE_BATCH_BIT;
 
 type ObjectId = u64;
+
+fn read_range_at(file: &File, start: u64, end: u64) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+
+    let buf_sz: usize = (end - start).try_into().unwrap();
+
+    let mut buf = Vec::with_capacity(buf_sz);
+
+    unsafe {
+        buf.set_len(buf_sz);
+    }
+
+    fallible!(file.read_exact_at(&mut buf, start));
+
+    Ok(buf)
+}
 
 fn uninit_boxed_slice(len: usize) -> Box<[u8]> {
     use std::alloc::{alloc, Layout};
@@ -225,10 +242,11 @@ struct Metadata {
     trailer_offset: u64,
     present_objects: u64,
     generation: u8,
+    file_size: u64,
 }
 
 impl Metadata {
-    fn parse(name: &str) -> Option<Metadata> {
+    fn parse(name: &str, file_size: u64) -> Option<Metadata> {
         let mut splits = name.split("-");
 
         Some(Metadata {
@@ -236,6 +254,7 @@ impl Metadata {
             trailer_offset: u64::from_str_radix(&splits.next()?, 16).ok()?,
             present_objects: u64::from_str_radix(&splits.next()?, 16).ok()?,
             generation: u8::from_str_radix(splits.next()?, 16).ok()?,
+            file_size,
         })
     }
 
@@ -250,7 +269,7 @@ impl Metadata {
 
 #[derive(Debug)]
 struct FileAndMetadata {
-    file: File,
+    file: Arc<File>,
     location: DiskLocation,
     path: PathBuf,
     metadata: Metadata,
@@ -258,7 +277,7 @@ struct FileAndMetadata {
     generation: u8,
     rewrite_claim: AtomicBool,
     synced: AtomicBool,
-    zstd_dict: ZstdDict,
+    zstd_dict: Arc<ZstdDict>,
 }
 
 /// Shard based on rough size ranges corresponding to SSD
@@ -301,8 +320,7 @@ pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Marble> {
 pub struct Marble {
     // maps from ObjectId to DiskLocation
     location_table: LocationTable,
-    next_file_lsn: AtomicU64,
-    fams: RwLock<BTreeMap<DiskLocation, FileAndMetadata>>,
+    file_map: FileMap,
     config: Config,
     directory_lock: File,
     #[cfg(feature = "runtime_validation")]
@@ -319,81 +337,22 @@ impl Marble {
     #[doc(alias = "metrics")]
     #[doc(alias = "info")]
     pub fn stats(&self) -> Stats {
-        let mut live_objects = 0;
-        let mut stored_objects = 0;
-
-        let fams = self.fams.read().unwrap();
-
-        for (_, fam) in &*fams {
-            live_objects += fam.len.load(SeqCst);
-            stored_objects += fam.metadata.present_objects;
-        }
-
-        Stats {
-            live_objects,
-            stored_objects,
-            dead_objects: stored_objects - live_objects,
-            live_percent: u8::try_from((live_objects * 100) / stored_objects.max(1)).unwrap(),
-            files: fams.len(),
-        }
+        self.file_map.stats()
     }
 
-    fn prune_empty_fams(&self) -> io::Result<()> {
-        // get writer file lock and remove the empty fams
-        let mut paths_to_remove = vec![];
-
-        let read_fams = self.fams.read().unwrap();
-
-        for (location, fam) in &*read_fams {
-            debug_delay();
-            if fam.len.load(SeqCst) == 0 && !fam.rewrite_claim.swap(true, SeqCst) {
-                log::trace!("fam at location {location:?} is empty, marking it for removal",);
-                paths_to_remove.push((*location, fam.path.clone()));
-            }
-        }
-
-        drop(read_fams);
-
-        let mut fams = self.fams.write().unwrap();
-
-        for (location, _) in &paths_to_remove {
-            log::trace!("removing fam at location {:?}", location);
-
-            self.verify_file_uninhabited(*location, &fams);
-
-            fams.remove(location).unwrap();
-        }
-
-        drop(fams);
-
-        for (_, path) in paths_to_remove {
-            // If this fails, it causes a file leak, but it
-            // is fixed by simply restarting.
-            fallible!(std::fs::remove_file(path));
-        }
-
-        Ok(())
+    fn prune_empty_files(&self) -> io::Result<()> {
+        self.file_map.prune_empty_files()
     }
+
     /// If `Config::fsync_each_batch` is `false`, this
     /// method can be called at a desired interval to
     /// ensure that the written batches are durable on
     /// disk.
     pub fn sync_all(&self) -> io::Result<()> {
-        let fams = self.fams.read().unwrap();
-
-        let mut synced_files = false;
-        for fam in fams.values() {
-            if !fam.synced.load(SeqCst) {
-                fam.file.sync_all()?;
-                fam.synced.store(true, SeqCst);
-                synced_files = true;
-            }
-        }
-
+        let synced_files = self.file_map.sync_all()?;
         if synced_files {
             fallible!(self.directory_lock.sync_all());
         }
-
         Ok(())
     }
 
@@ -413,59 +372,4 @@ impl Marble {
         });
         (max, iter)
     }
-
-    fn verify_file_uninhabited(
-        &self,
-        _location: DiskLocation,
-        _fams: &BTreeMap<DiskLocation, FileAndMetadata>,
-    ) {
-        #[cfg(feature = "runtime_validation")]
-        {
-            let fam = &_fams[&_location];
-            let next_location =
-                DiskLocation::new_fam(_location.lsn() + fam.metadata.trailer_offset);
-            let present: Vec<(ObjectId, DiskLocation)> = self
-                .location_table
-                .iter()
-                .filter(|(_oid, loc)| *loc >= _location && *loc < next_location)
-                .collect();
-
-            if !present.is_empty() {
-                panic!(
-                    "orphaned object location pairs in location table: {present:?}, which map to \
-                     the file we're about to delete: {_location:?} which is lower than the next \
-                     highest location {next_location:?}"
-                );
-            }
-        }
-    }
-}
-
-// `DeferUnclaim` exists because it was surprisingly
-// leak-prone to try to manage fams that were claimed by a
-// maintenance thread but never used. This ensures fams
-// always get unclaimed after this function returns.
-struct DeferUnclaim<'a> {
-    marble: &'a Marble,
-    claims: Vec<DiskLocation>,
-}
-
-impl<'a> Drop for DeferUnclaim<'a> {
-    fn drop(&mut self) {
-        let fams = self.marble.fams.read().unwrap();
-        for claim in &self.claims {
-            if let Some(fam) = fams.get(claim) {
-                debug_delay();
-                assert!(fam.rewrite_claim.swap(false, SeqCst));
-            }
-        }
-    }
-}
-
-fn _auto_trait_assertions() {
-    use core::panic::{RefUnwindSafe, UnwindSafe};
-
-    fn f<T: Send + Sync + UnwindSafe + RefUnwindSafe>() {}
-
-    f::<Marble>();
 }
