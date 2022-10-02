@@ -327,6 +327,20 @@ pub struct Marble {
     debug_history: std::sync::Mutex<debug_history::DebugHistory>,
 }
 
+impl std::fmt::Debug for Marble {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Marble")
+            .field("stats", &self.stats())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for Marble {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Marble {{ ... }}")
+    }
+}
+
 impl Marble {
     /// Statistics about current files, intended to inform
     /// decisions about when to call `maintenance` based on
