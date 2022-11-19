@@ -9,7 +9,6 @@ use std::sync::{
 };
 
 use concurrent_map::{ConcurrentMap, Maximum};
-use fault_injection::maybe;
 
 use crate::{
     debug_delay, Config, DiskLocation, FileAndMetadata, Map, Metadata, ObjectId, Stats, ZstdDict,
@@ -152,7 +151,6 @@ impl FileMap {
             path: AtomicPtr::default(),
             rewrite_claim: true.into(),
             zstd_dict: decompressor,
-            remove_path_on_drop: false.into(),
         });
 
         assert!(self.fams.insert(Reverse(location), fam).is_none());
@@ -254,7 +252,7 @@ impl FileMap {
         fam.len.store(0, SeqCst);
 
         let path_ptr = Box::into_raw(Box::new(tmp_path));
-        let old_path_ptr = fam.path.swap(path_ptr, std::sync::atomic::Ordering::SeqCst);
+        let old_path_ptr = fam.path.swap(path_ptr, SeqCst);
         assert!(old_path_ptr.is_null());
     }
 

@@ -96,7 +96,6 @@ impl Config {
                 rewrite_claim: false.into(),
                 synced: true.into(),
                 zstd_dict: zstd_dict,
-                remove_path_on_drop: false.into(),
             };
 
             fam.install_metadata_and_path(metadata, entry.path().into());

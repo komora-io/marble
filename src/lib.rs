@@ -137,7 +137,10 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, AtomicPtr, AtomicU64},
+    atomic::{
+        AtomicBool, AtomicPtr, AtomicU64,
+        Ordering::{Acquire, SeqCst},
+    },
     Arc,
 };
 
@@ -170,7 +173,7 @@ impl std::hash::Hasher for LocationHasher {
     }
 
     #[inline]
-    fn write(&mut self, bytes: &[u8]) {
+    fn write(&mut self, _: &[u8]) {
         panic!("trying to use LocationHasher with incorrect type");
     }
 }
@@ -310,12 +313,12 @@ struct FileAndMetadata {
     rewrite_claim: AtomicBool,
     synced: AtomicBool,
     zstd_dict: ZstdDict,
-    remove_path_on_drop: AtomicBool,
 }
 
 impl Drop for FileAndMetadata {
     fn drop(&mut self) {
-        if self.len.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        let empty = self.len.load(Acquire) == 0;
+        if empty {
             if let Err(e) = std::fs::remove_file(self.path().unwrap()) {
                 eprintln!("failed to remove empty FileAndMetadata on drop: {:?}", e);
             }
@@ -325,7 +328,7 @@ impl Drop for FileAndMetadata {
 
 impl FileAndMetadata {
     fn metadata(&self) -> Option<&Metadata> {
-        let metadata_ptr = self.metadata.load(std::sync::atomic::Ordering::Acquire);
+        let metadata_ptr = self.metadata.load(Acquire);
         if metadata_ptr.is_null() {
             // metadata not yet initialized
             None
@@ -339,20 +342,16 @@ impl FileAndMetadata {
         // want to be able to assume that if metadata
         // is present, then so is path.
         let path_ptr = Box::into_raw(Box::new(path));
-        let old_path_ptr = self
-            .path
-            .swap(path_ptr, std::sync::atomic::Ordering::SeqCst);
+        let old_path_ptr = self.path.swap(path_ptr, SeqCst);
         assert!(old_path_ptr.is_null());
 
         let meta_ptr = Box::into_raw(Box::new(metadata));
-        let old_meta_ptr = self
-            .metadata
-            .swap(meta_ptr, std::sync::atomic::Ordering::SeqCst);
+        let old_meta_ptr = self.metadata.swap(meta_ptr, SeqCst);
         assert!(old_meta_ptr.is_null());
     }
 
     fn path(&self) -> Option<&PathBuf> {
-        let path_ptr = self.path.load(std::sync::atomic::Ordering::Acquire);
+        let path_ptr = self.path.load(Acquire);
         if path_ptr.is_null() {
             // metadata not yet initialized
             None
