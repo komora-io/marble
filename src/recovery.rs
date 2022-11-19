@@ -18,6 +18,7 @@ use crate::{
 
 const HEAP_DIR_SUFFIX: &str = "heap";
 const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
+const LEGEND: &str = "             lsn   trailer_offset  present_objects generation";
 
 impl Config {
     pub fn open(&self) -> io::Result<Marble> {
@@ -38,6 +39,7 @@ impl Config {
             }
         }
 
+        let _ = File::create(config.path.join(HEAP_DIR_SUFFIX).join(LEGEND));
         let _ = File::create(config.path.join(WARN));
 
         let mut file_lock_opts = OpenOptions::new();
@@ -164,10 +166,12 @@ fn read_storage_directory(heap_dir: PathBuf) -> io::Result<Vec<(Metadata, fs::Di
         let metadata = match Metadata::parse(name, file_size) {
             Some(mn) => mn,
             None => {
-                log::error!(
-                    "encountered strange file in internal directory: {:?}",
-                    entry.path(),
-                );
+                if name != LEGEND {
+                    log::error!(
+                        "encountered strange file in internal directory: {:?}",
+                        entry.path(),
+                    );
+                }
                 continue;
             }
         };

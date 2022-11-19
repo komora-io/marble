@@ -112,8 +112,9 @@ fn main() {
         thread.join().unwrap();
     }
 
-    let cleaned_up = marble.maintenance().unwrap();
-    if cleaned_up != 0 {
+    let mut cleaned_up = 1;
+    while cleaned_up != 0 {
+        cleaned_up = marble.maintenance().unwrap();
         let stats = marble.stats();
         println!("defragmented {cleaned_up} objects. stats: {stats:?}",);
     }
