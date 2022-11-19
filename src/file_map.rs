@@ -58,7 +58,7 @@ impl FileMap {
             claims: vec![],
         };
 
-        let mut files_to_defrag: Map<u8, Vec<Arc<FileAndMetadata>>> = Map::new();
+        let mut files_to_defrag: Map<u8, Vec<Arc<FileAndMetadata>>> = Map::default();
 
         for (location, fam) in &self.fams {
             assert_eq!(location.0, fam.location);
@@ -128,8 +128,6 @@ impl FileMap {
         config: &Config,
         decompressor: ZstdDict,
     ) -> (DiskLocation, DeferUnclaim<'a>) {
-        // NB this fetch_add should always happen while fams write
-        // lock is being held
         let lsn_base = self.next_file_lsn.fetch_add(written_bytes + 1, SeqCst);
 
         let lsn = if is_gc {
@@ -183,7 +181,7 @@ impl FileMap {
     }
 
     pub fn prune_empty_files<'a>(&'a self) -> io::Result<()> {
-        // get writer file lock and remove the empty fams
+        // remove the empty fams
         let mut paths_to_remove = vec![];
 
         let mut claims = DeferUnclaim {

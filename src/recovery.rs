@@ -52,7 +52,7 @@ impl Config {
         let mut max_file_lsn = 0;
         let mut max_file_size = 0;
 
-        let mut recovery_page_table = Map::new();
+        let mut recovery_page_table = Map::default();
 
         let files = read_storage_directory(heap_dir)?;
 

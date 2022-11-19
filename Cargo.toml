@@ -20,7 +20,6 @@ panic = "abort"
 runtime_validation = ["rand"]
 
 [dev-dependencies]
-criterion = {version = "0.3.6", features = ["html_reports"]}
 env_logger = "0.9.0"
 rand = "0.8.5"
 
@@ -34,7 +33,8 @@ rand = { version = "0.8.5", optional = true }
 zstd-safe = { version="5.0.2", features=["std", "experimental"] }
 serde = { version = "1.0.144", features = ["derive"], optional = true }
 bincode = { version = "1.3.3", optional = true }
-concurrent-map = { version ="5.0", path = "../concurrent-map" }
+concurrent-map = { version ="5.0" }
+criterion = {version = "0.3.6", features = ["html_reports"], optional = true}
 
 [[bench]]
 name = "marble_bench"

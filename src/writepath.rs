@@ -32,7 +32,7 @@ impl Marble {
         B: AsRef<[u8]>,
         I: IntoIterator<Item = (ObjectId, Option<B>)>,
     {
-        let old_locations = Map::new();
+        let old_locations = Map::default();
         self.shard_batch(write_batch, NEW_WRITE_GENERATION, &old_locations)
     }
 
@@ -48,7 +48,7 @@ impl Marble {
     {
         // maps from shard -> (shard size, map of object
         // id's to object data)
-        let mut shards: Map<u8, (usize, Map<ObjectId, Option<B>>)> = Map::new();
+        let mut shards: Map<u8, (usize, Map<ObjectId, Option<B>>)> = Map::default();
 
         let mut fragmented_shards = vec![];
 
@@ -170,7 +170,7 @@ impl Marble {
                 (None, None, ZstdDict::default())
             };
 
-        let mut new_relative_locations: Map<ObjectId, RelativeDiskLocation> = Map::new();
+        let mut new_relative_locations: Map<ObjectId, RelativeDiskLocation> = Map::default();
 
         let mut written_bytes: u64 = 0;
         for (object_id, raw_object_opt) in &objects {

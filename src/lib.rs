@@ -143,8 +143,40 @@ use std::sync::{
 
 use fault_injection::fallible;
 
+#[derive(Clone, Copy)]
+pub struct LocationHasher(u64);
+
+impl Default for LocationHasher {
+    #[inline]
+    fn default() -> LocationHasher {
+        LocationHasher(0)
+    }
+}
+
+impl std::hash::Hasher for LocationHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write_u8(&mut self, n: u8) {
+        self.0 = u64::from(n);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        panic!("trying to use LocationHasher with incorrect type");
+    }
+}
+
 #[cfg(not(feature = "runtime_validation"))]
-type Map<K, V> = std::collections::HashMap<K, V>;
+type Map<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<LocationHasher>>;
 
 #[cfg(feature = "runtime_validation")]
 type Map<K, V> = std::collections::BTreeMap<K, V>;

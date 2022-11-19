@@ -20,7 +20,7 @@ impl Marble {
 
         // use this old_locations Map in the outer loop to reuse the
         // allocation and avoid resizing as often.
-        let mut old_locations: Map<ObjectId, DiskLocation> = Map::new();
+        let mut old_locations: Map<ObjectId, DiskLocation> = Map::default();
 
         let mut rewritten_objects = 0;
 
@@ -38,7 +38,7 @@ impl Marble {
                 continue;
             }
 
-            let mut batch = Map::new();
+            let mut batch = Map::default();
             let mut rewritten_fam_locations = vec![];
 
             for fam in file_to_defrag {
