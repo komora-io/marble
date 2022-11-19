@@ -41,23 +41,30 @@ impl Marble {
             let mut batch = Map::new();
             let mut rewritten_fam_locations = vec![];
 
-            for (base_location, path, file, trailer_offset, file_size) in file_to_defrag {
+            for fam in file_to_defrag {
                 log::trace!(
-                    "rewriting any surviving objects in file at location {base_location:?}"
+                    "rewriting any surviving objects in file at location {:?}",
+                    fam.location
                 );
-                rewritten_fam_locations.push(base_location);
+                rewritten_fam_locations.push(fam.location);
+                let metadata: &crate::Metadata = fam
+                    .metadata()
+                    .expect("anything being defragged should have metadata already set");
+
+                let path: &std::path::PathBuf = fam.path().unwrap();
 
                 // TODO handle trailer read using full buf
-                let file_buf = read_range_at(&file, 0, file_size)?;
+                let file_buf = read_range_at(&fam.file, 0, metadata.file_size)?;
 
-                let (trailer, zstd_dict) =
-                    read_trailer_from_buf(&file_buf[usize::try_from(trailer_offset).unwrap()..])?;
+                let (trailer, zstd_dict) = read_trailer_from_buf(
+                    &file_buf[usize::try_from(metadata.trailer_offset).unwrap()..],
+                )?;
 
                 let mut buf_reader = std::io::Cursor::new(file_buf);
 
                 let mut offset = 0_u64;
 
-                while offset < trailer_offset {
+                while offset < metadata.trailer_offset {
                     let mut header = [0_u8; HEADER_LEN];
                     buf_reader.read_exact(&mut header)?;
 
@@ -82,7 +89,7 @@ impl Marble {
                         .expect("anything being rewritten should exist in the location table");
 
                     let rewritten_location =
-                        RelativeDiskLocation::new(offset, false).to_absolute(base_location.lsn());
+                        RelativeDiskLocation::new(offset, false).to_absolute(fam.location.lsn());
 
                     // all objects present before the trailer are not deletes
                     let mut object_buf = uninit_boxed_slice(len);
@@ -127,13 +134,14 @@ impl Marble {
                 }
 
                 log::trace!(
-                    "trying to read trailer at file for lsn {} offset {trailer_offset} items",
-                    base_location.lsn(),
+                    "trying to read trailer at file for lsn {} offset {} items",
+                    metadata.trailer_offset,
+                    fam.location.lsn(),
                 );
 
                 for (object_id, relative_location) in trailer {
                     if relative_location.is_delete() {
-                        let rewritten_location = relative_location.to_absolute(base_location.lsn());
+                        let rewritten_location = relative_location.to_absolute(fam.location.lsn());
                         let current_location = self
                             .location_table
                             .load(object_id)

@@ -268,7 +268,6 @@ impl Marble {
         );
 
         // 3. attempt installation into pagetable
-
         let mut replaced_locations: Vec<(ObjectId, DiskLocation)> = vec![];
         let mut failed_gc_locations = vec![];
         let mut subtract_from_len = 0;
@@ -354,7 +353,9 @@ impl Marble {
         let trailer_items = new_relative_locations.len();
 
         if trailer_items == 0 {
-            self.file_map.remove_fam(base_location)?;
+            self.file_map
+                .delete_partially_installed_fam(base_location, tmp_path);
+
             return Ok(());
         }
 
@@ -414,7 +415,8 @@ impl Marble {
                     .location_table
                     .cas(object_id, new_location, old_location);
             }
-            self.file_map.remove_fam(base_location)?;
+            self.file_map
+                .delete_partially_installed_fam(base_location, tmp_path);
             log::error!("failed to write new file: {:?}", e);
             return Err(e);
         };

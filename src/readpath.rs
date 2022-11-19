@@ -10,8 +10,6 @@ impl Marble {
     /// unknown or has been removed, returns `Ok(None)`.
     /// If there is an IO problem, returns Err.
     pub fn read(&self, object_id: ObjectId) -> io::Result<Option<Box<[u8]>>> {
-        let guard = self.file_map.pin();
-
         let location = if let Some(location) = self.location_table.load(object_id) {
             location
         } else {
@@ -22,12 +20,12 @@ impl Marble {
             return Ok(None);
         }
 
-        let (base_location, file, dict) = self.file_map.file_and_dict_for_object(location);
+        let fam = self.file_map.fam_for_location(location);
 
-        let file_offset = location.lsn() - base_location.lsn();
+        let file_offset = location.lsn() - fam.location.lsn();
 
         let mut header_buf = [0_u8; HEADER_LEN];
-        fallible!(file.read_exact_at(&mut header_buf, file_offset));
+        fallible!(fam.file.read_exact_at(&mut header_buf, file_offset));
 
         let crc_expected: [u8; 4] = header_buf[0..4].try_into().unwrap();
         let pid_buf: [u8; 8] = header_buf[4..12].try_into().unwrap();
@@ -45,9 +43,7 @@ impl Marble {
         let mut compressed_buf: Box<[u8]> = uninit_boxed_slice(len);
 
         let object_offset = file_offset + HEADER_LEN as u64;
-        fallible!(file.read_exact_at(&mut compressed_buf, object_offset));
-
-        drop(guard);
+        fallible!(fam.file.read_exact_at(&mut compressed_buf, object_offset));
 
         let crc_actual = hash(len_buf, pid_buf, &compressed_buf);
 
@@ -67,6 +63,6 @@ impl Marble {
 
         assert_eq!(object_id, read_pid);
 
-        Ok(Some(dict.decompress(compressed_buf)))
+        Ok(Some(fam.zstd_dict.decompress(compressed_buf)))
     }
 }

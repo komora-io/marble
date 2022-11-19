@@ -28,12 +28,13 @@ rand = "0.8.5"
 crc32fast = "1.3.2"
 log = "0.4.17"
 fs2 = "0.4.3"
-pagetable = { version = "0.2.6" }
+pagetable = { version = "0.3" }
 fault-injection = "1.0.7"
 rand = { version = "0.8.5", optional = true }
 zstd-safe = { version="5.0.2", features=["std", "experimental"] }
 serde = { version = "1.0.144", features = ["derive"], optional = true }
 bincode = { version = "1.3.3", optional = true }
+concurrent-map = { version ="5.0", path = "../concurrent-map" }
 
 [[bench]]
 name = "marble_bench"

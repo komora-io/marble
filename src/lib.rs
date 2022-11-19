@@ -137,7 +137,7 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64},
+    atomic::{AtomicBool, AtomicPtr, AtomicU64},
     Arc,
 };
 
@@ -269,15 +269,65 @@ impl Metadata {
 
 #[derive(Debug)]
 struct FileAndMetadata {
-    file: Arc<File>,
+    file: File,
     location: DiskLocation,
-    path: PathBuf,
-    metadata: Metadata,
+    path: AtomicPtr<PathBuf>,
+    metadata: AtomicPtr<Metadata>,
     len: AtomicU64,
     generation: u8,
     rewrite_claim: AtomicBool,
     synced: AtomicBool,
-    zstd_dict: Arc<ZstdDict>,
+    zstd_dict: ZstdDict,
+    remove_path_on_drop: AtomicBool,
+}
+
+impl Drop for FileAndMetadata {
+    fn drop(&mut self) {
+        if self.len.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            if let Err(e) = std::fs::remove_file(self.path().unwrap()) {
+                eprintln!("failed to remove empty FileAndMetadata on drop: {:?}", e);
+            }
+        }
+    }
+}
+
+impl FileAndMetadata {
+    fn metadata(&self) -> Option<&Metadata> {
+        let metadata_ptr = self.metadata.load(std::sync::atomic::Ordering::Acquire);
+        if metadata_ptr.is_null() {
+            // metadata not yet initialized
+            None
+        } else {
+            Some(unsafe { &*metadata_ptr })
+        }
+    }
+
+    fn install_metadata_and_path(&self, metadata: Metadata, path: PathBuf) {
+        // NB: install path first because later on we
+        // want to be able to assume that if metadata
+        // is present, then so is path.
+        let path_ptr = Box::into_raw(Box::new(path));
+        let old_path_ptr = self
+            .path
+            .swap(path_ptr, std::sync::atomic::Ordering::SeqCst);
+        assert!(old_path_ptr.is_null());
+
+        let meta_ptr = Box::into_raw(Box::new(metadata));
+        let old_meta_ptr = self
+            .metadata
+            .swap(meta_ptr, std::sync::atomic::Ordering::SeqCst);
+        assert!(old_meta_ptr.is_null());
+    }
+
+    fn path(&self) -> Option<&PathBuf> {
+        let path_ptr = self.path.load(std::sync::atomic::Ordering::Acquire);
+        if path_ptr.is_null() {
+            // metadata not yet initialized
+            None
+        } else {
+            Some(unsafe { &*path_ptr })
+        }
+    }
 }
 
 /// Shard based on rough size ranges corresponding to SSD
@@ -317,12 +367,13 @@ pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Marble> {
 ///
 /// Writes should generally be performed by some background
 /// process whose job it is to clean logs etc...
+#[derive(Clone)]
 pub struct Marble {
     // maps from ObjectId to DiskLocation
-    location_table: LocationTable,
+    location_table: Arc<LocationTable>,
     file_map: FileMap,
     config: Config,
-    directory_lock: File,
+    directory_lock: Arc<File>,
     #[cfg(feature = "runtime_validation")]
     debug_history: std::sync::Mutex<debug_history::DebugHistory>,
 }

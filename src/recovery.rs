@@ -1,13 +1,14 @@
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::ops::Bound::{Included, Unbounded};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicU64, Ordering::SeqCst},
-    Arc, RwLock,
+    atomic::{AtomicPtr, AtomicU64, Ordering::SeqCst},
+    Arc,
 };
 
+use concurrent_map::ConcurrentMap;
 use fault_injection::fallible;
 
 use crate::{
@@ -45,7 +46,7 @@ impl Config {
         let directory_lock = fallible!(File::open(config.path.join(HEAP_DIR_SUFFIX)));
         fallible!(directory_lock.try_lock_exclusive());
 
-        let mut fams = BTreeMap::new();
+        let fams = ConcurrentMap::default();
         let mut max_file_lsn = 0;
         let mut max_file_size = 0;
 
@@ -85,18 +86,21 @@ impl Config {
 
             let fam = FileAndMetadata {
                 len: 0.into(),
-                metadata: metadata,
-                path: entry.path().into(),
-                file: Arc::new(file),
+                metadata: AtomicPtr::default(),
+                path: AtomicPtr::default(),
+                file: file,
                 location: file_location,
                 generation: metadata.generation,
                 rewrite_claim: false.into(),
                 synced: true.into(),
-                zstd_dict: Arc::new(zstd_dict),
+                zstd_dict: zstd_dict,
+                remove_path_on_drop: false.into(),
             };
 
+            fam.install_metadata_and_path(metadata, entry.path().into());
+
             log::debug!("inserting new fam at location {:?}", file_location);
-            assert!(fams.insert(file_location, fam).is_none());
+            assert!(fams.insert(Reverse(file_location), Arc::new(fam)).is_none());
         }
 
         let location_table = LocationTable::default();
@@ -108,8 +112,8 @@ impl Config {
             #[cfg(feature = "runtime_validation")]
             debug_history.mark_add(object_id, disk_location);
             let (_l, fam) = fams
-                .range((Unbounded, Included(disk_location)))
-                .next_back()
+                .range((Included(Reverse(disk_location)), Unbounded))
+                .next()
                 .unwrap();
             fam.len.fetch_add(1, SeqCst);
             location_table.store(object_id, disk_location);
@@ -118,13 +122,13 @@ impl Config {
         let next_file_lsn = AtomicU64::new(max_file_lsn + max_file_size + 1);
 
         Ok(Marble {
-            location_table,
+            location_table: Arc::new(location_table),
             file_map: FileMap {
-                inner: RwLock::new(fams),
-                next_file_lsn,
+                fams: fams,
+                next_file_lsn: Arc::new(next_file_lsn),
             },
             config,
-            directory_lock,
+            directory_lock: Arc::new(directory_lock),
             #[cfg(feature = "runtime_validation")]
             debug_history: debug_history.into(),
         })
