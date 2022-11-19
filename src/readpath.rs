@@ -1,5 +1,4 @@
 use std::io;
-use std::ops::Bound::{Included, Unbounded};
 use std::os::unix::fs::FileExt;
 
 use fault_injection::{annotate, fallible};
@@ -11,8 +10,6 @@ impl Marble {
     /// unknown or has been removed, returns `Ok(None)`.
     /// If there is an IO problem, returns Err.
     pub fn read(&self, object_id: ObjectId) -> io::Result<Option<Box<[u8]>>> {
-        let fams = self.fams.read().unwrap();
-
         let location = if let Some(location) = self.location_table.load(object_id) {
             location
         } else {
@@ -23,12 +20,9 @@ impl Marble {
             return Ok(None);
         }
 
-        let (base_location, fam) = fams
-            .range((Unbounded, Included(location)))
-            .next_back()
-            .expect("no possible storage file for object - likely file corruption");
+        let fam = self.file_map.fam_for_location(location);
 
-        let file_offset = location.lsn() - base_location.lsn();
+        let file_offset = location.lsn() - fam.location.lsn();
 
         let mut header_buf = [0_u8; HEADER_LEN];
         fallible!(fam.file.read_exact_at(&mut header_buf, file_offset));

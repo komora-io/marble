@@ -1,11 +1,10 @@
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{DiskLocation, ObjectId};
 
 #[derive(Default)]
 pub struct LocationTable {
-    pt: pagetable::PageTable,
+    pt: pagetable::PageTable<AtomicU64>,
     max_object_id: AtomicU64,
 }
 

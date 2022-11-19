@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use rand::{thread_rng, Rng};
 
 use marble::{open, Marble};
@@ -12,7 +10,7 @@ const VALUE_LEN: usize = 7;
 const OPS: usize = 16;
 const BATCHES: usize = OPS / BATCH_SZ;
 
-fn run(marble: Arc<Marble>) {
+fn run(marble: Marble) {
     let v = vec![0xFA; VALUE_LEN];
 
     let mut rng = thread_rng();
@@ -42,7 +40,7 @@ fn burn_in() {
 
     let concurrency: usize = std::thread::available_parallelism().unwrap().get() * 10;
 
-    let marble = Arc::new(open("testing_data_directories/burn_in").unwrap());
+    let marble = open("testing_data_directories/burn_in").unwrap();
 
     let mut threads = vec![];
 

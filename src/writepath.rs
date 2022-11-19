@@ -1,14 +1,12 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::ops::Bound::{Included, Unbounded};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 
 use fault_injection::{fallible, maybe};
 
 use crate::{
-    debug_delay, hash, write_trailer, DiskLocation, FileAndMetadata, Map, Marble, Metadata,
-    ObjectId, RelativeDiskLocation, ZstdDict, HEADER_LEN, NEW_WRITE_BATCH_BIT,
+    hash, write_trailer, DiskLocation, Map, Marble, Metadata, ObjectId, RelativeDiskLocation,
+    ZstdDict, HEADER_LEN,
 };
 
 const HEAP_DIR_SUFFIX: &str = "heap";
@@ -34,7 +32,7 @@ impl Marble {
         B: AsRef<[u8]>,
         I: IntoIterator<Item = (ObjectId, Option<B>)>,
     {
-        let old_locations = Map::new();
+        let old_locations = Map::default();
         self.shard_batch(write_batch, NEW_WRITE_GENERATION, &old_locations)
     }
 
@@ -50,7 +48,7 @@ impl Marble {
     {
         // maps from shard -> (shard size, map of object
         // id's to object data)
-        let mut shards: Map<u8, (usize, Map<ObjectId, Option<B>>)> = Map::new();
+        let mut shards: Map<u8, (usize, Map<ObjectId, Option<B>>)> = Map::default();
 
         let mut fragmented_shards = vec![];
 
@@ -172,7 +170,7 @@ impl Marble {
                 (None, None, ZstdDict::default())
             };
 
-        let mut new_relative_locations: Map<ObjectId, RelativeDiskLocation> = Map::new();
+        let mut new_relative_locations: Map<ObjectId, RelativeDiskLocation> = Map::default();
 
         let mut written_bytes: u64 = 0;
         for (object_id, raw_object_opt) in &objects {
@@ -257,46 +255,19 @@ impl Marble {
         }
 
         // 2. assign LSN and add to fams
-        let mut fams = self.fams.write().unwrap();
-
-        // NB this fetch_add should always happen while fams write
-        // lock is being held
-        let lsn_base = self.next_file_lsn.fetch_add(written_bytes + 1, SeqCst);
-
-        let lsn = if is_gc {
-            lsn_base
-        } else {
-            lsn_base | NEW_WRITE_BATCH_BIT
-        };
-
-        let location = DiskLocation::new_fam(lsn);
-        log::debug!("inserting new fam at lsn {lsn} location {location:?}",);
-
         let initial_capacity = new_relative_locations.len() as u64;
 
-        let fam = FileAndMetadata {
+        let (base_location, fam_claim) = self.file_map.insert(
             file,
-            metadata: Metadata::default(),
-            len: initial_capacity.into(),
+            written_bytes,
+            initial_capacity,
             generation,
-            location,
-            synced: self.config.fsync_each_batch.into(),
-            // set path to empty and rewrite_claim to true so
-            // that nobody tries to concurrently do maintenance
-            // on us until we're done with our write operation.
-            path: PathBuf::new(),
-            rewrite_claim: true.into(),
-            zstd_dict: decompressor,
-        };
-
-        assert!(fams.insert(location, fam).is_none());
-
-        drop(fams);
-
-        assert_ne!(lsn, 0);
+            is_gc,
+            &self.config,
+            decompressor,
+        );
 
         // 3. attempt installation into pagetable
-
         let mut replaced_locations: Vec<(ObjectId, DiskLocation)> = vec![];
         let mut failed_gc_locations = vec![];
         let mut subtract_from_len = 0;
@@ -307,7 +278,7 @@ impl Marble {
             #[cfg(feature = "runtime_validation")]
             let mut debug_history = self.debug_history.lock().unwrap();
 
-            let new_location = new_relative_location.to_absolute(lsn);
+            let new_location = new_relative_location.to_absolute(base_location.lsn());
 
             if let Some(old_location) = old_locations.get(&object_id) {
                 // CAS it
@@ -382,28 +353,40 @@ impl Marble {
         let trailer_items = new_relative_locations.len();
 
         if trailer_items == 0 {
-            let mut fams = self.fams.write().unwrap();
+            self.file_map
+                .delete_partially_installed_fam(base_location, tmp_path);
 
-            self.verify_file_uninhabited(location, &fams);
-
-            fams.remove(&location).unwrap();
-            fallible!(fs::remove_file(tmp_path));
             return Ok(());
         }
 
         // 5. write trailer then rename file
+        let dict_len = if let Some(ref dict_bytes) = dict_bytes_opt {
+            dict_bytes.len()
+        } else {
+            0
+        };
+
+        let expected_file_len = written_bytes
+            + 4
+            + 8
+            + 8
+            + (16 * new_relative_locations.len() as u64)
+            + dict_len as u64;
+
         let metadata = Metadata {
-            lsn,
+            lsn: base_location.lsn(),
             trailer_offset: written_bytes,
             present_objects: objects.len() as u64,
             generation,
+            file_size: expected_file_len,
         };
 
         let file_name = metadata.to_file_name();
         let new_path = self.config.path.join(HEAP_DIR_SUFFIX).join(file_name);
 
         log::trace!(
-            "writing trailer for {lsn} at offset {}, trailer items {trailer_items}",
+            "writing trailer for {} at offset {}, trailer items {trailer_items}",
+            base_location.lsn(),
             written_bytes,
         );
 
@@ -416,21 +399,6 @@ impl Marble {
         .and_then(|_| maybe!(file_2.sync_all()))
         .and_then(|_| maybe!(fs::rename(&tmp_path, &new_path)));
 
-        let dict_len = if let Some(dict_bytes) = dict_bytes_opt {
-            dict_bytes.len()
-        } else {
-            0
-        };
-
-        let file_len = fallible!(file_2.metadata()).len();
-        let expected_file_len = written_bytes
-            + 4
-            + 8
-            + 8
-            + (16 * new_relative_locations.len() as u64)
-            + dict_len as u64;
-
-        assert_eq!(file_len, expected_file_len);
         assert_eq!(trailer_items, new_relative_locations.len());
 
         if let Err(e) = res {
@@ -442,58 +410,30 @@ impl Marble {
             // additional damage.
             for (object_id, old_location) in replaced_locations {
                 let new_relative_location = new_relative_locations.get(&object_id).unwrap();
-                let new_location = new_relative_location.to_absolute(lsn);
+                let new_location = new_relative_location.to_absolute(base_location.lsn());
                 let _dont_care = self
                     .location_table
                     .cas(object_id, new_location, old_location);
             }
-            let mut fams = self.fams.write().unwrap();
-            self.verify_file_uninhabited(location, &fams);
-            fams.remove(&location).unwrap();
-            fallible!(fs::remove_file(tmp_path));
+            self.file_map
+                .delete_partially_installed_fam(base_location, tmp_path);
             log::error!("failed to write new file: {:?}", e);
             return Err(e);
         };
 
+        let file_len = fallible!(file_2.metadata()).len();
+
+        assert_eq!(file_len, expected_file_len);
+
         log::trace!("renamed file to {:?}", new_path);
 
         // 6. update replaced / contention-related failures
-        let fams = self.fams.read().unwrap();
+        self.file_map
+            .decrement_evacuated_fams(base_location, replaced_locations);
+        self.file_map
+            .finalize_fam(base_location, metadata, subtract_from_len, new_path);
 
-        for (_object_id, replaced_location) in replaced_locations.into_iter() {
-            let (fam_location, fam) = fams
-                .range((Unbounded, Included(replaced_location)))
-                .next_back()
-                .unwrap();
-
-            assert_ne!(*fam_location, location);
-
-            let old = fam.len.fetch_sub(1, SeqCst);
-            log::trace!(
-                "subtracting one from fam {:?}, current len is {}",
-                replaced_location,
-                old - 1
-            );
-            assert!(old >= 1, "expected old {old} to be >= 1");
-        }
-
-        drop(fams);
-
-        let mut fams = self.fams.write().unwrap();
-
-        let fam = fams.get_mut(&location).unwrap();
-        fam.metadata = metadata;
-        let old = fam.len.fetch_sub(subtract_from_len, SeqCst);
-
-        assert!(
-            old >= subtract_from_len,
-            "expected old {old} to be >= subtract_from_len {subtract_from_len}"
-        );
-
-        fam.path = new_path;
-
-        debug_delay();
-        assert!(fam.rewrite_claim.swap(false, SeqCst));
+        drop(fam_claim);
 
         Ok(())
     }

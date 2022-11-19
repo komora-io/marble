@@ -1,7 +1,6 @@
 use std::env::{self, VarError};
 use std::iter::once;
 use std::process::{exit, Child, Command, ExitStatus};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -86,7 +85,7 @@ fn run_crash_batches() {
         ..Default::default()
     };
 
-    let m = Arc::new(config.open().unwrap());
+    let m = config.open().unwrap();
 
     verify_batches(&m);
 
@@ -110,7 +109,7 @@ fn run_crash_batches() {
     }
 }
 
-fn write_batches_inner(start: u32, m: Arc<Marble>) {
+fn write_batches_inner(start: u32, m: Marble) {
     for i in start.. {
         let mut rng = rand::thread_rng();
         let value = if rng.gen_bool(0.1) {

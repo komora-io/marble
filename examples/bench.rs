@@ -1,7 +1,4 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rand::{thread_rng, Rng};
@@ -16,7 +13,7 @@ const BATCHES_PER_THREAD: usize = OPS_PER_THREAD / BATCH_SZ;
 
 static ANY_WRITERS_DONE: AtomicBool = AtomicBool::new(false);
 
-fn run_writer(marble: Arc<Marble>) {
+fn run_writer(marble: Marble) {
     let mut rng = thread_rng();
 
     let lorem_ipsum = include_bytes!("lorem_ipsum.txt");
@@ -42,7 +39,7 @@ fn run_writer(marble: Arc<Marble>) {
     ANY_WRITERS_DONE.store(true, Ordering::Release);
 }
 
-fn run_reader(marble: Arc<Marble>) {
+fn run_reader(marble: Marble) {
     let mut rng = thread_rng();
 
     let mut worst_time = Duration::default();
@@ -70,7 +67,7 @@ fn main() {
     };
 
     println!("beginning recovery");
-    let marble = Arc::new(config.open().unwrap());
+    let marble = config.open().unwrap();
     println!("marble recovered {:?}", marble.stats());
     marble.maintenance().unwrap();
     println!("post initial maintenance: {:?}", marble.stats());
@@ -115,8 +112,9 @@ fn main() {
         thread.join().unwrap();
     }
 
-    let cleaned_up = marble.maintenance().unwrap();
-    if cleaned_up != 0 {
+    let mut cleaned_up = 1;
+    while cleaned_up != 0 {
+        cleaned_up = marble.maintenance().unwrap();
         let stats = marble.stats();
         println!("defragmented {cleaned_up} objects. stats: {stats:?}",);
     }

@@ -1,25 +1,27 @@
 use std::fs::File;
 use std::io;
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 
 use fault_injection::{annotate, fallible};
 
-use crate::{Map, ObjectId, RelativeDiskLocation, ZstdDict};
+use crate::{read_range_at, Map, ObjectId, RelativeDiskLocation, ZstdDict};
 
 pub(crate) fn read_trailer(
-    file: &mut File,
+    file: &File,
     trailer_offset: u64,
+    file_size: u64,
 ) -> io::Result<(Vec<(ObjectId, RelativeDiskLocation)>, ZstdDict)> {
-    let mut buf = vec![];
+    let buf = read_range_at(file, trailer_offset, file_size)?;
+    read_trailer_from_buf(&buf)
+}
 
-    fallible!(file.seek(SeekFrom::Start(trailer_offset)));
-    fallible!(file.read_to_end(&mut buf));
-
+pub(crate) fn read_trailer_from_buf(
+    buf: &[u8],
+) -> io::Result<(Vec<(ObjectId, RelativeDiskLocation)>, ZstdDict)> {
     if buf.len() < 20 {
         return Err(annotate!(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("trailer at offset {trailer_offset} is smaller than the minimum possible size")
+            format!("trailer is smaller than the minimum possible size")
         )));
     }
 
@@ -39,7 +41,7 @@ pub(crate) fn read_trailer(
     }
 
     log::trace!(
-        "read trailer of length {} at offset {trailer_offset} with crc {}",
+        "read trailer of length {} with crc {}",
         buf.len(),
         actual_crc
     );
@@ -82,7 +84,7 @@ pub(crate) fn read_trailer(
 }
 
 pub(crate) fn write_trailer<'a>(
-    file: &mut File,
+    file: &File,
     trailer_offset: u64,
     new_shifted_relative_locations: &Map<ObjectId, RelativeDiskLocation>,
     dict_bytes_opt: &Option<Vec<u8>>,
@@ -138,7 +140,7 @@ pub(crate) fn write_trailer<'a>(
         "wrote zstd dict with crc {}",
         crc32fast::hash(zstd_dict_buffer)
     );
-    fallible!(file.flush());
+    fallible!(file.sync_all());
 
     Ok(())
 }

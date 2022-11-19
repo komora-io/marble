@@ -56,6 +56,8 @@ impl RelativeDiskLocation {
 pub struct DiskLocation(NonZeroU64);
 
 impl DiskLocation {
+    pub const MAX: DiskLocation = DiskLocation(unsafe { NonZeroU64::new_unchecked(u64::MAX) });
+
     pub fn new(location: u64, is_delete: bool) -> DiskLocation {
         DiskLocation(NonZeroU64::new(shift_location(location, is_delete)).unwrap())
     }
