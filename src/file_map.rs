@@ -11,8 +11,8 @@ use std::sync::{
 use concurrent_map::{ConcurrentMap, Maximum};
 
 use crate::{
-    debug_delay, Config, DiskLocation, FileAndMetadata, Map, Metadata, ObjectId, Stats, ZstdDict,
-    NEW_WRITE_BATCH_BIT,
+    debug_delay, Config, DiskLocation, FileAndMetadata, LocationTable, Map, Metadata, ObjectId,
+    Stats, ZstdDict, NEW_WRITE_BATCH_BIT,
 };
 
 impl Maximum for DiskLocation {
@@ -178,7 +178,7 @@ impl FileMap {
         Ok(synced_files)
     }
 
-    pub fn prune_empty_files<'a>(&'a self) -> io::Result<()> {
+    pub fn prune_empty_files<'a>(&'a self, location_table: &LocationTable) -> io::Result<()> {
         // remove the empty fams
         let mut paths_to_remove = vec![];
 
@@ -209,7 +209,7 @@ impl FileMap {
         for (location, _) in &paths_to_remove {
             log::trace!("removing fam at location {:?}", location);
 
-            self.verify_file_uninhabited(*location);
+            self.verify_file_uninhabited(*location, location_table);
 
             self.fams.remove(&Reverse(*location)).unwrap();
         }
@@ -219,9 +219,13 @@ impl FileMap {
         Ok(())
     }
 
-    pub fn verify_files_uninhabited(&self, locations: &[DiskLocation]) {
+    pub fn verify_files_uninhabited(
+        &self,
+        locations: &[DiskLocation],
+        location_table: &LocationTable,
+    ) {
         for location in locations {
-            self.verify_file_uninhabited(*location);
+            self.verify_file_uninhabited(*location, location_table);
         }
     }
 
@@ -300,7 +304,7 @@ impl FileMap {
         }
     }
 
-    fn verify_file_uninhabited(&self, _location: DiskLocation) {
+    fn verify_file_uninhabited(&self, _location: DiskLocation, location_table: &LocationTable) {
         #[cfg(feature = "runtime_validation")]
         {
             let fam = &self.fams.get(&Reverse(_location)).unwrap();
@@ -308,8 +312,7 @@ impl FileMap {
                 .metadata()
                 .expect("any fam being deleted should have metadata set");
             let next_location = DiskLocation::new_fam(_location.lsn() + metadata.trailer_offset);
-            let present: Vec<(ObjectId, DiskLocation)> = self
-                .location_table
+            let present: Vec<(ObjectId, DiskLocation)> = location_table
                 .iter()
                 .filter(|(_oid, loc)| *loc >= _location && *loc < next_location)
                 .collect();

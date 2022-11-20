@@ -131,7 +131,7 @@ impl Config {
             config,
             directory_lock: Arc::new(directory_lock),
             #[cfg(feature = "runtime_validation")]
-            debug_history: debug_history.into(),
+            debug_history: Arc::new(debug_history.into()),
         })
     }
 }

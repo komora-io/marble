@@ -178,11 +178,7 @@ impl std::hash::Hasher for LocationHasher {
     }
 }
 
-#[cfg(not(feature = "runtime_validation"))]
 type Map<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<LocationHasher>>;
-
-#[cfg(feature = "runtime_validation")]
-type Map<K, V> = std::collections::BTreeMap<K, V>;
 
 mod config;
 mod debug_delay;
@@ -406,7 +402,7 @@ pub struct Marble {
     config: Config,
     directory_lock: Arc<File>,
     #[cfg(feature = "runtime_validation")]
-    debug_history: std::sync::Mutex<debug_history::DebugHistory>,
+    debug_history: Arc<std::sync::Mutex<debug_history::DebugHistory>>,
 }
 
 impl std::fmt::Debug for Marble {
@@ -437,7 +433,7 @@ impl Marble {
     }
 
     fn prune_empty_files(&self) -> io::Result<()> {
-        self.file_map.prune_empty_files()
+        self.file_map.prune_empty_files(&self.location_table)
     }
 
     /// If `Config::fsync_each_batch` is `false`, this

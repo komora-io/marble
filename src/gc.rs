@@ -174,7 +174,7 @@ impl Marble {
             old_locations.clear();
 
             self.file_map
-                .verify_files_uninhabited(&rewritten_fam_locations);
+                .verify_files_uninhabited(&rewritten_fam_locations, &self.location_table);
         }
 
         drop(claims);

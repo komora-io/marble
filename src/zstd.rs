@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::RwLock;
 use std::thread::ThreadId;
@@ -73,7 +72,7 @@ impl DictInABox {
 
 pub(crate) struct ThreadLocalDict {
     dict_bytes: Vec<u8>,
-    tls: RwLock<HashMap<ThreadId, DictInABox>>,
+    tls: RwLock<Map<ThreadId, DictInABox>>,
 }
 
 impl Drop for ThreadLocalDict {

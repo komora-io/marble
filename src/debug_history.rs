@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use crate::{DiskLocation, ObjectId};
+use crate::{DiskLocation, Map, ObjectId};
 
 /// `DebugHistory` asserts that when objects are added to
 /// new files and marked as removed from old ones, that the
@@ -8,8 +8,8 @@ use crate::{DiskLocation, ObjectId};
 /// things that were already added.
 #[derive(Default, Debug)]
 pub struct DebugHistory {
-    adds: HashMap<ObjectId, HashSet<DiskLocation>>,
-    removes: HashMap<ObjectId, HashSet<DiskLocation>>,
+    adds: Map<ObjectId, HashSet<DiskLocation>>,
+    removes: Map<ObjectId, HashSet<DiskLocation>>,
 }
 
 impl DebugHistory {
