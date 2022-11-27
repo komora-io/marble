@@ -8,7 +8,7 @@ use marble::Marble;
 const KEYSPACE: u64 = 1024 * 1024;
 const BATCH_SZ: usize = 64 * 1024;
 const VALUE_LEN: usize = 64;
-const OPS_PER_THREAD: usize = 2 * 1024 * 1024;
+const OPS_PER_THREAD: usize = 1 * 1024 * 1024;
 const BATCHES_PER_THREAD: usize = OPS_PER_THREAD / BATCH_SZ;
 
 static ANY_WRITERS_DONE: AtomicBool = AtomicBool::new(false);
@@ -42,16 +42,29 @@ fn run_writer(marble: Marble) {
 fn run_reader(marble: Marble) {
     let mut rng = thread_rng();
 
+    let mut best_time = Duration::MAX;
     let mut worst_time = Duration::default();
+    let mut total_time = Duration::default();
+    let mut count = 0;
 
     while !ANY_WRITERS_DONE.load(Ordering::Relaxed) {
         let before = Instant::now();
         let pid = rng.gen_range(0..KEYSPACE);
         marble.read(pid).unwrap();
-        worst_time = worst_time.max(before.elapsed());
+        let elapsed = before.elapsed();
+
+        best_time = best_time.min(elapsed);
+        worst_time = worst_time.max(elapsed);
+        total_time += elapsed;
+        count += 1;
     }
 
-    println!("worst read latency: {:?}us", worst_time.as_micros());
+    println!(
+        "worst read latency: {:?}us, best: {:?}ns, average {:?}us",
+        worst_time.as_micros(),
+        best_time.as_nanos(),
+        total_time.as_micros() / count
+    );
 }
 
 fn main() {
@@ -63,6 +76,7 @@ fn main() {
         path: "bench_data".into(),
         fsync_each_batch: false,
         zstd_compression_level: None,
+        target_file_size: 5 * 1024 * 1024,
         ..Default::default()
     };
 
@@ -102,7 +116,7 @@ fn main() {
 
     while threads.iter().any(|t| !t.is_finished()) {
         let cleaned_up = marble.maintenance().unwrap();
-        if cleaned_up != 0 {
+        if cleaned_up > 0 {
             let stats = marble.stats();
             println!("defragmented {cleaned_up} objects. stats: {stats:?}",);
         }

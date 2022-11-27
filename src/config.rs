@@ -27,6 +27,13 @@ pub struct Config {
     /// will ever attempt to perform in order to read an
     /// object off of disk.
     pub max_object_size: usize,
+    /// The number of total files (of all sizes) that must
+    /// exist before "small files" are squished together
+    /// even if they are above the `file_compaction_percent`.
+    /// A "small file" is defined as a file whose uncompressed
+    /// size times `min_compaction_files` is below the
+    /// `target_file_size`.
+    pub small_file_cleanup_threshold: usize,
     /// A partitioning function for objects based on
     /// object ID and object size. You may override this to
     /// cause objects to be written into separate files so
@@ -53,6 +60,7 @@ impl Default for Config {
             file_compaction_percent: 66,
             partition_function: crate::default_partition_function,
             max_object_size: 16 * 1024 * 1024 * 1024, /* 16gb */
+            small_file_cleanup_threshold: 64,
             min_compaction_files: 2,
             fsync_each_batch: false,
             zstd_compression_level: None,

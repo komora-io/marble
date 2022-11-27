@@ -41,7 +41,7 @@ impl<'a> Drop for DeferUnclaim<'a> {
 
 #[derive(Clone)]
 pub(crate) struct FileMap {
-    pub(crate) fams: ConcurrentMap<Reverse<DiskLocation>, Arc<FileAndMetadata>>,
+    pub(crate) fams: ConcurrentMap<Reverse<DiskLocation>, Arc<FileAndMetadata>, 16, 1>,
     pub(crate) next_file_lsn: Arc<AtomicU64>,
 }
 
@@ -59,6 +59,8 @@ impl FileMap {
 
         let mut files_to_defrag: Map<u8, Vec<Arc<FileAndMetadata>>> = Map::default();
 
+        let approximate_fam_len = self.fams.len();
+
         for (location, fam) in &self.fams {
             assert_eq!(location.0, fam.location);
 
@@ -75,8 +77,11 @@ impl FileMap {
             let non_empty = len != 0;
             let present_percent = (len * 100) / present_objects.max(1);
             let candidate_by_percent = present_percent < u64::from(config.file_compaction_percent);
-            let candidate_by_size = (metadata.file_size * config.min_compaction_files as u64)
+            let is_small_file = (metadata.file_size * config.min_compaction_files as u64)
                 < config.target_file_size as u64;
+            let over_small_file_cleanup_threshold =
+                config.small_file_cleanup_threshold <= approximate_fam_len;
+            let candidate_by_size = over_small_file_cleanup_threshold && is_small_file;
 
             if non_empty && (candidate_by_percent || candidate_by_size) {
                 debug_delay();
@@ -92,12 +97,16 @@ impl FileMap {
 
                 claims.claims.push(location.0);
 
-                log::trace!(
-                    "fam at location {:?} is ready to be compacted",
-                    fam.location
-                );
-
                 let generation = fam.generation.saturating_add(1).min(MAX_GENERATION);
+
+                log::trace!(
+                    "fam at location {:?} generation {generation} is ready to be compacted, \
+                    len {len} present {present_objects} \
+                    present percent {present_percent} candidate by percent {candidate_by_percent} \
+                    candidate by size {candidate_by_size} (metadata size: {})",
+                    fam.location,
+                    metadata.file_size
+                );
 
                 let entry = files_to_defrag.entry(generation).or_default();
                 entry.push(fam);
@@ -304,7 +313,7 @@ impl FileMap {
         }
     }
 
-    fn verify_file_uninhabited(&self, _location: DiskLocation, location_table: &LocationTable) {
+    fn verify_file_uninhabited(&self, _location: DiskLocation, _location_table: &LocationTable) {
         #[cfg(feature = "runtime_validation")]
         {
             let fam = &self.fams.get(&Reverse(_location)).unwrap();
@@ -312,7 +321,7 @@ impl FileMap {
                 .metadata()
                 .expect("any fam being deleted should have metadata set");
             let next_location = DiskLocation::new_fam(_location.lsn() + metadata.trailer_offset);
-            let present: Vec<(ObjectId, DiskLocation)> = location_table
+            let present: Vec<(ObjectId, DiskLocation)> = _location_table
                 .iter()
                 .filter(|(_oid, loc)| *loc >= _location && *loc < next_location)
                 .collect();
