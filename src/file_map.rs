@@ -75,7 +75,7 @@ impl FileMap {
             let non_empty = len != 0;
             let present_percent = (len * 100) / present_objects.max(1);
             let candidate_by_percent = present_percent < u64::from(config.file_compaction_percent);
-            let candidate_by_size = (metadata.file_size / config.min_compaction_files as u64)
+            let candidate_by_size = (metadata.file_size * config.min_compaction_files as u64)
                 < config.target_file_size as u64;
 
             if non_empty && (candidate_by_percent || candidate_by_size) {
