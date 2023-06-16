@@ -1,25 +1,34 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+
+use concurrent_map::ConcurrentMap;
 
 use crate::{DiskLocation, ObjectId};
 
-#[derive(Default)]
+const fn _test_impls() {
+    const fn send<T: Send>() {}
+    const fn clone<T: Clone>() {}
+    send::<LocationTable>();
+    clone::<LocationTable>();
+}
+
+#[derive(Default, Clone)]
 pub struct LocationTable {
-    pt: pagetable::PageTable<AtomicU64>,
-    max_object_id: AtomicU64,
+    pt: ConcurrentMap<u64, DiskLocation>,
+    max_object_id: Arc<AtomicU64>,
 }
 
 impl LocationTable {
     pub fn load(&self, object_id: ObjectId) -> Option<DiskLocation> {
-        let raw = self.pt.get(object_id).load(Ordering::Acquire);
-        DiskLocation::from_raw(raw)
+        self.pt.get(&object_id)
     }
 
     pub fn store(&self, object_id: ObjectId, location: DiskLocation) {
         self.max_object_id.fetch_max(object_id, Ordering::Release);
 
-        self.pt
-            .get(object_id)
-            .store(location.to_raw(), Ordering::Release);
+        self.pt.insert(object_id, location);
     }
 
     pub fn cas(
@@ -31,15 +40,9 @@ impl LocationTable {
         self.max_object_id.fetch_max(object_id, Ordering::Release);
 
         self.pt
-            .get(object_id)
-            .compare_exchange(
-                old_location.to_raw(),
-                new_location.to_raw(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .cas(object_id, Some(&old_location), Some(new_location))
             .map(|_| ())
-            .map_err(|r| DiskLocation::from_raw(r).unwrap())
+            .map_err(|r| r.actual.unwrap())
     }
 
     pub fn fetch_max(
@@ -49,16 +52,21 @@ impl LocationTable {
     ) -> Result<Option<DiskLocation>, Option<DiskLocation>> {
         self.max_object_id.fetch_max(object_id, Ordering::Release);
 
-        let max_result = self
-            .pt
-            .get(object_id)
-            .fetch_max(new_location.to_raw(), Ordering::AcqRel);
+        let last_value_opt = self.pt.fetch_and_update(object_id, |current_opt| {
+            Some(if let Some(current) = current_opt {
+                (*current).max(new_location)
+            } else {
+                new_location
+            })
+        });
 
-        if max_result < new_location.to_raw() {
-            Ok(DiskLocation::from_raw(max_result))
-        } else {
-            assert_ne!(max_result, new_location.to_raw());
-            Err(DiskLocation::from_raw(max_result))
+        match last_value_opt {
+            None => Ok(None),
+            Some(last_value) if last_value < new_location => Ok(Some(last_value)),
+            Some(last_value) => {
+                assert!(last_value > new_location);
+                Err(Some(last_value))
+            }
         }
     }
 

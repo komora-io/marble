@@ -397,7 +397,7 @@ pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Marble> {
 #[derive(Clone)]
 pub struct Marble {
     // maps from ObjectId to DiskLocation
-    location_table: Arc<LocationTable>,
+    location_table: LocationTable,
     file_map: FileMap,
     config: Config,
     directory_lock: Arc<File>,

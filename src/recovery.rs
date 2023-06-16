@@ -123,7 +123,7 @@ impl Config {
         let next_file_lsn = AtomicU64::new(max_file_lsn + max_file_size + 1);
 
         Ok(Marble {
-            location_table: Arc::new(location_table),
+            location_table: location_table,
             file_map: FileMap {
                 fams: fams,
                 next_file_lsn: Arc::new(next_file_lsn),

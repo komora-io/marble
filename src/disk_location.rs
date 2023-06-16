@@ -1,5 +1,12 @@
 use std::num::NonZeroU64;
 
+const fn _test_impls() {
+    const fn send<T: Send>() {}
+    const fn clone<T: Clone>() {}
+    send::<DiskLocation>();
+    clone::<DiskLocation>();
+}
+
 fn shift_location(location: u64, is_delete: bool) -> u64 {
     assert_eq!(location << 1 >> 1, location);
     let inner = if is_delete {
@@ -64,14 +71,6 @@ impl DiskLocation {
 
     pub fn new_fam(location: u64) -> DiskLocation {
         DiskLocation::new(location, false)
-    }
-
-    pub fn from_raw(u: u64) -> Option<DiskLocation> {
-        Some(DiskLocation(NonZeroU64::new(u)?))
-    }
-
-    pub fn to_raw(&self) -> u64 {
-        self.0.get()
     }
 
     fn unshift(&self) -> (u64, bool) {
