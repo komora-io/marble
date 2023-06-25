@@ -50,6 +50,10 @@ fn test_00() {
         assert_eq!(max, object_id + 1);
         assert_eq!(iter.next(), Some(0));
         assert_eq!(iter.next(), None);
+
+        let mut iter_2 = marble.allocated_object_ids();
+        assert_eq!(iter_2.next(), Some(object_id));
+        assert_eq!(iter_2.next(), None);
     });
 }
 

@@ -397,7 +397,8 @@ pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Marble> {
 #[derive(Clone)]
 pub struct Marble {
     // maps from ObjectId to DiskLocation
-    location_table: Arc<LocationTable>,
+    location_table: LocationTable,
+    max_object_id: Arc<AtomicU64>,
     file_map: FileMap,
     config: Config,
     directory_lock: Arc<File>,
@@ -454,14 +455,27 @@ impl Marble {
     /// and an iterator over all object IDs beneath that which are
     /// currently deleted (due to being stored as a `None` in a write batch).
     pub fn free_object_ids<'a>(&'a self) -> (u64, impl 'a + Iterator<Item = u64>) {
-        let max = self.location_table.max_object_id() + 1;
-        let iter = (0..max).filter_map(|oid| {
+        let max = self.max_object_id.load(Acquire);
+
+        let iter = (0..=max).filter_map(|oid| {
             if self.location_table.load(oid).is_none() {
                 Some(oid)
             } else {
                 None
             }
         });
-        (max, iter)
+        (max + 1, iter)
+    }
+
+    /// Returns an Iterator over all currently allocated object IDs.
+    pub fn allocated_object_ids<'a>(&'a self) -> impl 'a + Iterator<Item = u64> {
+        let max = self.max_object_id.load(Acquire);
+        (0..=max).filter_map(|oid| {
+            if self.location_table.load(oid).is_some() {
+                Some(oid)
+            } else {
+                None
+            }
+        })
     }
 }

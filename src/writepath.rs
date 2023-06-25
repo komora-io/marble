@@ -52,7 +52,9 @@ impl Marble {
 
         let mut fragmented_shards = vec![];
 
+        let mut max_oid = 0;
         for (object_id, data_opt) in write_batch {
+            max_oid = max_oid.max(object_id);
             let (object_size, shard_id) = if let Some(ref data) = data_opt {
                 let len = data.as_ref().len();
                 let shard = if gen == NEW_WRITE_GENERATION {
@@ -85,6 +87,9 @@ impl Marble {
                 shard.0 -= replaced.as_ref().len();
             }
         }
+
+        self.max_object_id
+            .fetch_max(max_oid, std::sync::atomic::Ordering::Release);
 
         let iter = shards
             .into_iter()

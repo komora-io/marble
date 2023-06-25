@@ -2,10 +2,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{DiskLocation, ObjectId};
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct LocationTable {
     pt: pagetable::PageTable<AtomicU64>,
-    max_object_id: AtomicU64,
 }
 
 impl LocationTable {
@@ -15,8 +14,6 @@ impl LocationTable {
     }
 
     pub fn store(&self, object_id: ObjectId, location: DiskLocation) {
-        self.max_object_id.fetch_max(object_id, Ordering::Release);
-
         self.pt
             .get(object_id)
             .store(location.to_raw(), Ordering::Release);
@@ -28,8 +25,6 @@ impl LocationTable {
         old_location: DiskLocation,
         new_location: DiskLocation,
     ) -> Result<(), DiskLocation> {
-        self.max_object_id.fetch_max(object_id, Ordering::Release);
-
         self.pt
             .get(object_id)
             .compare_exchange(
@@ -47,8 +42,6 @@ impl LocationTable {
         object_id: ObjectId,
         new_location: DiskLocation,
     ) -> Result<Option<DiskLocation>, Option<DiskLocation>> {
-        self.max_object_id.fetch_max(object_id, Ordering::Release);
-
         let max_result = self
             .pt
             .get(object_id)
@@ -60,10 +53,6 @@ impl LocationTable {
             assert_ne!(max_result, new_location.to_raw());
             Err(DiskLocation::from_raw(max_result))
         }
-    }
-
-    pub fn max_object_id(&self) -> u64 {
-        self.max_object_id.load(Ordering::Acquire)
     }
 
     #[cfg(feature = "runtime_validation")]

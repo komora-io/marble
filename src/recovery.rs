@@ -104,12 +104,14 @@ impl Config {
             assert!(fams.insert(Reverse(file_location), Arc::new(fam)).is_none());
         }
 
-        let location_table = LocationTable::default();
+        let location_table: LocationTable = LocationTable::default();
         #[cfg(feature = "runtime_validation")]
         let mut debug_history = crate::debug_history::DebugHistory::default();
 
         // initialize fam utilization from page table
+        let mut max_object_id = 0;
         for (object_id, disk_location) in recovery_page_table {
+            max_object_id = max_object_id.max(object_id);
             #[cfg(feature = "runtime_validation")]
             debug_history.mark_add(object_id, disk_location);
             let (_l, fam) = fams
@@ -123,7 +125,8 @@ impl Config {
         let next_file_lsn = AtomicU64::new(max_file_lsn + max_file_size + 1);
 
         Ok(Marble {
-            location_table: Arc::new(location_table),
+            location_table,
+            max_object_id: Arc::new(max_object_id.into()),
             file_map: FileMap {
                 fams: fams,
                 next_file_lsn: Arc::new(next_file_lsn),
