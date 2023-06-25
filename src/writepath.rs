@@ -32,15 +32,15 @@ impl Marble {
         B: AsRef<[u8]>,
         I: IntoIterator<Item = (ObjectId, Option<B>)>,
     {
-        let old_locations = Map::default();
-        self.shard_batch(write_batch, NEW_WRITE_GENERATION, &old_locations)
+        let gced_locations = Map::default();
+        self.shard_batch(write_batch, NEW_WRITE_GENERATION, &gced_locations)
     }
 
     pub(crate) fn shard_batch<B, I>(
         &self,
         write_batch: I,
         gen: u8,
-        old_locations: &Map<ObjectId, DiskLocation>,
+        gced_locations: &Map<ObjectId, DiskLocation>,
     ) -> io::Result<()>
     where
         B: AsRef<[u8]>,
@@ -96,7 +96,7 @@ impl Marble {
             );
 
         for objects in iter {
-            self.write_batch_inner(objects, gen, &old_locations)?;
+            self.write_batch_inner(objects, gen, &gced_locations)?;
         }
 
         // fsync directory to ensure new file is present
@@ -111,7 +111,7 @@ impl Marble {
         &self,
         objects: Map<ObjectId, Option<B>>,
         generation: u8,
-        old_locations: &Map<ObjectId, DiskLocation>,
+        gced_locations: &Map<ObjectId, DiskLocation>,
     ) -> io::Result<()>
     where
         B: AsRef<[u8]>,
@@ -122,10 +122,10 @@ impl Marble {
         assert!(!objects.is_empty());
 
         let is_gc = if generation == NEW_WRITE_GENERATION {
-            assert!(old_locations.is_empty());
+            assert!(gced_locations.is_empty());
             false
         } else {
-            assert!(!old_locations.is_empty());
+            assert!(!gced_locations.is_empty());
             true
         };
 
@@ -280,30 +280,30 @@ impl Marble {
 
             let new_location = new_relative_location.to_absolute(base_location.lsn());
 
-            if let Some(old_location) = old_locations.get(&object_id) {
+            if let Some(gced_location) = gced_locations.get(&object_id) {
                 // CAS it
                 let res = self
                     .location_table
-                    .cas(*object_id, *old_location, new_location);
+                    .cas(*object_id, *gced_location, new_location);
 
                 match res {
                     Ok(()) => {
                         log::trace!(
-                            "cas of {object_id} from old location {old_location:?} to new \
+                            "cas of {object_id} from old location {gced_location:?} to new \
                              location {new_location:?} successful"
                         );
 
                         #[cfg(feature = "runtime_validation")]
                         {
                             debug_history.mark_add(*object_id, new_location);
-                            debug_history.mark_remove(*object_id, *old_location);
+                            debug_history.mark_remove(*object_id, *gced_location);
                         }
 
-                        replaced_locations.push((*object_id, *old_location));
+                        replaced_locations.push((*object_id, *gced_location));
                     }
                     Err(_current_opt) => {
                         log::trace!(
-                            "cas of {object_id} from old location {old_location:?} to new \
+                            "cas of {object_id} from old location {gced_location:?} to new \
                              location {new_location:?} failed"
                         );
                         failed_gc_locations.push(*object_id);
