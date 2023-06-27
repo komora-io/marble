@@ -265,6 +265,18 @@ pub struct Stats {
     /// The number of backing storage files that exist and are
     /// being held open.
     pub files: usize,
+    /// The number of compressed bytes that have been written since
+    /// this instance of `Marble` was created.
+    pub compressed_bytes_written: u64,
+    /// The number of compressed bytes that have been read since
+    /// this instance of `Marble` was created.
+    pub compressed_bytes_read: u64,
+    /// The number of decompressed bytes that have been written since
+    /// this instance of `Marble` was created.
+    pub decompressed_bytes_written: u64,
+    /// The number of decompressed bytes that have been read since
+    /// this instance of `Marble` was created.
+    pub decompressed_bytes_read: u64,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -404,6 +416,10 @@ pub struct Marble {
     directory_lock: Arc<File>,
     #[cfg(feature = "runtime_validation")]
     debug_history: Arc<std::sync::Mutex<debug_history::DebugHistory>>,
+    decompressed_bytes_read: Arc<AtomicU64>,
+    compressed_bytes_read: Arc<AtomicU64>,
+    decompressed_bytes_written: Arc<AtomicU64>,
+    compressed_bytes_written: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for Marble {
@@ -430,7 +446,19 @@ impl Marble {
     #[doc(alias = "metrics")]
     #[doc(alias = "info")]
     pub fn stats(&self) -> Stats {
-        self.file_map.stats()
+        let (fams_len, stored_objects, live_objects) = self.file_map.stats();
+
+        Stats {
+            live_objects,
+            stored_objects,
+            dead_objects: stored_objects - live_objects,
+            live_percent: u8::try_from((live_objects * 100) / stored_objects.max(1)).unwrap(),
+            files: fams_len,
+            compressed_bytes_written: self.compressed_bytes_written.load(Acquire),
+            decompressed_bytes_written: self.decompressed_bytes_written.load(Acquire),
+            compressed_bytes_read: self.compressed_bytes_read.load(Acquire),
+            decompressed_bytes_read: self.decompressed_bytes_read.load(Acquire),
+        }
     }
 
     fn prune_empty_files(&self) -> io::Result<()> {

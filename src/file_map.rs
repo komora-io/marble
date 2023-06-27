@@ -238,7 +238,8 @@ impl FileMap {
         }
     }
 
-    pub fn stats(&self) -> Stats {
+    /// Returns the counts of (files, total stored objects, live objects)
+    pub(crate) fn stats(&self) -> (usize, u64, u64) {
         let mut live_objects = 0;
         let mut stored_objects = 0;
 
@@ -251,13 +252,7 @@ impl FileMap {
             }
         }
 
-        Stats {
-            live_objects,
-            stored_objects,
-            dead_objects: stored_objects - live_objects,
-            live_percent: u8::try_from((live_objects * 100) / stored_objects.max(1)).unwrap(),
-            files: fams_len,
-        }
+        (fams_len, stored_objects, live_objects)
     }
 
     pub fn delete_partially_installed_fam(&self, location: DiskLocation, tmp_path: PathBuf) {
