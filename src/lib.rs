@@ -486,12 +486,12 @@ impl Marble {
 
         let high_level_user_bytes_written = self.high_level_user_bytes_written.load(Acquire);
 
-        let write_amplification =
-            decompressed_bytes_written as f32 / high_level_user_bytes_written as f32;
-
         let live_ratio = live_objects as f32 / stored_objects.max(1) as f32;
         let approximate_live_data = live_ratio * total_file_size as f32 * written_compression_ratio;
-        let space_amplification = total_file_size as f32 / approximate_live_data as f32;
+
+        let write_amplification =
+            decompressed_bytes_written as f32 / high_level_user_bytes_written as f32;
+        let space_amplification = total_file_size as f32 / approximate_live_data;
 
         Stats {
             live_objects,
