@@ -87,7 +87,7 @@ impl Config {
             let file_location = DiskLocation::new_fam(metadata.lsn);
 
             let fam = FileAndMetadata {
-                len: 0.into(),
+                live_objects: 0.into(),
                 metadata: AtomicPtr::default(),
                 path: AtomicPtr::default(),
                 file: file,
@@ -118,7 +118,7 @@ impl Config {
                 .range((Included(Reverse(disk_location)), Unbounded))
                 .next()
                 .unwrap();
-            fam.len.fetch_add(1, SeqCst);
+            fam.live_objects.fetch_add(1, SeqCst);
             location_table.store(object_id, disk_location);
         }
 
@@ -135,6 +135,11 @@ impl Config {
             directory_lock: Arc::new(directory_lock),
             #[cfg(feature = "runtime_validation")]
             debug_history: Arc::new(debug_history.into()),
+            compressed_bytes_read: Arc::new(0.into()),
+            decompressed_bytes_read: Arc::new(0.into()),
+            compressed_bytes_written: Arc::new(0.into()),
+            decompressed_bytes_written: Arc::new(0.into()),
+            high_level_user_bytes_written: Arc::new(0.into()),
         })
     }
 }

@@ -259,24 +259,50 @@ pub struct Stats {
     /// or removed in other storage files, contributing
     /// to fragmentation.
     pub dead_objects: u64,
-    /// The percentage of all objects on disk that are
-    /// live. This is another way of expressing fragmentation.
-    pub live_percent: u8,
+    /// The ratio of all objects on disk that are
+    /// live to all objects in total. This is another way of expressing fragmentation.
+    pub live_ratio: f32,
     /// The number of backing storage files that exist and are
     /// being held open.
     pub files: usize,
-    /// The number of compressed bytes that have been written since
-    /// this instance of `Marble` was created.
+    /// The sum of the sizes of all files currently on-disk.
+    pub total_file_size: u64,
+    /// The number of compressed bytes that have been written due
+    /// to calls to both `write_batch` and rewrites caused by
+    /// calls to `maintenance` since this instance of `Marble` was recovered.
     pub compressed_bytes_written: u64,
     /// The number of compressed bytes that have been read since
-    /// this instance of `Marble` was created.
+    /// this instance of `Marble` was recovered.
     pub compressed_bytes_read: u64,
-    /// The number of decompressed bytes that have been written since
-    /// this instance of `Marble` was created.
+    /// The number of decompressed bytes that have been written due
+    /// to calls to both `write_batch` and rewrites caused by
+    /// calls to `maintenance` since this instance of `Marble` was recovered.
     pub decompressed_bytes_written: u64,
     /// The number of decompressed bytes that have been read since
-    /// this instance of `Marble` was created.
+    /// this instance of `Marble` was recovered.
     pub decompressed_bytes_read: u64,
+    /// This is the number of bytes that are written from user
+    /// calls to [`crate::Marble::write_batch`] since this instance
+    /// was recovered.
+    pub high_level_user_bytes_written: u64,
+    /// Compression ratio for read objects since this `Marble` instance was recovered. 1.0 means no compression, 2.0 means that we saved 50% space by compressing, etc...
+    pub read_compression_ratio: f32,
+    /// Compression ratio for objects written since this `Marble` instance was recovered. 1.0 means no compression, 2.0 means that we saved 50% space by compressing, etc...
+    pub written_compression_ratio: f32,
+    /// The ratio of all decompressed writes performed to high-level user data
+    /// since this instance of `Marble` was recovered. This is basically the
+    /// maintenance overhead of on-disk GC in response to objects being rewritten
+    /// and defragmentation maintenance copying old data to new homes. 1.0 is "perfect".
+    /// If all data needs to be copied once, this will be 2.0, etc... For reference,
+    /// many LSM tries will see write amplifications of a few dozen, and b-trees can often
+    /// see write amplifications of several hundred. So, if you're under 10 for serious workloads,
+    /// you're doing much better than most industrial systems.
+    pub write_amplification: f32,
+    /// The ratio of the sum of the size of all compressed files written to the sum of the size of all high-level user data written
+    /// since this instance of `Marble` was recovered. This goes up with fragmentation, and is
+    /// brought back down with calls to `maintenance` that defragment storage files. Higher
+    /// compression levels also cause this to be lower.
+    pub space_amplification: f32,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -316,7 +342,7 @@ struct FileAndMetadata {
     location: DiskLocation,
     path: AtomicPtr<PathBuf>,
     metadata: AtomicPtr<Metadata>,
-    len: AtomicU64,
+    live_objects: AtomicU64,
     generation: u8,
     rewrite_claim: AtomicBool,
     synced: AtomicBool,
@@ -325,7 +351,7 @@ struct FileAndMetadata {
 
 impl Drop for FileAndMetadata {
     fn drop(&mut self) {
-        let empty = self.len.load(Acquire) == 0;
+        let empty = self.live_objects.load(Acquire) == 0;
         if empty {
             if let Err(e) = std::fs::remove_file(self.path().unwrap()) {
                 eprintln!("failed to remove empty FileAndMetadata on drop: {:?}", e);
@@ -420,6 +446,7 @@ pub struct Marble {
     compressed_bytes_read: Arc<AtomicU64>,
     decompressed_bytes_written: Arc<AtomicU64>,
     compressed_bytes_written: Arc<AtomicU64>,
+    high_level_user_bytes_written: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for Marble {
@@ -446,18 +473,42 @@ impl Marble {
     #[doc(alias = "metrics")]
     #[doc(alias = "info")]
     pub fn stats(&self) -> Stats {
-        let (fams_len, stored_objects, live_objects) = self.file_map.stats();
+        let (fams_len, total_file_size, stored_objects, live_objects) = self.file_map.stats();
+
+        let compressed_bytes_read = self.compressed_bytes_read.load(Acquire);
+        let decompressed_bytes_read = self.decompressed_bytes_read.load(Acquire);
+        let read_compression_ratio = decompressed_bytes_read as f32 / compressed_bytes_read as f32;
+
+        let compressed_bytes_written = self.compressed_bytes_written.load(Acquire);
+        let decompressed_bytes_written = self.decompressed_bytes_written.load(Acquire);
+        let written_compression_ratio =
+            decompressed_bytes_written as f32 / compressed_bytes_written as f32;
+
+        let high_level_user_bytes_written = self.high_level_user_bytes_written.load(Acquire);
+
+        let write_amplification =
+            decompressed_bytes_written as f32 / high_level_user_bytes_written as f32;
+
+        let live_ratio = live_objects as f32 / stored_objects.max(1) as f32;
+        let approximate_live_data = live_ratio * total_file_size as f32 * written_compression_ratio;
+        let space_amplification = total_file_size as f32 / approximate_live_data as f32;
 
         Stats {
             live_objects,
             stored_objects,
             dead_objects: stored_objects - live_objects,
-            live_percent: u8::try_from((live_objects * 100) / stored_objects.max(1)).unwrap(),
+            live_ratio,
             files: fams_len,
-            compressed_bytes_written: self.compressed_bytes_written.load(Acquire),
-            decompressed_bytes_written: self.decompressed_bytes_written.load(Acquire),
-            compressed_bytes_read: self.compressed_bytes_read.load(Acquire),
-            decompressed_bytes_read: self.decompressed_bytes_read.load(Acquire),
+            total_file_size,
+            compressed_bytes_read,
+            compressed_bytes_written,
+            decompressed_bytes_read,
+            decompressed_bytes_written,
+            read_compression_ratio,
+            written_compression_ratio,
+            high_level_user_bytes_written,
+            write_amplification,
+            space_amplification,
         }
     }
 

@@ -12,7 +12,7 @@ use concurrent_map::{ConcurrentMap, Maximum};
 
 use crate::{
     debug_delay, Config, DiskLocation, FileAndMetadata, LocationTable, Map, Metadata, ObjectId,
-    Stats, ZstdDict, NEW_WRITE_BATCH_BIT,
+    ZstdDict, NEW_WRITE_BATCH_BIT,
 };
 
 impl Maximum for DiskLocation {
@@ -71,12 +71,12 @@ impl FileMap {
                 continue;
             };
 
-            let len = fam.len.load(SeqCst);
-            let present_objects = metadata.present_objects;
+            let live_objects = fam.live_objects.load(SeqCst);
+            let live_and_dead_objects = metadata.present_objects;
 
-            let non_empty = len != 0;
-            let present_percent = (len * 100) / present_objects.max(1);
-            let candidate_by_percent = present_percent < u64::from(config.file_compaction_percent);
+            let non_empty = live_objects != 0;
+            let live_percent = (live_objects * 100) / live_and_dead_objects.max(1);
+            let candidate_by_percent = live_percent < u64::from(config.file_compaction_percent);
             let is_small_file = (metadata.file_size * config.min_compaction_files as u64)
                 < config.target_file_size as u64;
             let over_small_file_cleanup_threshold =
@@ -93,7 +93,7 @@ impl FileMap {
                     // rewriting its contents
                     continue;
                 }
-                assert_ne!(present_objects, 0);
+                assert_ne!(live_and_dead_objects, 0);
 
                 claims.claims.push(location.0);
 
@@ -101,10 +101,11 @@ impl FileMap {
 
                 log::trace!(
                     "fam at location {:?} generation {generation} is ready to be compacted, \
-                    len {len} present {present_objects} \
-                    present percent {present_percent} candidate by percent {candidate_by_percent} \
+                    live objects {live_objects} dead objects {} \
+                    live percent {live_percent} candidate by percent {candidate_by_percent} \
                     candidate by size {candidate_by_size} (metadata size: {})",
                     fam.location,
+                    live_and_dead_objects - live_objects,
                     metadata.file_size
                 );
 
@@ -149,7 +150,7 @@ impl FileMap {
 
         let fam = Arc::new(FileAndMetadata {
             file: file,
-            len: initial_capacity.into(),
+            live_objects: initial_capacity.into(),
             generation,
             location,
             synced: config.fsync_each_batch.into(),
@@ -205,7 +206,7 @@ impl FileMap {
                 continue;
             };
 
-            if fam.len.load(SeqCst) == 0 {
+            if fam.live_objects.load(SeqCst) == 0 {
                 let already_claimed = fam.rewrite_claim.swap(true, SeqCst);
                 if !already_claimed {
                     claims.claims.push(location.0);
@@ -238,26 +239,28 @@ impl FileMap {
         }
     }
 
-    /// Returns the counts of (files, total stored objects, live objects)
-    pub(crate) fn stats(&self) -> (usize, u64, u64) {
+    /// Returns the counts of (files, total file size, total stored objects, live objects)
+    pub(crate) fn stats(&self) -> (usize, u64, u64, u64) {
         let mut live_objects = 0;
         let mut stored_objects = 0;
 
         let mut fams_len = 0;
+        let mut total_file_size = 0;
         for (_, fam) in &self.fams {
             if let Some(metadata) = fam.metadata() {
                 fams_len += 1;
-                live_objects += fam.len.load(SeqCst);
+                total_file_size += metadata.file_size;
+                live_objects += fam.live_objects.load(SeqCst);
                 stored_objects += metadata.present_objects;
             }
         }
 
-        (fams_len, stored_objects, live_objects)
+        (fams_len, total_file_size, stored_objects, live_objects)
     }
 
     pub fn delete_partially_installed_fam(&self, location: DiskLocation, tmp_path: PathBuf) {
         let fam = self.fams.remove(&Reverse(location)).unwrap();
-        fam.len.store(0, SeqCst);
+        fam.live_objects.store(0, SeqCst);
 
         let path_ptr = Box::into_raw(Box::new(tmp_path));
         let old_path_ptr = fam.path.swap(path_ptr, SeqCst);
@@ -275,7 +278,7 @@ impl FileMap {
 
         fam.install_metadata_and_path(metadata, new_path);
 
-        let old = fam.len.fetch_sub(subtract_from_len, SeqCst);
+        let old = fam.live_objects.fetch_sub(subtract_from_len, SeqCst);
         assert!(
             old >= subtract_from_len,
             "expected old {old} to be >= subtract_from_len {subtract_from_len}"
@@ -298,7 +301,7 @@ impl FileMap {
 
             assert_ne!(fam_location.0, new_base_location);
 
-            let old = fam.len.fetch_sub(1, SeqCst);
+            let old = fam.live_objects.fetch_sub(1, SeqCst);
             log::trace!(
                 "subtracting one from fam {:?}, current len is {}",
                 replaced_location,

@@ -52,11 +52,17 @@ impl Marble {
 
         let mut fragmented_shards = vec![];
 
+        let mut high_level_user_bytes_written = 0;
         let mut max_oid = 0;
         for (object_id, data_opt) in write_batch {
             max_oid = max_oid.max(object_id);
             let (object_size, shard_id) = if let Some(ref data) = data_opt {
                 let len = data.as_ref().len();
+
+                if old_locations.is_empty() {
+                    high_level_user_bytes_written += len as u64;
+                }
+
                 let shard = if gen == NEW_WRITE_GENERATION {
                     // only shard during gc defragmentation of
                     // rewritten items, otherwise we break
@@ -88,8 +94,10 @@ impl Marble {
             }
         }
 
-        self.max_object_id
-            .fetch_max(max_oid, std::sync::atomic::Ordering::Release);
+        self.high_level_user_bytes_written
+            .fetch_add(high_level_user_bytes_written, Ordering::Relaxed);
+
+        self.max_object_id.fetch_max(max_oid, Ordering::Release);
 
         let iter = shards
             .into_iter()
@@ -270,8 +278,10 @@ impl Marble {
 
         self.compressed_bytes_written
             .fetch_add(written_bytes, Ordering::Relaxed);
-        self.decompressed_bytes_written
-            .fetch_add(written_bytes + compressed_bytes, Ordering::Relaxed);
+        self.decompressed_bytes_written.fetch_add(
+            u64::try_from(written_bytes as i64 + compressed_bytes).unwrap(),
+            Ordering::Relaxed,
+        );
 
         // 2. assign LSN and add to fams
         let initial_capacity = new_relative_locations.len() as u64;
