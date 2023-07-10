@@ -8,3 +8,6 @@ fuzz/corpus
 Cargo.lock
 target
 testing_data_directories
+
+measure_throughput
+measure_latency
