@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fault_injection::{fallible, maybe};
 
@@ -52,11 +52,17 @@ impl Marble {
 
         let mut fragmented_shards = vec![];
 
+        let mut high_level_user_bytes_written = 0;
         let mut max_oid = 0;
         for (object_id, data_opt) in write_batch {
             max_oid = max_oid.max(object_id);
             let (object_size, shard_id) = if let Some(ref data) = data_opt {
                 let len = data.as_ref().len();
+
+                if old_locations.is_empty() {
+                    high_level_user_bytes_written += len as u64;
+                }
+
                 let shard = if gen == NEW_WRITE_GENERATION {
                     // only shard during gc defragmentation of
                     // rewritten items, otherwise we break
@@ -88,8 +94,10 @@ impl Marble {
             }
         }
 
-        self.max_object_id
-            .fetch_max(max_oid, std::sync::atomic::Ordering::Release);
+        self.high_level_user_bytes_written
+            .fetch_add(high_level_user_bytes_written, Ordering::Relaxed);
+
+        self.max_object_id.fetch_max(max_oid, Ordering::Release);
 
         let iter = shards
             .into_iter()
@@ -143,7 +151,7 @@ impl Marble {
         // 6. update replaced / contention-related failures
 
         // 1. write data to tmp
-        let tmp_file_name = format!("{}-tmp", TMP_COUNTER.fetch_add(1, SeqCst));
+        let tmp_file_name = format!("{}-tmp", TMP_COUNTER.fetch_add(1, Ordering::SeqCst));
         let tmp_path = self.config.path.join(HEAP_DIR_SUFFIX).join(tmp_file_name);
 
         let mut file_options = OpenOptions::new();
@@ -178,6 +186,8 @@ impl Marble {
         let mut new_relative_locations: Map<ObjectId, RelativeDiskLocation> = Map::default();
 
         let mut written_bytes: u64 = 0;
+        let mut compressed_bytes: i64 = 0;
+
         for (object_id, raw_object_opt) in &objects {
             let raw_object = if let Some(raw_object) = raw_object_opt {
                 raw_object.as_ref()
@@ -205,12 +215,19 @@ impl Marble {
 
             let compressed_object: Option<Vec<u8>> =
                 if let Some((ref mut compressor, ref level)) = compressor_and_level_opt {
+                    let decompressed_size = raw_object.len() as i64;
                     let max_size = zstd_safe::compress_bound(raw_object.len());
                     let mut out = Vec::with_capacity(max_size);
                     compressor
                         .compress(&mut out, raw_object, *level)
                         .map_err(crate::zstd::zstd_error)
                         .unwrap();
+                    let compressed_size = out.len() as i64;
+
+                    // it's possible for compressed bytes to be larger than
+                    // decompressed bytes in some situations.
+                    compressed_bytes += decompressed_size - compressed_size;
+
                     Some(out)
                 } else {
                     None
@@ -258,6 +275,13 @@ impl Marble {
         if self.config.fsync_each_batch {
             fallible!(file.sync_all());
         }
+
+        self.compressed_bytes_written
+            .fetch_add(written_bytes, Ordering::Relaxed);
+        self.decompressed_bytes_written.fetch_add(
+            u64::try_from(written_bytes as i64 + compressed_bytes).unwrap(),
+            Ordering::Relaxed,
+        );
 
         // 2. assign LSN and add to fams
         let initial_capacity = new_relative_locations.len() as u64;

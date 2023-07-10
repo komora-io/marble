@@ -1,5 +1,6 @@
 use std::io;
 use std::os::unix::fs::FileExt;
+use std::sync::atomic::Ordering;
 
 use fault_injection::{annotate, fallible};
 
@@ -63,6 +64,14 @@ impl Marble {
 
         assert_eq!(object_id, read_pid);
 
-        Ok(Some(fam.zstd_dict.decompress(compressed_buf)))
+        self.compressed_bytes_read
+            .fetch_add(compressed_buf.len() as u64, Ordering::Relaxed);
+
+        let decompressed_buf = fam.zstd_dict.decompress(compressed_buf);
+
+        self.decompressed_bytes_read
+            .fetch_add(decompressed_buf.len() as u64, Ordering::Relaxed);
+
+        Ok(Some(decompressed_buf))
     }
 }
