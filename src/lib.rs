@@ -247,7 +247,7 @@ fn hash(len_buf: [u8; 8], pid_buf: [u8; 8], object_buf: &[u8]) -> [u8; 4] {
 
 /// Statistics for file contents, to base decisions around
 /// calls to `maintenance`.
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct Stats {
     /// The number of live objects stored in the backing
     /// storage files.
