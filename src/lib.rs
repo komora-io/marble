@@ -357,6 +357,15 @@ impl Drop for FileAndMetadata {
                 eprintln!("failed to remove empty FileAndMetadata on drop: {:?}", e);
             }
         }
+
+        let path_ptr = self.path.load(Acquire);
+        if !path_ptr.is_null() {
+            drop(unsafe { Box::from_raw(path_ptr) });
+        }
+        let metadata_ptr = self.metadata.load(Acquire);
+        if !metadata_ptr.is_null() {
+            drop(unsafe { Box::from_raw(metadata_ptr) });
+        }
     }
 }
 
