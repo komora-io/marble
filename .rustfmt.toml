@@ -1,0 +1,7 @@
+reorder_imports = true
+format_strings = true
+wrap_comments = true
+unstable_features = true
+max_width = 100
+comment_width = 60
+fn_call_width = 60
