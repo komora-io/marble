@@ -325,7 +325,7 @@ impl Marble {
         Stats {}
     }
 
-    pub fn get(&self, object_id: u64) -> io::Result<Option<Vec<u8>>> {
+    pub fn read(&self, object_id: u64) -> io::Result<Option<Vec<u8>>> {
         self.check_error()?;
 
         let mut guard = self.free_ebr.pin();

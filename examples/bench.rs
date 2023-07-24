@@ -54,7 +54,7 @@ fn run_reader(marble: Marble) {
     while !ANY_WRITERS_DONE.load(Ordering::Relaxed) {
         let before = Instant::now();
         let pid = rng.gen_range(0..KEYSPACE);
-        marble.get(pid).unwrap();
+        marble.read(pid).unwrap();
         let elapsed = before.elapsed();
 
         best_time = best_time.min(elapsed);
