@@ -19,10 +19,113 @@ use pagetable::PageTable;
 use rayon::prelude::*;
 
 const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
-const N_SLABS: usize = 32;
+const N_SLABS: usize = 78;
 
-const fn slab_for_size(size: usize) -> u8 {
-    size.next_power_of_two().trailing_zeros() as u8
+const SLAB_SIZES: [usize; N_SLABS] = [
+    64,     // 0x40
+    80,     // 0x50
+    96,     // 0x60
+    112,    // 0x70
+    128,    // 0x80
+    160,    // 0xa0
+    192,    // 0xc0
+    224,    // 0xe0
+    256,    // 0x100
+    320,    // 0x140
+    384,    // 0x180
+    448,    // 0x1c0
+    512,    // 0x200
+    640,    // 0x280
+    768,    // 0x300
+    896,    // 0x380
+    1024,   // 0x400
+    1280,   // 0x500
+    1536,   // 0x600
+    1792,   // 0x700
+    2048,   // 0x800
+    2560,   // 0xa00
+    3072,   // 0xc00
+    3584,   // 0xe00
+    4096,   // 0x1000
+    5120,   // 0x1400
+    6144,   // 0x1800
+    7168,   // 0x1c00
+    8192,   // 0x2000
+    10240,  // 0x2800
+    12288,  // 0x3000
+    14336,  // 0x3800
+    16384,  // 0x4000
+    20480,  // 0x5000
+    24576,  // 0x6000
+    28672,  // 0x7000
+    32768,  // 0x8000
+    40960,  // 0xa000
+    49152,  // 0xc000
+    57344,  // 0xe000
+    65536,  // 0x10000
+    98304,  // 0x1a000
+    131072, // 0x20000
+    163840, // 0x28000
+    196608,
+    262144,
+    393216,
+    524288,
+    786432,
+    1048576,
+    1572864,
+    2097152,
+    3145728,
+    4194304,
+    6291456,
+    8388608,
+    12582912,
+    16777216,
+    25165824,
+    33554432,
+    50331648,
+    67108864,
+    100663296,
+    134217728,
+    201326592,
+    268435456,
+    402653184,
+    536870912,
+    805306368,
+    1073741824,
+    1610612736,
+    2147483648,
+    3221225472,
+    4294967296,
+    6442450944,
+    8589934592,
+    12884901888,
+    17179869184,
+];
+
+const fn overhead_for_size(size: usize) -> usize {
+    if size + 5 <= u8::MAX as usize {
+        // crc32 + 1 byte frame
+        5
+    } else if size + 6 <= u16::MAX as usize {
+        // crc32 + 2 byte frame
+        6
+    } else if size + 8 <= u32::MAX as usize {
+        // crc32 + 4 byte frame
+        8
+    } else {
+        // crc32 + 8 byte frame
+        12
+    }
+}
+
+fn slab_for_size(size: usize) -> u8 {
+    let total_size = size + overhead_for_size(size);
+    for idx in 0..SLAB_SIZES.len() {
+        if SLAB_SIZES[idx] >= total_size {
+            return idx as u8;
+        }
+    }
+    u8::MAX
 }
 
 pub use inline_array::InlineArray;
@@ -88,20 +191,21 @@ impl SlabAddress {
     }
 }
 
-impl From<u64> for SlabAddress {
-    fn from(i: u64) -> SlabAddress {
+impl From<NonZeroU64> for SlabAddress {
+    fn from(i: NonZeroU64) -> SlabAddress {
+        let i = i.get();
         let bytes = i.to_be_bytes();
         SlabAddress {
-            slab_id: bytes[0],
+            slab_id: bytes[0] - 1,
             slab_slot: bytes[1..].try_into().unwrap(),
         }
     }
 }
 
-impl Into<u64> for SlabAddress {
-    fn into(self) -> u64 {
-        u64::from_be_bytes([
-            self.slab_id,
+impl Into<NonZeroU64> for SlabAddress {
+    fn into(self) -> NonZeroU64 {
+        NonZeroU64::new(u64::from_be_bytes([
+            self.slab_id + 1,
             self.slab_slot[0],
             self.slab_slot[1],
             self.slab_slot[2],
@@ -109,7 +213,8 @@ impl Into<u64> for SlabAddress {
             self.slab_slot[4],
             self.slab_slot[5],
             self.slab_slot[6],
-        ])
+        ]))
+        .unwrap()
     }
 }
 
@@ -188,8 +293,32 @@ impl Slab {
         Ok(ret)
     }
 
-    fn write(&self, slot: u64, data: &[u8]) -> io::Result<()> {
-        assert!(data.len() <= self.slot_size);
+    fn write(&self, slot: u64, mut data: Vec<u8>) -> io::Result<()> {
+        let len = data.len();
+
+        assert!(len + overhead_for_size(data.len()) <= self.slot_size);
+
+        data.resize(self.slot_size, 0);
+
+        if self.slot_size <= u8::MAX as usize {
+            // crc32 + 1 byte frame
+            data[self.slot_size - 5] = u8::try_from(len).unwrap();
+        } else if len <= u16::MAX as usize {
+            // crc32 + 2 byte frame
+            let size_bytes: [u8; 2] = u16::try_from(len).unwrap().to_le_bytes();
+            data[self.slot_size - 6..self.slot_size - 4].copy_from_slice(&size_bytes);
+        } else if len <= u32::MAX as usize {
+            // crc32 + 4 byte frame
+            let size_bytes: [u8; 4] = u32::try_from(len).unwrap().to_le_bytes();
+            data[self.slot_size - 8..self.slot_size - 4].copy_from_slice(&size_bytes);
+        } else {
+            // crc32 + 8 byte frame
+            let size_bytes: [u8; 8] = u64::try_from(len).unwrap().to_le_bytes();
+            data[self.slot_size - 12..self.slot_size - 4].copy_from_slice(&size_bytes);
+        }
+
+        let hash: [u8; 4] = crc32fast::hash(&data[..self.slot_size - 4]).to_le_bytes();
+        data[self.slot_size - 4..].copy_from_slice(&hash);
 
         let whence = self.slot_size as u64 * slot;
 
@@ -294,10 +423,11 @@ impl Marble {
         let pt = PageTable::<AtomicU64>::default();
         let mut user_data = Vec::<(u64, InlineArray)>::with_capacity(recovered_metadata.len());
         let mut object_ids: FnvHashSet<u64> = Default::default();
-        let mut slots_per_slab: [FnvHashSet<u64>; N_SLABS] = Default::default();
+        let mut slots_per_slab: [FnvHashSet<u64>; N_SLABS] =
+            core::array::from_fn(|_| Default::default());
         for (k, location, data) in recovered_metadata {
             object_ids.insert(k);
-            let slab_address = SlabAddress::from(location.get());
+            let slab_address = SlabAddress::from(location);
             slots_per_slab[slab_address.slab_id as usize].insert(slab_address.slot());
             pt.get(k).store(location.get(), Ordering::Relaxed);
             user_data.push((k, data.clone()));
@@ -307,7 +437,7 @@ impl Marble {
         let mut slab_opts = fs::OpenOptions::new();
         slab_opts.create(true).read(true).write(true);
         for i in 0..N_SLABS {
-            let slot_size = 1 << i;
+            let slot_size = SLAB_SIZES[i];
             let slab_path = slabs_dir.join(format!("{}", slot_size));
 
             let file = fallible!(slab_opts.open(slab_path));
@@ -349,11 +479,11 @@ impl Marble {
         let mut guard = self.free_ebr.pin();
         let location_u64 = self.pt.get(object_id).load(Ordering::Acquire);
 
-        if location_u64 == 0 {
+        let slab_address = if let Some(nzu) = NonZeroU64::new(location_u64) {
+            SlabAddress::from(nzu)
+        } else {
             return Ok(None);
-        }
-
-        let slab_address = SlabAddress::from(location_u64);
+        };
 
         let slab = &self.slabs[usize::from(slab_address.slab_id)];
 
@@ -366,15 +496,14 @@ impl Marble {
         }
     }
 
-    pub fn write_batch<B, I>(&self, batch: I) -> io::Result<()>
+    pub fn write_batch<I>(&self, batch: I) -> io::Result<()>
     where
-        B: AsRef<[u8]> + Send,
-        I: Sized + IntoIterator<Item = (u64, Option<(InlineArray, B)>)>,
+        I: Sized + IntoIterator<Item = (u64, Option<(InlineArray, Vec<u8>)>)>,
     {
         self.check_error()?;
         let mut guard = self.free_ebr.pin();
 
-        let batch: Vec<(u64, Option<(InlineArray, B)>)> = batch
+        let batch: Vec<(u64, Option<(InlineArray, Vec<u8>)>)> = batch
             .into_iter()
             //.map(|(key, val_opt)| (key, val_opt.map(|(user_data, b)| (user_data, b.as_ref()))))
             .collect();
@@ -382,29 +511,30 @@ impl Marble {
         let slabs = &self.slabs;
         let metadata_batch_res: io::Result<Vec<(u64, Option<(NonZeroU64, InlineArray)>)>> = batch
             .into_par_iter()
-            .map(|(object_id, val_opt): (u64, Option<(InlineArray, B)>)| {
-                let new_meta = if let Some((user_data, b)) = val_opt {
-                    let bytes = b.as_ref();
-                    let slab_id = slab_for_size(bytes.len());
-                    let slab = &slabs[usize::from(slab_id)];
-                    let slot = slab.slot_allocator.allocate();
-                    let new_location = SlabAddress::from_slab_slot(slab_id, slot);
-                    let new_location_u64: u64 = new_location.into();
+            .map(
+                |(object_id, val_opt): (u64, Option<(InlineArray, Vec<u8>)>)| {
+                    let new_meta = if let Some((user_data, bytes)) = val_opt {
+                        let slab_id = slab_for_size(bytes.len());
+                        let slab = &slabs[usize::from(slab_id)];
+                        let slot = slab.slot_allocator.allocate();
+                        let new_location = SlabAddress::from_slab_slot(slab_id, slot);
+                        let new_location_nzu: NonZeroU64 = new_location.into();
 
-                    let complete_durability_pipeline = maybe!(slab.write(slot, &bytes));
+                        let complete_durability_pipeline = maybe!(slab.write(slot, bytes));
 
-                    if let Err(e) = complete_durability_pipeline {
-                        // can immediately free slot as the
-                        slab.slot_allocator.free(slot);
-                        return Err(e);
-                    }
-                    Some((NonZeroU64::new(new_location_u64).unwrap(), user_data))
-                } else {
-                    None
-                };
+                        if let Err(e) = complete_durability_pipeline {
+                            // can immediately free slot as the
+                            slab.slot_allocator.free(slot);
+                            return Err(e);
+                        }
+                        Some((new_location_nzu, user_data))
+                    } else {
+                        None
+                    };
 
-                Ok((object_id, new_meta))
-            })
+                    Ok((object_id, new_meta))
+                },
+            )
             .collect();
 
         let metadata_batch = match metadata_batch_res {
@@ -421,7 +551,7 @@ impl Marble {
             // this is very cold, so it's fine if it's not fast
             for (_object_id, value_opt) in metadata_batch {
                 let (new_location_u64, _user_data) = value_opt.unwrap();
-                let new_location = SlabAddress::from(new_location_u64.get());
+                let new_location = SlabAddress::from(new_location_u64);
                 let slab_id = new_location.slab_id;
                 let slab = &self.slabs[usize::from(slab_id)];
                 slab.slot_allocator.free(new_location.slot());
@@ -440,8 +570,8 @@ impl Marble {
 
             let last_u64 = self.pt.get(object_id).swap(new_location, Ordering::Release);
 
-            if last_u64 != 0 {
-                let last_address = SlabAddress::from(last_u64);
+            if let Some(nzu) = NonZeroU64::new(last_u64) {
+                let last_address = SlabAddress::from(nzu);
 
                 guard.defer_drop(DeferredFree {
                     allocator: self.slabs[usize::from(last_address.slab_id)]
@@ -455,9 +585,13 @@ impl Marble {
         Ok(())
     }
 
-    pub fn allocate<B: AsRef<[u8]>>(&self, user_data: InlineArray, object: B) -> io::Result<u64> {
+    pub fn allocate<B: AsRef<[u8]>>(
+        &self,
+        user_data: InlineArray,
+        object: Vec<u8>,
+    ) -> io::Result<u64> {
         let new_id = self.object_id_allocator.allocate();
-        if let Err(e) = self.write_batch([(new_id, Some((user_data, object.as_ref())))]) {
+        if let Err(e) = self.write_batch([(new_id, Some((user_data, object)))]) {
             self.object_id_allocator.free(new_id);
             Err(e)
         } else {
@@ -472,8 +606,8 @@ impl Marble {
             return Err(e);
         }
         let last_u64 = self.pt.get(object_id).swap(0, Ordering::Release);
-        if last_u64 != 0 {
-            let last_address = SlabAddress::from(last_u64);
+        if let Some(nzu) = NonZeroU64::new(last_u64) {
+            let last_address = SlabAddress::from(nzu);
 
             guard.defer_drop(DeferredFree {
                 allocator: self.slabs[usize::from(last_address.slab_id)]
