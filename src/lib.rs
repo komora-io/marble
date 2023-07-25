@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::num::NonZeroU64;
@@ -13,7 +14,6 @@ use ebr::{Ebr, Guard};
 use fault_injection::{fallible, maybe};
 use fnv::FnvHashSet;
 use fs2::FileExt as _;
-use inline_array::InlineArray;
 use metadata_store::MetadataStore;
 use pagetable::PageTable;
 use rayon::prelude::*;
@@ -24,6 +24,8 @@ const N_SLABS: usize = 32;
 const fn slab_for_size(size: usize) -> u8 {
     size.next_power_of_two().trailing_zeros() as u8
 }
+
+pub use inline_array::InlineArray;
 
 #[derive(Debug, Clone)]
 pub struct Stats {}
@@ -41,10 +43,17 @@ impl Default for Config {
     }
 }
 
+pub fn recover<P: AsRef<Path>>(
+    storage_directory: P,
+) -> io::Result<(Marble, Vec<(u64, InlineArray)>)> {
+    Marble::recover(&Config {
+        path: storage_directory.as_ref().into(),
+    })
+}
+
 impl Config {
-    pub fn open(&self) -> io::Result<Marble> {
-        let (marble, _user_data) = Marble::recover(&self.path)?;
-        Ok(marble)
+    pub fn recover(&self) -> io::Result<(Marble, Vec<(u64, InlineArray)>)> {
+        Marble::recover(&self)
     }
 }
 
@@ -224,6 +233,7 @@ fn set_error(global_error: &AtomicPtr<(io::ErrorKind, String)>, error: &io::Erro
 
 #[derive(Clone)]
 pub struct Marble {
+    config: Config,
     slabs: Arc<[Slab; N_SLABS]>,
     pt: PageTable<AtomicU64>,
     object_id_allocator: Arc<Allocator>,
@@ -232,6 +242,15 @@ pub struct Marble {
     global_error: Arc<AtomicPtr<(io::ErrorKind, String)>>,
     #[allow(unused)]
     directory_lock: Arc<fs::File>,
+}
+
+impl fmt::Debug for Marble {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Marble")
+            .field("config", &self.config.path)
+            .field("stats", &self.stats())
+            .finish()
+    }
 }
 
 impl Marble {
@@ -250,14 +269,11 @@ impl Marble {
         set_error(&self.global_error, error);
     }
 
-    pub fn recover<P: AsRef<Path>>(
-        storage_directory: P,
-    ) -> io::Result<(Marble, Vec<(u64, InlineArray)>)> {
-        let path = storage_directory.as_ref();
-        let slabs_dir = path.join("slabs");
+    pub fn recover(config: &Config) -> io::Result<(Marble, Vec<(u64, InlineArray)>)> {
+        let slabs_dir = config.path.join("slabs");
 
         // initialize directories if not present
-        for p in [&path.into(), &slabs_dir] {
+        for p in [&config.path, &slabs_dir] {
             if let Err(e) = fs::read_dir(p) {
                 if e.kind() == io::ErrorKind::NotFound {
                     fallible!(fs::create_dir_all(p));
@@ -265,14 +281,15 @@ impl Marble {
             }
         }
 
-        let _ = fs::File::create(path.join(WARN));
+        let _ = fs::File::create(config.path.join(WARN));
 
         let mut file_lock_opts = fs::OpenOptions::new();
         file_lock_opts.create(false).read(false).write(false);
-        let directory_lock = fallible!(fs::File::open(path));
+        let directory_lock = fallible!(fs::File::open(&config.path));
         fallible!(directory_lock.try_lock_exclusive());
 
-        let (metadata_store, recovered_metadata) = MetadataStore::recover(path.join("metadata"))?;
+        let (metadata_store, recovered_metadata) =
+            MetadataStore::recover(config.path.join("metadata"))?;
 
         let pt = PageTable::<AtomicU64>::default();
         let mut user_data = Vec::<(u64, InlineArray)>::with_capacity(recovered_metadata.len());
@@ -305,6 +322,7 @@ impl Marble {
         Ok((
             Marble {
                 slabs: Arc::new(slabs.try_into().unwrap()),
+                config: config.clone(),
                 object_id_allocator: Arc::new(Allocator::from_allocated(&object_ids)),
                 pt,
                 metadata_store: Arc::new(metadata_store),
