@@ -244,14 +244,11 @@ impl Allocator {
     }
 
     fn allocate(&self) -> u64 {
-        let pop_attempt = if let Ok(mut free) = self.free_and_pending.try_lock() {
-            while let Some(free_id) = self.free_queue.pop() {
-                free.push(Reverse(free_id));
-            }
-            free.pop()
-        } else {
-            None
-        };
+        let mut free = self.free_and_pending.lock().unwrap();
+        while let Some(free_id) = self.free_queue.pop() {
+            free.push(Reverse(free_id));
+        }
+        let pop_attempt = free.pop();
 
         if let Some(id) = pop_attempt {
             id.0
