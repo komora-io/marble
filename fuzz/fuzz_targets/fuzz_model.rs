@@ -25,7 +25,7 @@ type ObjectId = u64;
 struct Config(MarbleConfig);
 
 impl<'a> Arbitrary<'a> for Config {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+    fn arbitrary(_: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let path = std::path::Path::new(TEST_DIR)
             .join("fuzz")
             .join(uuid::Uuid::new_v4().to_string())
@@ -121,7 +121,7 @@ fuzz_target!(|args: (Config, [Op; OPS])| {
         };
 
         for (pid, expected) in &model {
-            let expected_ref: Option<&[u8]> = if let Some((ud, d)) = expected {
+            let expected_ref: Option<&[u8]> = if let Some((_ud, d)) = expected {
                 Some(d)
             } else {
                 None
