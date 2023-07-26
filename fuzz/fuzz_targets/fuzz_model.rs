@@ -31,26 +31,17 @@ impl<'a> Arbitrary<'a> for Config {
             .join(uuid::Uuid::new_v4().to_string())
             .into();
 
-        let zstd_compression_level = if Arbitrary::arbitrary(u).unwrap_or(false) {
-            None
-        } else {
-            Some(Arbitrary::arbitrary(u).unwrap_or(3))
-        };
-
         Ok(Config(MarbleConfig {
             path,
-            target_file_size: u.int_in_range(1_u16..=1024).unwrap_or(50) as usize,
-            file_compaction_percent: u.int_in_range(0_u8..=99).unwrap_or(50) as u8,
-            zstd_compression_level,
             ..Default::default()
         }))
     }
 }
 
 #[derive(Debug)]
-struct WriteBatch<'a>(HashMap<ObjectId, Option<&'a [u8]>>);
+struct WriteBatch(HashMap<ObjectId, Option<(marble::InlineArray, Vec<u8>)>>);
 
-impl<'a> Arbitrary<'a> for WriteBatch<'a> {
+impl<'a> Arbitrary<'a> for WriteBatch {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let pages: u8 = u
             .int_in_range(BATCH_MIN_SZ..=BATCH_MAX_SZ)
@@ -62,10 +53,12 @@ impl<'a> Arbitrary<'a> for WriteBatch<'a> {
 
             let page = if Arbitrary::arbitrary(u).unwrap_or(true) {
                 let len: u8 = u.int_in_range(0..=VALUE_MAX_SZ).unwrap_or(0);
-                let value = u
+                let user_data = u64::from(pid).to_le_bytes().as_ref().into();
+                let value: Vec<u8> = u
                     .bytes(usize::from(len))
-                    .unwrap_or(&[1, 2, 3, 4, 5, 6, 7, 8]);
-                Some(value)
+                    .unwrap_or(&[1, 2, 3, 4, 5, 6, 7, 8])
+                    .into();
+                Some((user_data, value))
             } else {
                 None
             };
@@ -78,13 +71,13 @@ impl<'a> Arbitrary<'a> for WriteBatch<'a> {
 }
 
 #[derive(Debug)]
-enum Op<'a> {
-    WriteBatch(WriteBatch<'a>),
+enum Op {
+    WriteBatch(WriteBatch),
     Gc,
     Restart,
 }
 
-impl<'a> Arbitrary<'a> for Op<'a> {
+impl<'a> Arbitrary<'a> for Op {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let choice: u8 = u.int_in_range(0..=2).unwrap_or(0);
         Ok(match choice {
@@ -98,10 +91,13 @@ impl<'a> Arbitrary<'a> for Op<'a> {
     }
 }
 
-fuzz_target!(|args: (Config, [Op<'_>; OPS])| {
+fuzz_target!(|args: (Config, [Op; OPS])| {
     let (config, ops) = args;
 
-    let mut marble = config.0.clone().open().unwrap();
+    let (mut marble, mut recovered_data) = config.0.clone().recover().unwrap();
+    for (id, ud) in &recovered_data {
+        assert_eq!(id.to_le_bytes().as_ref(), ud.as_ref());
+    }
     let mut model = std::collections::BTreeMap::new();
 
     for op in ops {
@@ -117,13 +113,20 @@ fuzz_target!(|args: (Config, [Op<'_>; OPS])| {
             }
             Op::Restart => {
                 drop(marble);
-                marble = config.0.clone().open().unwrap();
+                (marble, recovered_data) = config.0.clone().recover().unwrap();
+                for (id, ud) in &recovered_data {
+                    assert_eq!(id.to_le_bytes().as_ref(), ud.as_ref());
+                }
             }
         };
 
         for (pid, expected) in &model {
-            let expected_ref: Option<&[u8]> = expected.as_deref();
-            let actual: Option<Box<[u8]>> = marble.read(*pid).unwrap();
+            let expected_ref: Option<&[u8]> = if let Some((ud, d)) = expected {
+                Some(d)
+            } else {
+                None
+            };
+            let actual: Option<Vec<u8>> = marble.read(*pid).unwrap();
             let actual_ref: Option<&[u8]> = actual.as_deref();
             assert_eq!(expected_ref, actual_ref);
         }
