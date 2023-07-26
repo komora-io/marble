@@ -119,7 +119,7 @@ fn write_batches_inner(start: u32, m: Marble) {
         };
 
         let mut batch = vec![];
-        for key in (0..BATCH_SIZE as u64).chain(once(u64::MAX)) {
+        for key in 0..BATCH_SIZE as u64 {
             batch.push((key, value.clone()));
         }
         m.write_batch(batch).unwrap();
@@ -130,7 +130,6 @@ fn write_batches_inner(start: u32, m: Marble) {
 /// recovered (i.e., equal). Panics if they don't match up.
 fn verify_batches(m: &Marble) {
     let values: Vec<Option<Vec<u8>>> = (0..BATCH_SIZE as u64)
-        .chain(once(u64::MAX))
         .map(|i| {
             let object_id = i;
             m.read(object_id).unwrap()

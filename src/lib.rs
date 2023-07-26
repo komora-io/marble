@@ -428,6 +428,7 @@ impl Marble {
     }
 
     pub fn recover(config: &Config) -> io::Result<(Marble, Vec<(u64, InlineArray)>)> {
+        log::info!("recovering Marble at {:?}", config.path);
         let slabs_dir = config.path.join("slabs");
 
         // initialize directories if not present
@@ -478,6 +479,7 @@ impl Marble {
             })
         }
 
+        log::info!("recovery of Marble at {:?} complete", config.path);
         Ok((
             Marble {
                 slabs: Arc::new(slabs.try_into().unwrap()),
