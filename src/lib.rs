@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use crossbeam_queue::SegQueue;
 use ebr::{Ebr, Guard};
-use fault_injection::{fallible, maybe};
+use fault_injection::{annotate, fallible, maybe};
 use fnv::FnvHashSet;
 use fs2::FileExt as _;
 use metadata_store::MetadataStore;
@@ -281,16 +281,48 @@ struct Slab {
 
 impl Slab {
     fn read(&self, slot: u64, _guard: &mut Guard<'_, DeferredFree, 1>) -> io::Result<Vec<u8>> {
-        let mut ret = Vec::with_capacity(self.slot_size);
+        let mut data = Vec::with_capacity(self.slot_size);
         unsafe {
-            ret.set_len(self.slot_size);
+            data.set_len(self.slot_size);
         }
 
         let whence = self.slot_size as u64 * slot;
 
-        self.file.read_exact_at(&mut ret, whence)?;
+        self.file.read_exact_at(&mut data, whence)?;
 
-        Ok(ret)
+        let hash_actual: [u8; 4] = crc32fast::hash(&data[..self.slot_size - 4]).to_le_bytes();
+        let hash_expected = &data[self.slot_size - 4..];
+
+        if hash_expected != &hash_actual {
+            return Err(annotate!(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "crc mismatch - data corruption detected"
+            )));
+        }
+
+        let len: usize = if self.slot_size <= u8::MAX as usize {
+            // crc32 + 1 byte frame
+            usize::from(data[self.slot_size - 5])
+        } else if self.slot_size <= u16::MAX as usize {
+            // crc32 + 2 byte frame
+            let mut size_bytes: [u8; 2] = [0; 2];
+            size_bytes.copy_from_slice(&data[self.slot_size - 6..self.slot_size - 4]);
+            usize::from(u16::from_le_bytes(size_bytes))
+        } else if self.slot_size <= u32::MAX as usize {
+            // crc32 + 4 byte frame
+            let mut size_bytes: [u8; 4] = [0; 4];
+            size_bytes.copy_from_slice(&data[self.slot_size - 8..self.slot_size - 4]);
+            usize::try_from(u32::from_le_bytes(size_bytes)).unwrap()
+        } else {
+            // crc32 + 8 byte frame
+            let mut size_bytes: [u8; 8] = [0; 8];
+            size_bytes.copy_from_slice(&data[self.slot_size - 12..self.slot_size - 4]);
+            usize::try_from(u64::from_le_bytes(size_bytes)).unwrap()
+        };
+
+        data.truncate(len);
+
+        Ok(data)
     }
 
     fn write(&self, slot: u64, mut data: Vec<u8>) -> io::Result<()> {
@@ -303,11 +335,11 @@ impl Slab {
         if self.slot_size <= u8::MAX as usize {
             // crc32 + 1 byte frame
             data[self.slot_size - 5] = u8::try_from(len).unwrap();
-        } else if len <= u16::MAX as usize {
+        } else if self.slot_size <= u16::MAX as usize {
             // crc32 + 2 byte frame
             let size_bytes: [u8; 2] = u16::try_from(len).unwrap().to_le_bytes();
             data[self.slot_size - 6..self.slot_size - 4].copy_from_slice(&size_bytes);
-        } else if len <= u32::MAX as usize {
+        } else if self.slot_size <= u32::MAX as usize {
             // crc32 + 4 byte frame
             let size_bytes: [u8; 4] = u32::try_from(len).unwrap().to_le_bytes();
             data[self.slot_size - 8..self.slot_size - 4].copy_from_slice(&size_bytes);
