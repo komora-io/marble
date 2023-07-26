@@ -81,11 +81,10 @@ fn run_crash_batches() {
 
     let config = Config {
         path: BATCHES_DIR.into(),
-        fsync_each_batch: false,
         ..Default::default()
     };
 
-    let m = config.open().unwrap();
+    let m = config.recover().unwrap().0;
 
     verify_batches(&m);
 
@@ -115,7 +114,8 @@ fn write_batches_inner(start: u32, m: Marble) {
         let value = if rng.gen_bool(0.1) {
             None
         } else {
-            Some(i.to_le_bytes().to_vec())
+            let bytes = &i.to_le_bytes();
+            Some((bytes.into(), bytes.to_vec()))
         };
 
         let mut batch = vec![];
@@ -129,7 +129,7 @@ fn write_batches_inner(start: u32, m: Marble) {
 /// Verifies that the keys in the tree are correctly
 /// recovered (i.e., equal). Panics if they don't match up.
 fn verify_batches(m: &Marble) {
-    let values: Vec<Option<Box<[u8]>>> = (0..BATCH_SIZE as u64)
+    let values: Vec<Option<Vec<u8>>> = (0..BATCH_SIZE as u64)
         .chain(once(u64::MAX))
         .map(|i| {
             let object_id = i;

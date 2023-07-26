@@ -25,13 +25,13 @@ fn run_writer(marble: Marble) {
 
         for _ in 0..BATCH_SZ {
             let pid = rng.gen_range(0..KEYSPACE);
-            let v: Option<(InlineArray, &[u8])> = if rng.gen_bool(0.1) {
+            let v: Option<(InlineArray, Vec<u8>)> = if rng.gen_bool(0.1) {
                 None
             } else {
                 let start = rng.gen_range(0..max_offset);
                 Some((
                     lorem_ipsum[start..start + VALUE_LEN].into(),
-                    &lorem_ipsum[start..start + VALUE_LEN],
+                    lorem_ipsum[start..start + VALUE_LEN].to_vec(),
                 ))
             };
             batch.insert(pid, v);
@@ -82,7 +82,7 @@ fn main() {
     };
 
     println!("beginning recovery");
-    let marble = config.open().unwrap();
+    let (marble, recovered_index) = config.recover().unwrap();
     println!("marble recovered {:?}", marble.stats());
     marble.maintenance().unwrap();
     println!("post initial maintenance: {:?}", marble.stats());

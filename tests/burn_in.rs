@@ -1,6 +1,6 @@
 use rand::{thread_rng, Rng};
 
-use marble::{open, Marble};
+use marble::{recover, Marble};
 
 mod common;
 
@@ -20,7 +20,9 @@ fn run(marble: Marble) {
 
         for _ in 0..BATCH_SZ {
             let pid = rng.gen_range(0..KEYSPACE);
-            batch.insert(pid, Some(&v));
+            let bytes = i.to_le_bytes();
+            let user_data = marble::InlineArray::from(&bytes);
+            batch.insert(pid, Some((user_data, v.clone())));
         }
 
         marble.write_batch(batch).unwrap();
@@ -40,7 +42,7 @@ fn burn_in() {
 
     let concurrency: usize = std::thread::available_parallelism().unwrap().get() * 10;
 
-    let marble = open("testing_data_directories/burn_in").unwrap();
+    let marble = recover("testing_data_directories/burn_in").unwrap().0;
 
     let mut threads = vec![];
 

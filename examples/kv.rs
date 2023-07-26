@@ -1,5 +1,5 @@
 /// build with --features=serde,bincode
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io;
 
 use bincode::{deserialize, serialize};
@@ -8,9 +8,7 @@ use serde::{Deserialize, Serialize};
 
 type ObjectId = u64;
 
-const INDEX_OBJECT_ID: ObjectId = 1;
-
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug)]
 struct Index {
     pages: BTreeMap<Vec<u8>, ObjectId>,
     max_pid: u64,
@@ -20,7 +18,7 @@ impl Default for Index {
     fn default() -> Self {
         Index {
             pages: Default::default(),
-            max_pid: INDEX_OBJECT_ID + 1,
+            max_pid: 1,
         }
     }
 }
@@ -46,13 +44,13 @@ struct Kv {
 
 impl Kv {
     fn recover(path: &str) -> io::Result<Kv> {
-        let heap = marble::open(path)?;
+        let (heap, recovered_index) = marble::recover(path)?;
 
-        let index: Index = if let Some(index_data) = heap.read(INDEX_OBJECT_ID)? {
-            deserialize(&index_data).unwrap()
-        } else {
-            Index::default()
-        };
+        let mut index = Index::default();
+        for (object_id, low_key) in recovered_index {
+            index.max_pid = index.max_pid.max(object_id);
+            index.pages.insert(low_key.to_vec(), object_id);
+        }
 
         let mut kv = Kv { index, heap };
 
@@ -76,12 +74,10 @@ impl Kv {
         let previous = self.index.pages.insert(leaf.lo.clone(), object_id);
         assert!(previous.is_none());
 
-        let write_batch: HashMap<ObjectId, Option<Vec<u8>>> = [
-            (object_id, Some(serialize(&leaf).unwrap())),
-            (INDEX_OBJECT_ID, Some(serialize(&self.index).unwrap())),
-        ]
-        .into_iter()
-        .collect();
+        let write_batch = [(
+            object_id,
+            Some((leaf.lo.clone().into(), serialize(&leaf).unwrap())),
+        )];
 
         self.heap.write_batch(write_batch)
     }
@@ -117,15 +113,14 @@ impl Kv {
             leaf.kvs.remove(&key)
         };
 
-        let write_batch = [(object_id, Some(serialize(&leaf).unwrap()))];
+        let write_batch = [(
+            object_id,
+            Some((leaf.lo.clone().into(), serialize(&leaf).unwrap())),
+        )];
 
         self.heap.write_batch(write_batch)?;
 
         let stats = self.heap.stats();
-
-        if stats.dead_objects > stats.live_objects {
-            self.heap.maintenance()?;
-        }
 
         Ok(ret)
     }
