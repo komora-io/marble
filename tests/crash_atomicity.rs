@@ -1,5 +1,4 @@
 use std::env::{self, VarError};
-use std::iter::once;
 use std::process::{exit, Child, Command, ExitStatus};
 use std::thread;
 use std::time::Duration;
