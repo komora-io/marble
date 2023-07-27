@@ -616,18 +616,8 @@ impl Marble {
         Ok(())
     }
 
-    pub fn allocate<B: AsRef<[u8]>>(
-        &self,
-        user_data: InlineArray,
-        object: Vec<u8>,
-    ) -> io::Result<u64> {
-        let new_id = self.object_id_allocator.allocate();
-        if let Err(e) = self.write_batch([(new_id, Some((user_data, object)))]) {
-            self.object_id_allocator.free(new_id);
-            Err(e)
-        } else {
-            Ok(new_id)
-        }
+    pub fn allocate_object_id(&self) -> u64 {
+        self.object_id_allocator.allocate()
     }
 
     pub fn free(&self, object_id: u64) -> io::Result<()> {
