@@ -4,7 +4,6 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::num::NonZeroU64;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -269,6 +268,76 @@ impl Allocator {
     }
 }
 
+#[cfg(unix)]
+mod sys_io {
+    use std::io;
+    use std::os::unix::fs::FileExt;
+
+    use super::*;
+
+    pub fn read_exact_at<F: FileExt>(file: &F, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        maybe!(file.read_exact_at(buf, offset))
+    }
+
+    pub fn write_all_at<F: FileExt>(file: &F, buf: &[u8], offset: u64) -> io::Result<()> {
+        maybe!(file.write_all_at(buf, offset))
+    }
+}
+
+#[cfg(windows)]
+mod sys_io {
+    use std::os::windows::fs::FileExt;
+
+    use super::*;
+
+    pub fn read_exact_at<F: FileExt>(
+        file: &F,
+        mut buf: &mut [u8],
+        mut offset: u64,
+    ) -> io::Result<()> {
+        while !buf.is_empty() {
+            match maybe!(file.seek_read(buf, offset)) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let tmp = buf;
+                    buf = &mut tmp[n..];
+                    offset += n as u64;
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(annotate!(e)),
+            }
+        }
+        if !buf.is_empty() {
+            Err(annotate!(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn write_all_at<F: FileExt>(file: &F, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            match maybe!(file.seek_write(buf, offset)) {
+                Ok(0) => {
+                    return Err(annotate!(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write whole buffer",
+                    )));
+                }
+                Ok(n) => {
+                    buf = &buf[n..];
+                    offset += n as u64;
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(annotate!(e)),
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct Slab {
     file: fs::File,
@@ -285,7 +354,7 @@ impl Slab {
 
         let whence = self.slot_size as u64 * slot;
 
-        self.file.read_exact_at(&mut data, whence)?;
+        sys_io::read_exact_at(&self.file, &mut data, whence)?;
 
         let hash_actual: [u8; 4] = crc32fast::hash(&data[..self.slot_size - 4]).to_le_bytes();
         let hash_expected = &data[self.slot_size - 4..];
@@ -351,7 +420,7 @@ impl Slab {
 
         let whence = self.slot_size as u64 * slot;
 
-        self.file.write_all_at(&data, whence)
+        sys_io::write_all_at(&self.file, &data, whence)
     }
 }
 
