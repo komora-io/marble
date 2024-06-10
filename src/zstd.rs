@@ -56,9 +56,8 @@ unsafe impl Send for DictInABox {}
 
 impl DictInABox {
     fn decompress(&self, buf: &[u8]) -> Box<[u8]> {
-        let exact_size = usize::try_from(zstd_safe::find_decompressed_size(&buf)).unwrap();
-
-        let mut out = uninit_boxed_slice(exact_size);
+        let exact_size = zstd_safe::find_decompressed_size(&buf).unwrap().unwrap();
+        let mut out = uninit_boxed_slice(exact_size as usize);
 
         let dctx: &mut DCtx<'static> = unsafe { &mut *self.0 };
 
