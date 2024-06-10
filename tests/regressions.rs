@@ -386,3 +386,45 @@ fn test_13() {
         );
     });
 }
+
+#[test]
+fn test_compression() {
+    let subdir = format!("test_{}", TEST_COUNTER.fetch_add(1, SeqCst));
+
+    let config = Config {
+        zstd_compression_level: Some(4),
+        path: std::path::Path::new(TEST_DIR).join(subdir),
+        ..Default::default()
+    };
+
+    with_instance(config, |config, mut marble| {
+        // low entropy, should be very high compression
+        let big_value = vec![0xFA; 1024 * 1024];
+        let big_slice: &[u8] = &big_value;
+        let min = 0_u64;
+        let max = 10_u64;
+        let iter_range = (min..max);
+
+        marble
+            .write_batch::<&[u8], _>(
+                iter_range
+                    .clone()
+                    .into_iter()
+                    .map(|x| (x, Some(big_slice)))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+
+        for x in iter_range.clone() {
+            assert_eq!(&*marble.read(x).unwrap().unwrap(), big_slice);
+        }
+
+        marble = restart(config, marble);
+
+        for x in iter_range.into_iter() {
+            assert_eq!(&*marble.read(x).unwrap().unwrap(), big_slice);
+        }
+
+        marble.maintenance().unwrap();
+    });
+}
