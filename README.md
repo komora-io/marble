@@ -24,9 +24,7 @@ top of.
 
 At a high-level, it supports atomic batch writes and
 single-object reads. Garbage collection is manual.
-All operations are blocking. Nothing is cached
-in-memory except for zstd dictionaries and file
-handles to all storage files. Objects may be
+All operations are blocking. Objects may be
 sharded upon GC by providing a custom
 `Config::partition_function`. Partitioning
 is not performed on the write batch when it
@@ -49,16 +47,6 @@ Marble does not create any threads or call
 `Marble::maintenance` automatically under any
 conditions. You should probably create a background
 thread that calls this periodically.
-
-Pretty much the only "fancy" thing that Marble does
-is that it can be configured to create a zstd dictionary
-that is tuned specifically to your write batches.
-This is disabled by default and can be configured
-by setting the `Config::zstd_compression_level` to
-something other than `None` (the level is passed
-directly to zstd during compression). Compression is
-bypassed if batches have fewer than 8 items or the
-average item length is less than or equal to 8.
 
 # Examples
 
