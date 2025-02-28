@@ -48,7 +48,7 @@ pub(crate) fn read_trailer_from_buf(
 
     let offsets = usize::try_from(u64::from_le_bytes(buf[4..12].try_into().unwrap())).unwrap();
 
-    let offsets_begin = 4 + 8 + 8;
+    let offsets_begin = 4 + 8;
     let offsets_end = offsets_begin + (offsets * 16);
 
     let mut ret = vec![];

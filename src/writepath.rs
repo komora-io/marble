@@ -335,8 +335,7 @@ impl Marble {
         }
 
         // 5. write trailer then rename file
-        let expected_file_len =
-            written_bytes + 4 + 8 + 8 + (16 * new_relative_locations.len() as u64);
+        let expected_file_len = written_bytes + 4 + 8 + (16 * new_relative_locations.len() as u64);
 
         let metadata = Metadata {
             lsn: base_location.lsn(),
