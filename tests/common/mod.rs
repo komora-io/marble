@@ -9,15 +9,19 @@ mod alloc {
 
     unsafe impl std::alloc::GlobalAlloc for Alloc {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            let ret = System.alloc(layout);
+            let ret = unsafe { System.alloc(layout) };
             assert_ne!(ret, std::ptr::null_mut());
-            std::ptr::write_bytes(ret, 0xa1, layout.size());
+            unsafe {
+                std::ptr::write_bytes(ret, 0xa1, layout.size());
+            }
             ret
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            std::ptr::write_bytes(ptr, 0xde, layout.size());
-            System.dealloc(ptr, layout)
+            unsafe {
+                std::ptr::write_bytes(ptr, 0xde, layout.size());
+                System.dealloc(ptr, layout)
+            }
         }
     }
 }
@@ -31,9 +35,6 @@ pub fn setup_logger() {
             .unwrap_or("unknown")
             .to_owned()
     }
-
-    #[cfg(feature = "pretty_backtrace")]
-    color_backtrace::install();
 
     let mut builder = env_logger::Builder::new();
     builder
