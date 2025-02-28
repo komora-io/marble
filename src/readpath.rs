@@ -41,12 +41,12 @@ impl Marble {
             ));
         };
 
-        let mut compressed_buf: Box<[u8]> = uninit_boxed_slice(len);
+        let mut read_buf: Box<[u8]> = uninit_boxed_slice(len);
 
         let object_offset = file_offset + HEADER_LEN as u64;
-        fallible!(fam.file.read_exact_at(&mut compressed_buf, object_offset));
+        fallible!(fam.file.read_exact_at(&mut read_buf, object_offset));
 
-        let crc_actual = hash(len_buf, pid_buf, &compressed_buf);
+        let crc_actual = hash(len_buf, pid_buf, &read_buf);
 
         if crc_expected != crc_actual {
             log::warn!(
@@ -64,14 +64,9 @@ impl Marble {
 
         assert_eq!(object_id, read_pid);
 
-        self.compressed_bytes_read
-            .fetch_add(compressed_buf.len() as u64, Ordering::Relaxed);
+        self.bytes_read
+            .fetch_add(read_buf.len() as u64, Ordering::Relaxed);
 
-        let decompressed_buf = fam.zstd_dict.decompress(compressed_buf);
-
-        self.decompressed_bytes_read
-            .fetch_add(decompressed_buf.len() as u64, Ordering::Relaxed);
-
-        Ok(Some(decompressed_buf))
+        Ok(Some(read_buf))
     }
 }

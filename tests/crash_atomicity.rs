@@ -46,7 +46,9 @@ fn spawn_killah() {
 fn run_child_process(test_name: &str) -> Child {
     let bin = env::current_exe().expect("could not get test binary path");
 
-    env::set_var(TEST_ENV_VAR, test_name);
+    unsafe {
+        env::set_var(TEST_ENV_VAR, test_name);
+    }
 
     Command::new(bin)
         .env(TEST_ENV_VAR, test_name)

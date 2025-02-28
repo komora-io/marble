@@ -56,7 +56,7 @@ impl Marble {
                 // TODO handle trailer read using full buf
                 let file_buf = read_range_at(&fam.file, 0, metadata.file_size)?;
 
-                let (trailer, zstd_dict) = read_trailer_from_buf(
+                let trailer = read_trailer_from_buf(
                     &file_buf[usize::try_from(metadata.trailer_offset).unwrap()..],
                 )?;
 
@@ -120,7 +120,7 @@ impl Marble {
                             "rewriting object {object_id} at rewritten location \
                              {rewritten_location:?}"
                         );
-                        batch.insert(object_id, Some(zstd_dict.decompress(object_buf)));
+                        batch.insert(object_id, Some(object_buf));
                         old_locations.insert(object_id, rewritten_location);
                     } else {
                         log::trace!(

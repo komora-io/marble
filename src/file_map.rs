@@ -12,7 +12,7 @@ use concurrent_map::{ConcurrentMap, Maximum};
 
 use crate::{
     debug_delay, Config, DiskLocation, FileAndMetadata, LocationTable, Map, Metadata, ObjectId,
-    ZstdDict, NEW_WRITE_BATCH_BIT,
+    NEW_WRITE_BATCH_BIT,
 };
 
 impl Maximum for DiskLocation {
@@ -135,7 +135,6 @@ impl FileMap {
         generation: u8,
         is_gc: bool,
         config: &Config,
-        decompressor: ZstdDict,
     ) -> (DiskLocation, DeferUnclaim<'a>) {
         let lsn_base = self.next_file_lsn.fetch_add(written_bytes + 1, SeqCst);
 
@@ -160,7 +159,6 @@ impl FileMap {
             // on us until we're done with our write operation.
             path: AtomicPtr::default(),
             rewrite_claim: true.into(),
-            zstd_dict: decompressor,
         });
 
         assert!(self.fams.insert(Reverse(location), fam).is_none());
