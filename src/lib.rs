@@ -166,7 +166,6 @@ impl std::hash::Hasher for LocationHasher {
 }
 
 type Map<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<LocationHasher>>;
-type Set<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<LocationHasher>>;
 
 mod config;
 mod debug_delay;
