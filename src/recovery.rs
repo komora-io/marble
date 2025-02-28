@@ -62,8 +62,7 @@ impl Config {
 
             let mut file = fallible!(options.open(entry.path()));
 
-            let (trailer, zstd_dict) =
-                read_trailer(&mut file, metadata.trailer_offset, metadata.file_size)?;
+            let trailer = read_trailer(&mut file, metadata.trailer_offset, metadata.file_size)?;
 
             for (object_id, relative_loc) in trailer {
                 // add file base LSN to relative offset
@@ -95,7 +94,6 @@ impl Config {
                 generation: metadata.generation,
                 rewrite_claim: false.into(),
                 synced: true.into(),
-                zstd_dict: zstd_dict,
             };
 
             fam.install_metadata_and_path(metadata, entry.path().into());
@@ -135,10 +133,8 @@ impl Config {
             directory_lock: Arc::new(directory_lock),
             #[cfg(feature = "runtime_validation")]
             debug_history: Arc::new(debug_history.into()),
-            compressed_bytes_read: Arc::new(0.into()),
-            decompressed_bytes_read: Arc::new(0.into()),
-            compressed_bytes_written: Arc::new(0.into()),
-            decompressed_bytes_written: Arc::new(0.into()),
+            bytes_read: Arc::new(0.into()),
+            bytes_written: Arc::new(0.into()),
             high_level_user_bytes_written: Arc::new(0.into()),
         })
     }

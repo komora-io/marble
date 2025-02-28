@@ -3,7 +3,7 @@
 /// interleavings quickly. It gets fully eliminated by the
 /// compiler in non-test code.
 pub fn debug_delay() {
-    #[cfg(feature = "runtime_verification")]
+    #[cfg(feature = "runtime_validation")]
     {
         use std::thread;
         use std::time::Duration;

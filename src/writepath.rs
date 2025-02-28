@@ -6,7 +6,7 @@ use fault_injection::{fallible, maybe};
 
 use crate::{
     hash, write_trailer, DiskLocation, Map, Marble, Metadata, ObjectId, RelativeDiskLocation,
-    ZstdDict, HEADER_LEN,
+    HEADER_LEN,
 };
 
 const HEAP_DIR_SUFFIX: &str = "heap";
@@ -39,7 +39,7 @@ impl Marble {
     pub(crate) fn shard_batch<B, I>(
         &self,
         write_batch: I,
-        gen: u8,
+        generation: u8,
         old_locations: &Map<ObjectId, DiskLocation>,
     ) -> io::Result<()>
     where
@@ -63,7 +63,7 @@ impl Marble {
                     high_level_user_bytes_written += len as u64;
                 }
 
-                let shard = if gen == NEW_WRITE_GENERATION {
+                let shard = if generation == NEW_WRITE_GENERATION {
                     // only shard during gc defragmentation of
                     // rewritten items, otherwise we break
                     // writebatch atomicity
@@ -80,7 +80,7 @@ impl Marble {
 
             // only split shards on rewrite, otherwise we lose batch
             // atomicity
-            let is_rewrite = gen > NEW_WRITE_GENERATION;
+            let is_rewrite = generation > NEW_WRITE_GENERATION;
             let over_size_preference = shard.0 > self.config.target_file_size;
 
             if is_rewrite && over_size_preference {
@@ -109,7 +109,7 @@ impl Marble {
             );
 
         for objects in iter {
-            self.write_batch_inner(objects, gen, &old_locations)?;
+            self.write_batch_inner(objects, generation, &old_locations)?;
         }
 
         // fsync directory to ensure new file is present
@@ -160,33 +160,9 @@ impl Marble {
         let file = fallible!(file_options.open(&tmp_path));
         let mut buf_writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
 
-        let (dict_bytes_opt, mut compressor_and_level_opt, decompressor) =
-            if let Some(compression_level) = self.config.zstd_compression_level {
-                let dict_bytes_opt = crate::zstd::from_samples(&objects);
-                let (compressor_and_level_opt, decompressor) =
-                    if let Some(ref dict_bytes) = dict_bytes_opt {
-                        let mut compressor = zstd_safe::CCtx::create();
-                        compressor
-                            .load_dictionary(&dict_bytes)
-                            .map_err(crate::zstd::zstd_error)
-                            .unwrap();
-
-                        let decompressor = ZstdDict::from_dict_bytes(&dict_bytes);
-
-                        (Some((compressor, compression_level)), decompressor)
-                    } else {
-                        (None, ZstdDict::default())
-                    };
-
-                (dict_bytes_opt, compressor_and_level_opt, decompressor)
-            } else {
-                (None, None, ZstdDict::default())
-            };
-
         let mut new_relative_locations: Map<ObjectId, RelativeDiskLocation> = Map::default();
 
         let mut written_bytes: u64 = 0;
-        let mut compressed_bytes: i64 = 0;
 
         for (object_id, raw_object_opt) in &objects {
             let raw_object = if let Some(raw_object) = raw_object_opt {
@@ -213,39 +189,14 @@ impl Marble {
 
             let relative_address = written_bytes;
 
-            let compressed_object: Option<Vec<u8>> =
-                if let Some((ref mut compressor, ref level)) = compressor_and_level_opt {
-                    let decompressed_size = raw_object.len() as i64;
-                    let max_size = zstd_safe::compress_bound(raw_object.len());
-                    let mut out = Vec::with_capacity(max_size);
-                    compressor
-                        .compress(&mut out, raw_object, *level)
-                        .map_err(crate::zstd::zstd_error)
-                        .unwrap();
-                    let compressed_size = out.len() as i64;
-
-                    // it's possible for compressed bytes to be larger than
-                    // decompressed bytes in some situations.
-                    compressed_bytes += decompressed_size - compressed_size;
-
-                    Some(out)
-                } else {
-                    None
-                };
-
             let is_delete = false;
             let relative_location = RelativeDiskLocation::new(relative_address, is_delete);
             new_relative_locations.insert(*object_id, relative_location);
 
-            let output_object: &[u8] = compressed_object
-                .as_ref()
-                .map(AsRef::as_ref)
-                .unwrap_or(raw_object);
-
-            let len_buf: [u8; 8] = (output_object.len() as u64).to_le_bytes();
+            let len_buf: [u8; 8] = (raw_object.len() as u64).to_le_bytes();
             let pid_buf: [u8; 8] = object_id.to_le_bytes();
 
-            let crc = hash(len_buf, pid_buf, &output_object);
+            let crc = hash(len_buf, pid_buf, &raw_object);
 
             log::trace!(
                 "writing object {} at offset {} with crc {:?}",
@@ -257,9 +208,9 @@ impl Marble {
             fallible!(buf_writer.write_all(&crc));
             fallible!(buf_writer.write_all(&pid_buf));
             fallible!(buf_writer.write_all(&len_buf));
-            fallible!(buf_writer.write_all(&output_object));
+            fallible!(buf_writer.write_all(&raw_object));
 
-            written_bytes += (HEADER_LEN + output_object.len()) as u64;
+            written_bytes += (HEADER_LEN + raw_object.len()) as u64;
         }
 
         assert_eq!(new_relative_locations.len(), objects.len());
@@ -276,12 +227,8 @@ impl Marble {
             fallible!(file.sync_all());
         }
 
-        self.compressed_bytes_written
+        self.bytes_written
             .fetch_add(written_bytes, Ordering::Relaxed);
-        self.decompressed_bytes_written.fetch_add(
-            u64::try_from(written_bytes as i64 + compressed_bytes).unwrap(),
-            Ordering::Relaxed,
-        );
 
         // 2. assign LSN and add to fams
         let initial_capacity = new_relative_locations.len() as u64;
@@ -293,7 +240,6 @@ impl Marble {
             generation,
             is_gc,
             &self.config,
-            decompressor,
         );
 
         // 3. attempt installation into pagetable
@@ -389,18 +335,7 @@ impl Marble {
         }
 
         // 5. write trailer then rename file
-        let dict_len = if let Some(ref dict_bytes) = dict_bytes_opt {
-            dict_bytes.len()
-        } else {
-            0
-        };
-
-        let expected_file_len = written_bytes
-            + 4
-            + 8
-            + 8
-            + (16 * new_relative_locations.len() as u64)
-            + dict_len as u64;
+        let expected_file_len = written_bytes + 4 + 8 + (16 * new_relative_locations.len() as u64);
 
         let metadata = Metadata {
             lsn: base_location.lsn(),
@@ -419,14 +354,9 @@ impl Marble {
             written_bytes,
         );
 
-        let res = write_trailer(
-            &mut file_2,
-            written_bytes,
-            &new_relative_locations,
-            &dict_bytes_opt,
-        )
-        .and_then(|_| maybe!(file_2.sync_all()))
-        .and_then(|_| maybe!(fs::rename(&tmp_path, &new_path)));
+        let res = write_trailer(&mut file_2, written_bytes, &new_relative_locations)
+            .and_then(|_| maybe!(file_2.sync_all()))
+            .and_then(|_| maybe!(fs::rename(&tmp_path, &new_path)));
 
         assert_eq!(trailer_items, new_relative_locations.len());
 

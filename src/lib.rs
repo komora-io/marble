@@ -7,10 +7,8 @@
 //! At a high-level, it supports atomic batch writes and
 //! single-object reads. Garbage collection is manual.
 //! All operations are blocking. Nothing is cached
-//! in-memory except for zstd dictionaries and file
-//! handles to all storage files. Objects may be
-//! sharded upon GC by providing a custom
-//! `Config::partition_function`. Partitioning
+//! in-memory. Objects may be sharded upon GC by providing
+//! a custom `Config::partition_function`. Partitioning
 //! is not performed on the write batch when it
 //! is initially written, because the write batch
 //! must be stored in a single file for it to be atomic.
@@ -31,16 +29,6 @@
 //! `Marble::maintenance` automatically under any
 //! conditions. You should probably create a background
 //! thread that calls this periodically.
-//!
-//! Pretty much the only "fancy" thing that Marble does
-//! is that it can be configured to create a zstd dictionary
-//! that is tuned specifically to your write batches.
-//! This is disabled by default and can be configured
-//! by setting the `Config::zstd_compression_level` to
-//! something other than `None` (the level is passed
-//! directly to zstd during compression). Compression is
-//! bypassed if batches have fewer than 8 items or the
-//! average item length is less than or equal to 8.
 //!
 //! # Examples
 //!
@@ -88,7 +76,6 @@
 //! ```
 //! let config = marble::Config {
 //!     path: "my_path".into(),
-//!     zstd_compression_level: Some(7),
 //!     fsync_each_batch: true,
 //!     target_file_size: 64 * 1024 * 1024,
 //!     file_compaction_percent: 50,
@@ -179,6 +166,7 @@ impl std::hash::Hasher for LocationHasher {
 }
 
 type Map<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<LocationHasher>>;
+type Set<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<LocationHasher>>;
 
 mod config;
 mod debug_delay;
@@ -192,7 +180,6 @@ mod readpath;
 mod recovery;
 mod trailer;
 mod writepath;
-mod zstd;
 
 pub use config::Config;
 use debug_delay::debug_delay;
@@ -200,7 +187,6 @@ use disk_location::{DiskLocation, RelativeDiskLocation};
 use file_map::FileMap;
 use location_table::LocationTable;
 use trailer::{read_trailer, read_trailer_from_buf, write_trailer};
-use zstd::ZstdDict;
 
 const HEADER_LEN: usize = 20;
 const NEW_WRITE_BATCH_BIT: u64 = 1 << 62;
@@ -267,29 +253,18 @@ pub struct Stats {
     pub files: usize,
     /// The sum of the sizes of all files currently on-disk.
     pub total_file_size: u64,
-    /// The number of compressed bytes that have been written due
+    /// The number of bytes that have been read since
+    /// this instance of `Marble` was recovered.
+    pub bytes_read: u64,
+    /// The number of bytes that have been written due
     /// to calls to both `write_batch` and rewrites caused by
     /// calls to `maintenance` since this instance of `Marble` was recovered.
-    pub compressed_bytes_written: u64,
-    /// The number of compressed bytes that have been read since
-    /// this instance of `Marble` was recovered.
-    pub compressed_bytes_read: u64,
-    /// The number of decompressed bytes that have been written due
-    /// to calls to both `write_batch` and rewrites caused by
-    /// calls to `maintenance` since this instance of `Marble` was recovered.
-    pub decompressed_bytes_written: u64,
-    /// The number of decompressed bytes that have been read since
-    /// this instance of `Marble` was recovered.
-    pub decompressed_bytes_read: u64,
+    pub bytes_written: u64,
     /// This is the number of bytes that are written from user
     /// calls to [`crate::Marble::write_batch`] since this instance
     /// was recovered.
     pub high_level_user_bytes_written: u64,
-    /// Compression ratio for read objects since this `Marble` instance was recovered. 1.0 means no compression, 2.0 means that we saved 50% space by compressing, etc...
-    pub read_compression_ratio: f32,
-    /// Compression ratio for objects written since this `Marble` instance was recovered. 1.0 means no compression, 2.0 means that we saved 50% space by compressing, etc...
-    pub written_compression_ratio: f32,
-    /// The ratio of all decompressed writes performed to high-level user data
+    /// The ratio of all bytes written to high-level user data
     /// since this instance of `Marble` was recovered. This is basically the
     /// maintenance overhead of on-disk GC in response to objects being rewritten
     /// and defragmentation maintenance copying old data to new homes. 1.0 is "perfect".
@@ -298,10 +273,9 @@ pub struct Stats {
     /// see write amplifications of several hundred. So, if you're under 10 for serious workloads,
     /// you're doing much better than most industrial systems.
     pub write_amplification: f32,
-    /// The ratio of the sum of the size of all compressed files written to the sum of the size of all high-level user data written
+    /// The ratio of the sum of the size of all bytes written to the sum of the size of all high-level user data written
     /// since this instance of `Marble` was recovered. This goes up with fragmentation, and is
-    /// brought back down with calls to `maintenance` that defragment storage files. Higher
-    /// compression levels also cause this to be lower.
+    /// brought back down with calls to `maintenance` that defragment storage files.
     pub space_amplification: f32,
 }
 
@@ -346,7 +320,6 @@ struct FileAndMetadata {
     generation: u8,
     rewrite_claim: AtomicBool,
     synced: AtomicBool,
-    zstd_dict: ZstdDict,
 }
 
 impl Drop for FileAndMetadata {
@@ -451,10 +424,8 @@ pub struct Marble {
     directory_lock: Arc<File>,
     #[cfg(feature = "runtime_validation")]
     debug_history: Arc<std::sync::Mutex<debug_history::DebugHistory>>,
-    decompressed_bytes_read: Arc<AtomicU64>,
-    compressed_bytes_read: Arc<AtomicU64>,
-    decompressed_bytes_written: Arc<AtomicU64>,
-    compressed_bytes_written: Arc<AtomicU64>,
+    bytes_read: Arc<AtomicU64>,
+    bytes_written: Arc<AtomicU64>,
     high_level_user_bytes_written: Arc<AtomicU64>,
 }
 
@@ -484,22 +455,16 @@ impl Marble {
     pub fn stats(&self) -> Stats {
         let (fams_len, total_file_size, stored_objects, live_objects) = self.file_map.stats();
 
-        let compressed_bytes_read = self.compressed_bytes_read.load(Acquire);
-        let decompressed_bytes_read = self.decompressed_bytes_read.load(Acquire);
-        let read_compression_ratio = decompressed_bytes_read as f32 / compressed_bytes_read as f32;
+        let bytes_read = self.bytes_read.load(Acquire);
 
-        let compressed_bytes_written = self.compressed_bytes_written.load(Acquire);
-        let decompressed_bytes_written = self.decompressed_bytes_written.load(Acquire);
-        let written_compression_ratio =
-            decompressed_bytes_written as f32 / compressed_bytes_written as f32;
+        let bytes_written = self.bytes_written.load(Acquire);
 
         let high_level_user_bytes_written = self.high_level_user_bytes_written.load(Acquire);
 
         let live_ratio = live_objects as f32 / stored_objects.max(1) as f32;
-        let approximate_live_data = live_ratio * total_file_size as f32 * written_compression_ratio;
+        let approximate_live_data = live_ratio * total_file_size as f32;
 
-        let write_amplification =
-            decompressed_bytes_written as f32 / high_level_user_bytes_written as f32;
+        let write_amplification = bytes_written as f32 / high_level_user_bytes_written as f32;
         let space_amplification = total_file_size as f32 / approximate_live_data;
 
         Stats {
@@ -509,12 +474,8 @@ impl Marble {
             live_ratio,
             files: fams_len,
             total_file_size,
-            compressed_bytes_read,
-            compressed_bytes_written,
-            decompressed_bytes_read,
-            decompressed_bytes_written,
-            read_compression_ratio,
-            written_compression_ratio,
+            bytes_read,
+            bytes_written,
             high_level_user_bytes_written,
             write_amplification,
             space_amplification,
