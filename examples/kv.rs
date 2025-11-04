@@ -2,9 +2,23 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 
-use bincode::{deserialize, serialize};
+use bincode::serde::{decode_from_slice, encode_to_vec};
 use marble::Marble;
 use serde::{Deserialize, Serialize};
+
+const BC_CONFIG: bincode::config::Configuration = bincode::config::standard()
+    .with_little_endian()
+    .with_variable_int_encoding();
+
+fn deserialize<T: serde::de::DeserializeOwned>(
+    buf: &[u8],
+) -> Result<T, bincode::error::DecodeError> {
+    Ok(decode_from_slice(buf, BC_CONFIG)?.0)
+}
+
+fn serialize<T: Serialize>(t: &T) -> Vec<u8> {
+    encode_to_vec(t, BC_CONFIG).unwrap()
+}
 
 type ObjectId = u64;
 
@@ -76,12 +90,7 @@ impl Kv {
         let previous = self.index.pages.insert(leaf.lo.clone(), object_id);
         assert!(previous.is_none());
 
-        let write_batch: HashMap<ObjectId, Option<Vec<u8>>> = [
-            (object_id, Some(serialize(&leaf).unwrap())),
-            (INDEX_OBJECT_ID, Some(serialize(&self.index).unwrap())),
-        ]
-        .into_iter()
-        .collect();
+        let write_batch = [(object_id, Some(serialize(&leaf)))];
 
         self.heap.write_batch(write_batch)
     }
@@ -117,7 +126,7 @@ impl Kv {
             leaf.kvs.remove(&key)
         };
 
-        let write_batch = [(object_id, Some(serialize(&leaf).unwrap()))];
+        let write_batch = [(object_id, Some(serialize(&leaf)))];
 
         self.heap.write_batch(write_batch)?;
 
